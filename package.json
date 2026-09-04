@@ -10,8 +10,9 @@
   "scripts": {
     "build": "tsc",
     "typecheck": "tsc --noEmit",
-    "test": "npm run build && node --test dist/test/probe.test.js",
-    "probe": "node --env-file-if-exists=.env.local dist/src/probe.js"
+    "test": "npm run build && node --test dist/test/*.test.js",
+    "probe": "node --env-file-if-exists=.env.local dist/src/probe.js",
+    "baseline": "node --env-file-if-exists=.env.local dist/src/baseline.js"
   },
   "dependencies": {
     "@vercel/sandbox": "3.2.1"

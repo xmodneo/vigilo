@@ -1,8 +1,9 @@
-# Vigilo — Task 1.1 sandbox probe
+# Vigilo — execution boundary proofs
 
-The disposable Node.js 24 Vercel Sandbox probe is implemented. Task 1.2 adds a
-separate [controlled broken fixture](fixtures/README.md), which is not yet run
-in a sandbox. There is no repair workflow, web app, database, or model integration.
+Task 1.1 proves the disposable Node.js 24 Vercel Sandbox boundary. Task 1.2 adds
+a separate [controlled broken fixture](fixtures/README.md). Task 1.3 runs its
+[original failing baseline in a real sandbox](docs/baseline.md). There is no
+repair workflow, web app, database, or model integration.
 
 ## Prerequisites and pinned dependencies
 

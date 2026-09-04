@@ -80,8 +80,9 @@ No Git repository or GitHub credentials are needed to copy or run it.
 
 Installing packages needs access to the public npm registry (or a populated npm
 cache); the application and test cases themselves perform no networking.
-Task 1.2 only verifies local copies. Uploading or executing this fixture in a
-Vercel Sandbox belongs to Task 1.3 and is not implemented here.
+Task 1.2 defines the local fixture. Task 1.3 adds a separate
+[Vigilo baseline runner](../docs/baseline.md) that uploads and tests the original
+fixture in a Vercel Sandbox; it does not change or repair these fixture files.
 
 The root Vigilo commands continue to test and build only the Task 1.1 probe;
 run this intentionally failing fixture suite separately.
