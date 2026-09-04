@@ -1,7 +1,8 @@
 # Vigilo — Task 1.1 sandbox probe
 
-Only the disposable Node.js 24 Vercel Sandbox probe is implemented. There is no
-application fixture, repair workflow, web app, database, or model integration.
+The disposable Node.js 24 Vercel Sandbox probe is implemented. Task 1.2 adds a
+separate [controlled broken fixture](fixtures/README.md), which is not yet run
+in a sandbox. There is no repair workflow, web app, database, or model integration.
 
 ## Prerequisites and pinned dependencies
 
