@@ -1,0 +1,24 @@
+{
+  "name": "vigilo",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": "24.x"
+  },
+  "packageManager": "npm@11.6.2",
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "npm run build && node --test dist/test/probe.test.js",
+    "probe": "node --env-file-if-exists=.env.local dist/src/probe.js"
+  },
+  "dependencies": {
+    "@vercel/sandbox": "3.2.1"
+  },
+  "devDependencies": {
+    "@types/async-retry": "1.4.9",
+    "@types/node": "24.13.3",
+    "typescript": "7.0.2"
+  }
+}
