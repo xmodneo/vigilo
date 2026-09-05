@@ -84,8 +84,8 @@ Task 1.2 defines the local fixture. Task 1.3 adds a separate
 [Vigilo baseline runner](../docs/baseline.md) that uploads and tests the original
 fixture in a Vercel Sandbox; it does not change or repair these fixture files.
 
-The root Vigilo commands continue to test and build only the Task 1.1 probe;
-run this intentionally failing fixture suite separately.
+The root Vigilo test suite covers the complete Milestone 1 execution logic;
+run this intentionally failing fixture suite separately as its negative control.
 
 Official Vitest references: [single-run execution](https://vitest.dev/guide/)
 and [JSON reporting](https://vitest.dev/guide/reporters.html#json-reporter).

@@ -102,7 +102,7 @@ test("fresh verifier uses only frozen bytes, gates scripts, rejects failures and
   }));
   authNames.forEach(name => { delete process.env[name]; });
   process.env.VERCEL_OIDC_TOKEN = "host-only-verifier-sentinel";
-  for (const scenario of ["passed", "failed_tests", "mutated_source", "typecheck_failed", "install_failed", "policy_failed", "same_sandbox", "cleanup_failed"]) {
+  for (const scenario of ["passed", "failed_tests", "mutated_source", "typecheck_failed", "install_failed", "policy_failed", "same_sandbox", "same_session", "cleanup_failed"]) {
     await context.test(scenario, async child => {
       const temporary = mkdtempSync(join(tmpdir(), "vigilo-verifier-work-"));
       const host = await realpath(temporary);
@@ -183,19 +183,22 @@ test("fresh verifier uses only frozen bytes, gates scripts, rejects failures and
         confirmedPolicy = policy === "deny-all";
         return fake;
       });
-      const result = await runVerification(path);
+      const control = scenario === "same_session" ? { candidateHash: candidate.candidateHash,
+        repairSandbox: { name: VERIFICATION_CONTROL.repairSandbox.name, sessionId: "fresh-verifier-session" } }
+        : VERIFICATION_CONTROL;
+      const result = await runVerification(path, control);
       assert.equal(result.success, scenario === "passed");
       assert(stopped);
       assert.equal(deleted, scenario !== "cleanup_failed");
       if (["failed_tests", "mutated_source", "typecheck_failed"].includes(scenario)) assert.equal(result.outcome, "candidate_verification_failure");
-      if (["install_failed", "policy_failed", "same_sandbox", "cleanup_failed"].includes(scenario)) assert.equal(result.outcome, "verifier_infrastructure_failure");
+      if (["install_failed", "policy_failed", "same_sandbox", "same_session", "cleanup_failed"].includes(scenario)) assert.equal(result.outcome, "verifier_infrastructure_failure");
       if (scenario === "mutated_source") assert.equal(result.sourceIdentityUnchangedAfterVerification, false);
       if (scenario === "passed") {
         assert(result.distinctSandboxConfirmed && result.candidateIdentityMatches && result.sourceIdentityUnchangedAfterVerification);
         assert.equal(result.tests?.passed, 3);
         assert.equal(result.tests?.failed, 0);
       }
-      if (["install_failed", "policy_failed", "same_sandbox"].includes(scenario)) assert(scripts.every(args => args[0] === "ci"));
+      if (["install_failed", "policy_failed", "same_sandbox", "same_session"].includes(scenario)) assert(scripts.every(args => args[0] === "ci"));
       assert(!JSON.stringify(result).includes("host-only-verifier-sentinel"));
       const verifierSource = readFileSync(new URL("../../src/verify-candidate.ts", import.meta.url), "utf8");
       assert(!verifierSource.includes("free-shipping.patch") && !verifierSource.includes("./freeze-candidate"));

@@ -29,7 +29,8 @@ export async function runVerification(
     success: false, outcome: "invalid_candidate", baseFixtureIdentity: EXPECTED_FIXTURE_HASH,
     frozenCandidateIdentity: null as string | null, repairSandbox: control.repairSandbox,
     verifierSandbox: { name: null as string | null, sessionId: null as string | null },
-    distinctSandboxConfirmed: false, separationIdentifier: "sandbox_name",
+    distinctSandboxConfirmed: false,
+    separationIdentifier: control.repairSandbox.sessionId === null ? "sandbox_name" : "sandbox_name_and_session",
     pristineBaseIntegrity: false, appliedCandidateIdentity: null as string | null, candidateIdentityMatches: false,
     changedPaths: [] as string[], changedContentHashes: [] as { path: string; sha256: string }[],
     dependencyInstallation: commandEvidence(INSTALL_ARGS, 90_000),
@@ -51,8 +52,10 @@ export async function runVerification(
     report.outcome = "verifier_infrastructure_failure";
     phase = "provision_fresh_verifier";
     await boundary.run(async (sandbox, signal) => {
-      report.verifierSandbox = { name: sandbox.name, sessionId: sandbox.currentSession().sessionId };
-      if (sandbox.name !== boundary.evidence.name || sandbox.name === control.repairSandbox.name) {
+      const verifierSessionId = sandbox.currentSession().sessionId;
+      report.verifierSandbox = { name: sandbox.name, sessionId: verifierSessionId };
+      if (sandbox.name !== boundary.evidence.name || sandbox.name === control.repairSandbox.name ||
+          control.repairSandbox.sessionId !== null && verifierSessionId === control.repairSandbox.sessionId) {
         throw new ExecutionFailure("infrastructure_failure", "verifier_not_distinct");
       }
       boundary.assertSameSession(sandbox);
