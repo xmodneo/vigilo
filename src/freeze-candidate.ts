@@ -3,7 +3,7 @@ import { lstatSync, mkdirSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { loadOriginalFixture, EXPECTED_FIXTURE_HASH, fixtureHash } from "./baseline.js";
 import { SandboxBoundary, CREDENTIALS_SCRIPT, requireNode24 } from "./sandbox-boundary.js";
-import { buildCandidate, collectTree, freezeCandidate, CandidateError, sha256, type Candidate, type TreeReader } from "./candidate.js";
+import { buildCandidate, collectTree, freezeCandidate, CandidateError, sha256, type Candidate, sandboxTreeReader } from "./candidate.js";
 
 const ROOT = "/vercel/sandbox/fixture";
 const PATCH_PATH = "/vercel/sandbox/vigilo-repair.patch";
@@ -38,18 +38,7 @@ export async function runCandidateFreeze() {
       requireNode24(await runtime.stdout({ signal }));
       const credentials = await sandbox.runCommand({ cmd: "node", args: ["-e", CREDENTIALS_SCRIPT], signal, timeoutMs: 10_000 });
       if (credentials.exitCode !== 0 || (await credentials.stdout({ signal })).trim() !== "absent") throw new CandidateError("credential_boundary_failed");
-      const reader: TreeReader = {
-        // withFileTypes uses enumeration that includes dotfiles in SDK 3.2.1.
-        // https://vercel.com/docs/sandbox/sdk-reference#filesystem-class
-        readdir: async path => (await sandbox.fs.readdir(path, { withFileTypes: true, signal })).map(entry => entry.name),
-        lstat: path => sandbox.fs.lstat(path, { signal }),
-        realpath: path => sandbox.fs.realpath(path, { signal }),
-        read: async path => {
-          const stream = await sandbox.readFile({ path }, { signal });
-          if (!stream) throw new CandidateError("file_missing");
-          return stream;
-        },
-      };
+      const reader = sandboxTreeReader(sandbox, signal);
       phase = "upload";
       await sandbox.writeFiles(original.map(file => ({ path: `${ROOT}/${file.path}`, content: file.content, mode: 0o644 })), { signal });
       if (fixtureHash(await collectTree(reader, ROOT, original)) !== EXPECTED_FIXTURE_HASH) throw new CandidateError("uploaded_base_mismatch");

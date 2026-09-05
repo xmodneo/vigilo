@@ -1,8 +1,9 @@
 import { createHash } from "node:crypto";
-import { createReadStream, constants, mkdirSync, mkdtempSync, openSync, closeSync, writeFileSync, fsyncSync, fchmodSync, linkSync, rmSync, lstatSync, fstatSync, readFileSync } from "node:fs";
+import type { Sandbox } from "@vercel/sandbox";
+import { createReadStream, constants, mkdirSync, mkdtempSync, openSync, closeSync, writeFileSync, fsyncSync, fchmodSync, linkSync, rmSync, lstatSync, fstatSync, readFileSync, readSync } from "node:fs";
 import { lstat, readdir, realpath } from "node:fs/promises";
 import { join, resolve } from "node:path";
-import { EXPECTED_FIXTURE_HASH, fixtureHash } from "./baseline.js";
+import { EXPECTED_FIXTURE_HASH, fixtureHash, loadOriginalFixture } from "./baseline.js";
 
 type File = { path: string; content: Buffer };
 type CollectedFile = File & { mode: number };
@@ -58,6 +59,46 @@ export function buildCandidate(base: File[], files: CollectedFile[]) {
 }
 export type Candidate = ReturnType<typeof buildCandidate>;
 
+// Artifact JSON is untrusted data. Rebuild through the same scope validator and
+// compare all recorded digests before it can authorize any sandbox provisioning.
+export function parseCandidate(raw: string): Candidate {
+  requireSafe(Buffer.byteLength(raw) <= MAX_ARTIFACT_BYTES, "artifact_too_large");
+  try {
+    const value = JSON.parse(raw);
+    requireSafe(value && value.schemaVersion === 1 && value.baseFixtureHash === EXPECTED_FIXTURE_HASH &&
+      Array.isArray(value.changes) && value.changes.length === 1, "invalid_candidate_manifest");
+    requireSafe(Object.keys(value).sort().join() === "baseFixtureHash,candidateHash,changes,schemaVersion", "unexpected_manifest_fields");
+    const change = value.changes[0];
+    requireSafe(change && change.path === SOURCE && typeof change.contentBase64 === "string", "invalid_candidate_change");
+    requireSafe(Object.keys(change).sort().join() === "byteLength,contentBase64,path,sha256", "unexpected_change_fields");
+    const content = Buffer.from(change.contentBase64, "base64");
+    requireSafe(content.toString("base64") === change.contentBase64 && content.length === change.byteLength && sha256(content) === change.sha256, "changed_content_mismatch");
+    const base = loadOriginalFixture();
+    const candidate = buildCandidate(base, base.map(file => ({ ...file, mode: 0o644, content: file.path === change.path ? content : file.content })));
+    requireSafe(candidate.candidateHash === value.candidateHash, "candidate_identity_mismatch");
+    return candidate;
+  } catch (error) {
+    if (error instanceof CandidateError) throw error;
+    throw new CandidateError("invalid_candidate_data");
+  }
+}
+
+export function loadCandidate(path: string): Candidate {
+  const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  try {
+    const stat = fstatSync(fd);
+    requireSafe(stat.isFile() && stat.size <= MAX_ARTIFACT_BYTES, "invalid_candidate_file");
+    const bytes = Buffer.alloc(MAX_ARTIFACT_BYTES + 1);
+    let size = 0;
+    while (size < bytes.length) {
+      const count = readSync(fd, bytes, size, bytes.length - size, null);
+      if (count === 0) break;
+      size += count;
+    }
+    return parseCandidate(bytes.subarray(0, size).toString("utf8"));
+  } finally { closeSync(fd); }
+}
+
 type FileStat = {
   mode: number; size: number; nlink: number; ino: number; mtimeMs: number; ctimeMs: number;
   isFile(): boolean; isDirectory(): boolean; isSymbolicLink(): boolean;
@@ -72,9 +113,23 @@ export const localTreeReader: TreeReader = {
   readdir, lstat, realpath, read: async path => createReadStream(path),
 };
 
+export function sandboxTreeReader(sandbox: Sandbox, signal: AbortSignal): TreeReader {
+  return {
+    // SDK 3.2.1 requires withFileTypes to include dotfiles in enumeration.
+    readdir: async path => (await sandbox.fs.readdir(path, { withFileTypes: true, signal })).map(entry => entry.name),
+    lstat: path => sandbox.fs.lstat(path, { signal }),
+    realpath: path => sandbox.fs.realpath(path, { signal }),
+    read: async path => {
+      const stream = await sandbox.readFile({ path }, { signal });
+      if (!stream) throw new CandidateError("file_missing");
+      return stream;
+    },
+  };
+}
+
 // Enumerate ALL entries (including hidden files), then independently read every
 // allowed file. No diff, Git status, ignore rule, or sandbox hash is trusted.
-export async function collectTree(reader: TreeReader, root: string, base: File[]): Promise<CollectedFile[]> {
+export async function collectTree(reader: TreeReader, root: string, base: File[], allowExecutionArtifacts = false): Promise<CollectedFile[]> {
   const original = verifiedBase(base);
   const directories = new Set(["", "src", "test"]);
   requireSafe(root.startsWith("/") && resolve(root) === root, "invalid_root");
@@ -93,6 +148,14 @@ export async function collectTree(reader: TreeReader, root: string, base: File[]
         validateCandidatePath(name);
         requireSafe(!name.includes("/"), "invalid_entry_name");
         const child = relative ? `${relative}/${name}` : name;
+        // Only verifier-generated root directories may be excluded from source
+        // identity. No ignore patterns or nested source exclusions are accepted.
+        if (allowExecutionArtifacts && relative === "" && ["node_modules", "dist", ".vitest"].includes(child)) {
+          const artifactPath = `${root}/${child}`;
+          const stat = await reader.lstat(artifactPath);
+          requireSafe(stat.isDirectory() && !stat.isSymbolicLink() && await reader.realpath(artifactPath) === artifactPath, "unsafe_execution_artifact");
+          continue;
+        }
         requireSafe(original.has(child) || directories.has(child), "unexpected_entry");
         await walk(child);
       }

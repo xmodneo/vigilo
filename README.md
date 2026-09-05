@@ -3,9 +3,9 @@
 Task 1.1 proves the disposable Node.js 24 Vercel Sandbox boundary. Task 1.2 adds
 a separate [controlled broken fixture](fixtures/README.md). Task 1.3 runs its
 [original failing baseline in a real sandbox](docs/baseline.md). Task 1.4
-[applies and freezes the predetermined candidate](docs/candidate.md). Fresh
-independent verification is not implemented yet. There is no web app, database,
-or model integration.
+[applies and freezes the predetermined candidate](docs/candidate.md). Task 1.5
+[verifies those frozen bytes in a fresh sandbox](docs/verification.md). There is
+no web app, database, or model integration.
 
 ## Prerequisites and pinned dependencies
 
