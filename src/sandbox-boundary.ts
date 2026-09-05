@@ -18,7 +18,15 @@ type CleanupTarget = {
   delete(options: { signal: AbortSignal; deleteOrphanSnapshots: boolean }): Promise<unknown>;
 };
 
-export async function cleanupSandbox(sandbox: CleanupTarget) {
+export type CleanupError = { operation: "stop" | "delete" | "lookup"; code: string };
+export function providerErrorCode(error: unknown) {
+  return error instanceof APIError ? `provider_http_${error.response.status}` : "provider_operation_failed";
+}
+export class ExecutionCancelled extends Error {
+  constructor() { super("execution_cancelled"); }
+}
+
+export async function cleanupSandbox(sandbox: CleanupTarget, errors: CleanupError[]) {
   const result: { stop: "confirmed" | "failed"; delete: "confirmed" | "failed" } = {
     stop: "failed", delete: "failed",
   };
@@ -27,11 +35,11 @@ export async function cleanupSandbox(sandbox: CleanupTarget) {
   try {
     await sandbox.stop({ signal: AbortSignal.timeout(20_000) });
     result.stop = "confirmed";
-  } catch { /* Continue to deletion even if stopping fails. */ }
+  } catch (error) { errors.push({ operation: "stop", code: providerErrorCode(error) }); }
   try {
     await sandbox.delete({ signal: AbortSignal.timeout(20_000), deleteOrphanSnapshots: true });
     result.delete = "confirmed";
-  } catch { /* Report uncertainty; never print SDK errors containing requests. */ }
+  } catch (error) { errors.push({ operation: "delete", code: providerErrorCode(error) }); }
   return result;
 }
 
@@ -40,6 +48,7 @@ export async function cleanupSandbox(sandbox: CleanupTarget) {
 export class SandboxBoundary {
   readonly evidence;
   readonly cleanup = { stop: "not_needed", delete: "not_needed", lookup: "not_run" };
+  readonly cleanupErrors: CleanupError[] = [];
   readonly transition = { status: "not_run", requested: "deny-all", readBack: null as string | null, sameSession: false };
   private sandbox: Sandbox | undefined;
   private createAttempted = false;
@@ -69,13 +78,14 @@ export class SandboxBoundary {
     this.transition.status = "passed";
   }
 
-  async run(work: (sandbox: Sandbox, signal: AbortSignal) => Promise<void>) {
+  async run(work: (sandbox: Sandbox, signal: AbortSignal) => Promise<void>, cancellation?: AbortSignal) {
     const controller = new AbortController();
     const cancel = () => controller.abort();
     process.once("SIGINT", cancel);
     process.once("SIGTERM", cancel);
-    const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(this.timeoutMs - 30_000)]);
+    const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(this.timeoutMs - 30_000), ...(cancellation ? [cancellation] : [])]);
     try {
+      signal.throwIfAborted();
       requireNode24(process.version);
       const { VERCEL_TOKEN: token, VERCEL_TEAM_ID: teamId, VERCEL_PROJECT_ID: projectId } = process.env;
       if ((token || teamId || projectId) && !(token && teamId && projectId)) throw new Error("incomplete_credentials");
@@ -94,6 +104,10 @@ export class SandboxBoundary {
       this.evidence.settingsConfirmed = true;
       this.evidence.sessionId = this.sandbox.currentSession().sessionId;
       await work(this.sandbox, signal);
+      signal.throwIfAborted();
+    } catch (error) {
+      if (controller.signal.aborted || cancellation?.aborted) throw new ExecutionCancelled();
+      throw error;
     } finally {
       try { await this.close(); }
       finally {
@@ -108,15 +122,19 @@ export class SandboxBoundary {
       try {
         this.sandbox = await Sandbox.get({ ...this.credentials, name: this.evidence.name, resume: false, signal: AbortSignal.timeout(10_000) });
         this.evidence.created = true;
-      } catch { this.cleanup.lookup = "unconfirmed_after_create_failure"; }
+      } catch (error) {
+        this.cleanup.lookup = "unconfirmed_after_create_failure";
+        this.cleanupErrors.push({ operation: "lookup", code: providerErrorCode(error) });
+      }
     }
     if (this.sandbox) {
-      Object.assign(this.cleanup, await cleanupSandbox(this.sandbox));
+      Object.assign(this.cleanup, await cleanupSandbox(this.sandbox, this.cleanupErrors));
       try {
         await Sandbox.get({ ...this.credentials, name: this.evidence.name, resume: false, signal: AbortSignal.timeout(10_000) });
         this.cleanup.lookup = "still_present";
       } catch (error) {
         this.cleanup.lookup = error instanceof APIError && error.response.status === 404 ? "absent" : "unconfirmed";
+        if (this.cleanup.lookup === "unconfirmed") this.cleanupErrors.push({ operation: "lookup", code: providerErrorCode(error) });
       }
     }
   }

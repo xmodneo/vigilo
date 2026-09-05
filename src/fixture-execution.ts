@@ -29,13 +29,21 @@ const COMMAND_SCRIPT = `
   console.log(JSON.stringify({
     exitCode: result.status, timedOut: result.error?.code === 'ETIMEDOUT',
     spawnFailed: Boolean(result.error), signalTermination: Boolean(result.signal),
-    stdoutSha256: hash(result.stdout), stderrSha256: hash(result.stderr)
+    stdoutSha256: hash(result.stdout), stderrSha256: hash(result.stderr),
+    diagnostics: {
+      stdoutBytes: Buffer.byteLength(result.stdout ?? ''), stderrBytes: Buffer.byteLength(result.stderr ?? ''),
+      outputTruncated: result.error?.code === 'ENOBUFS',
+      spawnCode: ['ETIMEDOUT', 'ENOBUFS', 'ENOENT'].includes(result.error?.code) ? result.error.code : null,
+      npmCode: /npm (?:error|ERR!) code EUSAGE/.test(result.stderr ?? '') ? 'EUSAGE' : null
+    }
   }));
 `;
 
-type CommandEvidence = {
+export type CommandEvidence = {
   command: string[]; timeoutMs: number; status: string; exitCode: number | null;
   timedOut: boolean; stdoutSha256?: string; stderrSha256?: string;
+  diagnostics?: { stdoutBytes: number; stderrBytes: number; outputTruncated: boolean;
+    spawnCode: string | null; npmCode: string | null; textIncluded: false; trust: "untrusted" };
 };
 export function commandEvidence(args: string[], timeoutMs: number): CommandEvidence {
   return { command: ["npm", ...args], timeoutMs, status: "not_run", exitCode: null, timedOut: false };
@@ -82,6 +90,15 @@ export function fixtureExecutor(sandbox: Sandbox, boundary: SandboxBoundary, sig
     evidence.timedOut = result.timedOut;
     evidence.stdoutSha256 = result.stdoutSha256;
     evidence.stderrSha256 = result.stderrSha256;
+    if (result.diagnostics !== undefined) {
+      const d = object(result.diagnostics);
+      if (![d.stdoutBytes, d.stderrBytes].every(n => Number.isSafeInteger(n) && (n as number) >= 0 && (n as number) <= 262_144) ||
+          typeof d.outputTruncated !== "boolean" || ![null, "ETIMEDOUT", "ENOBUFS", "ENOENT"].includes(d.spawnCode as string | null) ||
+          ![null, "EUSAGE"].includes(d.npmCode as string | null)) throw new Error("invalid_command_diagnostics");
+      evidence.diagnostics = { stdoutBytes: d.stdoutBytes as number, stderrBytes: d.stderrBytes as number,
+        outputTruncated: d.outputTruncated, spawnCode: d.spawnCode as string | null, npmCode: d.npmCode as string | null,
+        textIncluded: false, trust: "untrusted" };
+    }
     if (result.timedOut) {
       evidence.status = "timed_out";
       throw new ExecutionFailure("command_timeout", "npm_deadline_exceeded");

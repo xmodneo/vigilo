@@ -8,6 +8,8 @@ a separate [controlled broken fixture](fixtures/README.md). Task 1.3 runs its
 no web app, database, or model integration. Task 1.6 generates an offline
 [structured evidence report](docs/evidence-report.md) from recorded execution
 results and the frozen candidate artifact.
+Task 1.7 exercises [failure cleanup and provider expiry](docs/failure-cleanup.md)
+with controlled live sandbox failures.
 
 ## Prerequisites and pinned dependencies
 

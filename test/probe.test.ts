@@ -41,21 +41,25 @@ test("HTTP, TCP, or TLS connection after deny-all never counts as blocked", () =
 
 test("deletion is still attempted when stopping fails; raw errors are not returned", async () => {
   let deleted = false;
+  const errors: { operation: "stop" | "delete" | "lookup"; code: string }[] = [];
   const result = await cleanupSandbox({
     async stop() { throw new Error("secret-token-must-not-appear"); },
     async delete() { deleted = true; },
-  });
+  }, errors);
   assert.equal(deleted, true);
   assert.deepEqual(result, { stop: "failed", delete: "confirmed" });
+  assert.deepEqual(errors, [{ operation: "stop", code: "provider_operation_failed" }]);
   assert.equal(JSON.stringify(result).includes("secret-token"), false);
 });
 
 test("failed deletion is reported instead of claiming cleanup succeeded", async () => {
+  const errors: { operation: "stop" | "delete" | "lookup"; code: string }[] = [];
   const result = await cleanupSandbox({
     async stop() {},
     async delete() { throw new Error("provider unavailable"); },
-  });
+  }, errors);
   assert.deepEqual(result, { stop: "confirmed", delete: "failed" });
+  assert.deepEqual(errors, [{ operation: "delete", code: "provider_operation_failed" }]);
 });
 
 test("an intermediate command failure still stops and deletes the sandbox", async (context) => {
