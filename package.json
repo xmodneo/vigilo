@@ -16,7 +16,9 @@
     "candidate": "node --env-file-if-exists=.env.local dist/src/freeze-candidate.js",
     "verify": "node --env-file-if-exists=.env.local dist/src/verify-candidate.js",
     "evidence": "node dist/src/evidence-report.js",
-    "failures": "node --env-file-if-exists=.env.local dist/src/failure-probe.js"
+    "failures": "node --env-file-if-exists=.env.local dist/src/failure-probe.js",
+    "demo": "npm run build --silent && node --env-file-if-exists=.env.local dist/src/demo.js",
+    "demo:failure": "npm run build --silent && node --env-file-if-exists=.env.local dist/src/demo.js --failure"
   },
   "dependencies": {
     "@vercel/sandbox": "3.2.1"

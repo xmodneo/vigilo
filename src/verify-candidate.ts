@@ -11,6 +11,7 @@ export const VERIFICATION_CONTROL = Object.freeze({
   candidateHash: "5a83213ab30bc5e81a88f9910270ac64c0e3b402b66d13096b591da18f8ea346",
   repairSandbox: Object.freeze({ name: "vigilo-candidate-77e7b73a-b775-4bc3-b331-6f6f46bdac7c", sessionId: null }),
 });
+export type VerificationControl = { candidateHash: string; repairSandbox: { name: string; sessionId: string | null } };
 const BASELINE_NEGATIVE_CONTROL = Object.freeze({
   evidence: "recorded_Task_1_3_live_run", source: "docs/baseline.md", observedAt: "2026-09-04",
   baseFixtureIdentity: EXPECTED_FIXTURE_HASH,
@@ -19,11 +20,14 @@ const BASELINE_NEGATIVE_CONTROL = Object.freeze({
   regression: TEST_NAMES[1]!, assertion: "expected_0_received_500", cleanup: "confirmed",
 });
 
-export async function runVerification(candidatePath = fileURLToPath(new URL(`../../.vigilo/candidates/${VERIFICATION_CONTROL.candidateHash}.json`, import.meta.url))) {
+export async function runVerification(
+  candidatePath = fileURLToPath(new URL(`../../.vigilo/candidates/${VERIFICATION_CONTROL.candidateHash}.json`, import.meta.url)),
+  control: VerificationControl = VERIFICATION_CONTROL,
+) {
   const boundary = new SandboxBoundary("vigilo-verifier", INSTALL_POLICY, 240_000);
   const report = {
     success: false, outcome: "invalid_candidate", baseFixtureIdentity: EXPECTED_FIXTURE_HASH,
-    frozenCandidateIdentity: null as string | null, repairSandbox: VERIFICATION_CONTROL.repairSandbox,
+    frozenCandidateIdentity: null as string | null, repairSandbox: control.repairSandbox,
     verifierSandbox: { name: null as string | null, sessionId: null as string | null },
     distinctSandboxConfirmed: false, separationIdentifier: "sandbox_name",
     pristineBaseIntegrity: false, appliedCandidateIdentity: null as string | null, candidateIdentityMatches: false,
@@ -41,14 +45,14 @@ export async function runVerification(candidatePath = fileURLToPath(new URL(`../
   let phase = "load_frozen_candidate";
   try {
     const frozen = loadCandidate(candidatePath);
-    if (frozen.candidateHash !== VERIFICATION_CONTROL.candidateHash) throw new CandidateError("candidate_provenance_mismatch");
+    if (frozen.candidateHash !== control.candidateHash) throw new CandidateError("candidate_provenance_mismatch");
     report.frozenCandidateIdentity = frozen.candidateHash;
     const base = loadOriginalFixture();
     report.outcome = "verifier_infrastructure_failure";
     phase = "provision_fresh_verifier";
     await boundary.run(async (sandbox, signal) => {
       report.verifierSandbox = { name: sandbox.name, sessionId: sandbox.currentSession().sessionId };
-      if (sandbox.name !== boundary.evidence.name || sandbox.name === VERIFICATION_CONTROL.repairSandbox.name) {
+      if (sandbox.name !== boundary.evidence.name || sandbox.name === control.repairSandbox.name) {
         throw new ExecutionFailure("infrastructure_failure", "verifier_not_distinct");
       }
       boundary.assertSameSession(sandbox);

@@ -39,7 +39,7 @@ const list = <T>(decode: Decoder<T>): Decoder<(T | null)[]> => optional(value =>
 const path = oneOf("src/shipping-cost.ts");
 const changes = list(fields({ path, sha256: hash }));
 const sandbox = fields({
-  name: matches(/^vigilo-(?:baseline|candidate|verifier)-[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/),
+  name: matches(/^vigilo-(?:baseline|candidate|repair|verifier)-[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/),
   sessionId: matches(/^sbx_[A-Za-z0-9]{1,64}$/),
 });
 const cleanup = fields({ stop: oneOf("confirmed", "failed", "not_needed"), delete: oneOf("confirmed", "failed", "not_needed"),

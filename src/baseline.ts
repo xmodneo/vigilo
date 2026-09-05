@@ -1,4 +1,4 @@
-import { APIError } from "@vercel/sandbox";
+import { APIError, type Sandbox } from "@vercel/sandbox";
 import { createHash } from "node:crypto";
 import { lstatSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -10,7 +10,7 @@ export const EXPECTED_FIXTURE_HASH = "60c6da3af26475c6efd1212487ae1a12d77a069d98
 const FILES = [".gitignore", ".nvmrc", "package-lock.json", "package.json", "src/shipping-cost.ts", "test/shipping-cost.test.ts", "tsconfig.json"];
 export const TEST_NAMES = ["charges 500 cents below the free-shipping threshold", "offers free shipping at exactly 5000 cents", "offers free shipping above the threshold"];
 const MAX_REPORT_BYTES = 65_536;
-type FixtureFile = { path: string; content: Buffer };
+export type FixtureFile = { path: string; content: Buffer };
 const sha256 = (value: string | Buffer) => createHash("sha256").update(value).digest("hex");
 
 export function fixtureHash(files: FixtureFile[]) {
@@ -80,11 +80,8 @@ function integrityScript() {
   `;
 }
 
-export async function runBaseline() {
-  // No wildcard domains, CIDR ranges, credentials brokering, or GitHub access.
-  // https://vercel.com/docs/sandbox/concepts/firewall#user-defined
-  const boundary = new SandboxBoundary("vigilo-baseline", INSTALL_POLICY, 240_000);
-  const report = {
+export function createBaselineReport(boundary: SandboxBoundary) {
+  return {
     success: false, outcome: "infrastructure_failure",
     sandbox: boundary.evidence,
     fixture: { name: "free-shipping", revision: FIXTURE_REVISION, sha256: EXPECTED_FIXTURE_HASH,
@@ -98,50 +95,61 @@ export async function runBaseline() {
     testResults: null as ReturnType<typeof parseBaselineTests> | null,
     cleanup: boundary.cleanup, error: null as { phase: string; code: string } | null,
   };
+}
+
+export async function executeBaseline(sandbox: Sandbox, boundary: SandboxBoundary, signal: AbortSignal,
+  files: FixtureFile[], report: ReturnType<typeof createBaselineReport>, setPhase: (phase: string) => void) {
+  const execution = fixtureExecutor(sandbox, boundary, signal);
+  const { trustedNode, npm } = execution;
+  const verifyRemote = async () => {
+    if (await trustedNode(["-e", integrityScript()]) !== EXPECTED_FIXTURE_HASH) {
+      throw new BaselineFailure("infrastructure_failure", "remote_fixture_integrity_mismatch");
+    }
+  };
+  const credentialsAbsent = async () => {
+    await execution.credentialsAbsent();
+    report.credentialsExposure = "absent";
+  };
+
+  setPhase("runtime");
+  report.runtime.node = requireNode24(await trustedNode(["--version"]));
+  await credentialsAbsent();
+  setPhase("upload");
+  await sandbox.writeFiles(files.map(file => ({ path: `${ROOT}/${file.path}`, content: file.content })), { signal });
+  await verifyRemote();
+  report.fixture.uploadedVerified = true;
+  setPhase("install");
+  await npm(report.install, "dependency_installation_failure");
+  setPhase("network_policy_transition");
+  await boundary.denyAll(signal);
+  await credentialsAbsent();
+  await verifyRemote();
+  report.fixture.installedVerified = true;
+  setPhase("typecheck");
+  await npm(report.typecheck, "build_failure");
+  setPhase("build");
+  await npm(report.build, "build_failure");
+  await verifyRemote();
+  report.fixture.beforeTestsVerified = true;
+  setPhase("tests");
+  await npm(report.tests, "unexpected_test_failure", true);
+  report.testResults = parseBaselineTests(await boundedReport(sandbox, signal), report.tests.exitCode);
+  report.tests.status = "expected_failure";
+  report.outcome = "expected_baseline_application_failure";
+}
+
+export async function runBaseline() {
+  // No wildcard domains, CIDR ranges, credentials brokering, or GitHub access.
+  // https://vercel.com/docs/sandbox/concepts/firewall#user-defined
+  const boundary = new SandboxBoundary("vigilo-baseline", INSTALL_POLICY, 240_000);
+  const report = createBaselineReport(boundary);
   let phase = "fixture_integrity";
   try {
     const files = loadOriginalFixture();
     report.fixture.localVerified = true;
     phase = "boundary";
     await boundary.run(async (sandbox, signal) => {
-      const execution = fixtureExecutor(sandbox, boundary, signal);
-      const { trustedNode, npm } = execution;
-      const verifyRemote = async () => {
-        if (await trustedNode(["-e", integrityScript()]) !== EXPECTED_FIXTURE_HASH) {
-          throw new BaselineFailure("infrastructure_failure", "remote_fixture_integrity_mismatch");
-        }
-      };
-      const credentialsAbsent = async () => {
-        await execution.credentialsAbsent();
-        report.credentialsExposure = "absent";
-      };
-
-      phase = "runtime";
-      report.runtime.node = requireNode24(await trustedNode(["--version"]));
-      await credentialsAbsent();
-      phase = "upload";
-      await sandbox.writeFiles(files.map(file => ({ path: `${ROOT}/${file.path}`, content: file.content })), { signal });
-      await verifyRemote();
-      report.fixture.uploadedVerified = true;
-      phase = "install";
-      await npm(report.install, "dependency_installation_failure");
-      phase = "network_policy_transition";
-      await boundary.denyAll(signal);
-      await credentialsAbsent();
-      await verifyRemote();
-      report.fixture.installedVerified = true;
-      // All repository-controlled scripts are below the confirmed deny-all gate.
-      phase = "typecheck";
-      await npm(report.typecheck, "build_failure");
-      phase = "build";
-      await npm(report.build, "build_failure");
-      await verifyRemote();
-      report.fixture.beforeTestsVerified = true;
-      phase = "tests";
-      await npm(report.tests, "unexpected_test_failure", true);
-      report.testResults = parseBaselineTests(await boundedReport(sandbox, signal), report.tests.exitCode);
-      report.tests.status = "expected_failure";
-      report.outcome = "expected_baseline_application_failure";
+      await executeBaseline(sandbox, boundary, signal, files, report, value => { phase = value; });
     });
   } catch (error) {
     report.outcome = error instanceof BaselineFailure ? error.kind : "infrastructure_failure";

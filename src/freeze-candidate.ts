@@ -1,4 +1,4 @@
-import { APIError } from "@vercel/sandbox";
+import { APIError, type Sandbox } from "@vercel/sandbox";
 import { lstatSync, mkdirSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { loadOriginalFixture, EXPECTED_FIXTURE_HASH, fixtureHash } from "./baseline.js";
@@ -18,6 +18,34 @@ function loadPatch() {
   return content;
 }
 
+export async function collectPredeterminedCandidate(sandbox: Sandbox, boundary: SandboxBoundary, signal: AbortSignal,
+  original: ReturnType<typeof loadOriginalFixture>, allowExecutionArtifacts = false, setPhase: (phase: string) => void = () => {}) {
+  const patch = loadPatch();
+  const reader = sandboxTreeReader(sandbox, signal);
+  setPhase("upload_patch");
+  await sandbox.writeFiles([{ path: PATCH_PATH, content: patch, mode: 0o644 }], { signal });
+  const uploadedPatch = await sandbox.readFileToBuffer({ path: PATCH_PATH }, { signal });
+  if (!uploadedPatch || sha256(uploadedPatch) !== PATCH_HASH) throw new CandidateError("uploaded_patch_mismatch");
+  setPhase("apply_patch");
+  const applied = await sandbox.runCommand({ cmd: "git", args: ["apply", "--whitespace=error-all", "-p1", PATCH_PATH],
+    cwd: ROOT, timeoutMs: 10_000, signal });
+  boundary.assertSameSession(sandbox);
+  if (applied.exitCode !== 0) throw new CandidateError("patch_command_failed");
+  setPhase("collect_candidate");
+  const candidate = buildCandidate(original, await collectTree(reader, ROOT, original, allowExecutionArtifacts));
+  boundary.assertSameSession(sandbox);
+  return candidate;
+}
+
+export function freezeCandidateOnHost(candidate: Candidate) {
+  loadOriginalFixture();
+  const directory = fileURLToPath(new URL("../../.vigilo", import.meta.url));
+  try { mkdirSync(directory, { mode: 0o700 }); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
+  if (!lstatSync(directory).isDirectory() || lstatSync(directory).isSymbolicLink()) throw new CandidateError("unsafe_artifact_root");
+  return freezeCandidate(candidate, `${directory}/candidates`);
+}
+
 export async function runCandidateFreeze() {
   const boundary = new SandboxBoundary("vigilo-candidate", "deny-all", 240_000);
   const report = {
@@ -29,7 +57,6 @@ export async function runCandidateFreeze() {
   let phase = "local_integrity";
   try {
     const original = loadOriginalFixture();
-    const patch = loadPatch();
     let candidate: Candidate | undefined;
     phase = "sandbox";
     await boundary.run(async (sandbox, signal) => {
@@ -42,20 +69,7 @@ export async function runCandidateFreeze() {
       phase = "upload";
       await sandbox.writeFiles(original.map(file => ({ path: `${ROOT}/${file.path}`, content: file.content, mode: 0o644 })), { signal });
       if (fixtureHash(await collectTree(reader, ROOT, original)) !== EXPECTED_FIXTURE_HASH) throw new CandidateError("uploaded_base_mismatch");
-      await sandbox.writeFiles([{ path: PATCH_PATH, content: patch, mode: 0o644 }], { signal });
-      const uploadedPatch = await sandbox.readFileToBuffer({ path: PATCH_PATH }, { signal });
-      if (!uploadedPatch || sha256(uploadedPatch) !== PATCH_HASH) throw new CandidateError("uploaded_patch_mismatch");
-      phase = "apply_patch";
-      // The managed image includes Git but not patch. git apply works without a
-      // repository or index: https://git-scm.com/docs/git-apply#_description
-      const applied = await sandbox.runCommand({ cmd: "git", args: ["apply", "--whitespace=error-all", "-p1", PATCH_PATH],
-        cwd: ROOT, timeoutMs: 10_000, signal });
-      boundary.assertSameSession(sandbox);
-      // Patch output is untrusted and irrelevant to candidate collection.
-      if (applied.exitCode !== 0) throw new CandidateError("patch_command_failed");
-      phase = "collect_candidate";
-      candidate = buildCandidate(original, await collectTree(reader, ROOT, original));
-      boundary.assertSameSession(sandbox);
+      candidate = await collectPredeterminedCandidate(sandbox, boundary, signal, original, false, value => { phase = value; });
       report.validation = "passed";
       report.changedFileCount = candidate.changes.length;
       report.changedPaths = candidate.changes.map(change => change.path);
@@ -68,12 +82,7 @@ export async function runCandidateFreeze() {
     }
     phase = "freeze_on_host";
     if (!candidate) throw new CandidateError("candidate_missing");
-    loadOriginalFixture();
-    const directory = fileURLToPath(new URL("../../.vigilo", import.meta.url));
-    try { mkdirSync(directory, { mode: 0o700 }); }
-    catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
-    if (!lstatSync(directory).isDirectory() || lstatSync(directory).isSymbolicLink()) throw new CandidateError("unsafe_artifact_root");
-    freezeCandidate(candidate, `${directory}/candidates`);
+    freezeCandidateOnHost(candidate);
     report.frozenOutsideSandbox = true;
     report.success = true;
   } catch (error) {

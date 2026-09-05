@@ -2,6 +2,7 @@ import { constants, openSync, closeSync, fstatSync, readSync, mkdirSync, lstatSy
   writeFileSync, readFileSync, mkdtempSync, linkSync, rmSync, fsyncSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { createHash } from "node:crypto";
 import { loadCandidate } from "./candidate.js";
 import { createEvidenceReport, EvidenceError } from "./evidence.js";
 import { VERIFICATION_CONTROL } from "./verify-candidate.js";
@@ -34,32 +35,53 @@ function readBounded(path: string, limit: number) {
 
 // Offline only: no sandbox methods, credential loading, patching, or execution.
 // projectRoot is the host-selected workspace, not a path from an execution record.
-export function generateEvidenceFile(projectRoot: string) {
+function publish(directoryPath: string, name: string, bytes: string, limit: number) {
+  if (Buffer.byteLength(bytes) > limit || !/^(?:workflow|[a-f0-9]{64})\.json$/.test(name)) throw new EvidenceError();
+  const path = join(directoryPath, name);
+  const staging = mkdtempSync(join(directoryPath, ".stage-"));
+  try {
+    const temporary = join(staging, "artifact.json");
+    const fd = openSync(temporary, "wx", 0o600);
+    try { writeFileSync(fd, bytes); fsyncSync(fd); } finally { closeSync(fd); }
+    try { linkSync(temporary, path); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST" || readBounded(path, limit) !== bytes) throw new EvidenceError();
+    }
+    return path;
+  } finally { rmSync(staging, { recursive: true, force: true }); }
+}
+
+export function writeEvidenceRecord(projectRoot: string, input: unknown) {
+  const runtime = join(projectRoot, ".vigilo");
+  directory(runtime);
+  directory(join(runtime, "candidates"));
+  const evidence = join(runtime, "evidence");
+  directory(evidence, true);
+  const records = join(evidence, "records");
+  directory(records, true);
+  const bytes = JSON.stringify(input, null, 2) + "\n";
+  const name = `${createHash("sha256").update(bytes).digest("hex")}.json`;
+  return { path: publish(records, name, bytes, 262_144), name };
+}
+
+export function generateEvidenceFile(projectRoot: string, options: { recordName?: string; candidateHash?: string } = {}) {
   const runtime = join(projectRoot, ".vigilo");
   directory(runtime);
   directory(join(runtime, "candidates"));
   const evidence = join(runtime, "evidence");
   directory(evidence);
-  directory(join(evidence, "records"));
-  const input: unknown = JSON.parse(readBounded(join(evidence, "records/workflow.json"), 262_144));
-  const candidate = loadCandidate(join(runtime, `candidates/${VERIFICATION_CONTROL.candidateHash}.json`));
+  const records = join(evidence, "records");
+  directory(records);
+  const recordName = options.recordName ?? "workflow.json";
+  const candidateHash = options.candidateHash ?? VERIFICATION_CONTROL.candidateHash;
+  if (!/^(?:workflow|[a-f0-9]{64})\.json$/.test(recordName) || !/^[a-f0-9]{64}$/.test(candidateHash)) throw new EvidenceError();
+  const input: unknown = JSON.parse(readBounded(join(records, recordName), 262_144));
+  const candidate = loadCandidate(join(runtime, `candidates/${candidateHash}.json`));
   const report = createEvidenceReport(input, JSON.stringify(candidate));
   const bytes = JSON.stringify(report, null, 2) + "\n";
-  if (Buffer.byteLength(bytes) > 65_536) throw new EvidenceError();
   const reports = join(evidence, "reports");
   directory(reports, true);
-  const path = join(reports, `${report.reportId}.json`);
-  const staging = mkdtempSync(join(reports, ".stage-"));
-  try {
-    const temporary = join(staging, "report.json");
-    const fd = openSync(temporary, "wx", 0o600);
-    try { writeFileSync(fd, bytes); fsyncSync(fd); } finally { closeSync(fd); }
-    try { linkSync(temporary, path); }
-    catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST" || readBounded(path, 65_536) !== bytes) throw new EvidenceError();
-    }
-    return { path, report };
-  } finally { rmSync(staging, { recursive: true, force: true }); }
+  return { path: publish(reports, `${report.reportId}.json`, bytes, 65_536), report };
 }
 
 if (import.meta.main) {

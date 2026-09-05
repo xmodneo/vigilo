@@ -7,7 +7,7 @@ import { buildCandidate } from "../src/candidate.js";
 import { loadOriginalFixture, EXPECTED_FIXTURE_HASH, TEST_NAMES } from "../src/baseline.js";
 import { INSTALL_ARGS } from "../src/fixture-execution.js";
 import { createEvidenceReport } from "../src/evidence.js";
-import { generateEvidenceFile } from "../src/evidence-report.js";
+import { generateEvidenceFile, writeEvidenceRecord } from "../src/evidence-report.js";
 
 function inputs() {
   const base = loadOriginalFixture();
@@ -18,7 +18,7 @@ function inputs() {
   const cleanup = { stop: "confirmed", delete: "confirmed", lookup: "absent" };
   const network = { status: "passed", requested: "deny-all", readBack: "deny-all", sameSession: true };
   const source = { kind: "captured_execution", observedAt: null, itemId: null, outputTruncated: false };
-  const repairName = "vigilo-candidate-00000000-0000-4000-8000-000000000001";
+  const repairName = "vigilo-repair-00000000-0000-4000-8000-000000000001";
   const changes = candidate.changes.map(({ path, sha256 }) => ({ path, sha256 }));
   const baseline = { source, result: {
     success: true, outcome: "expected_baseline_application_failure", error: null,
@@ -134,6 +134,11 @@ test("local generation is repeatable, bounded, and writes only under the evidenc
   assert.equal(first.path, generateEvidenceFile(root).path);
   assert.equal(readFileSync(candidatePath, "utf8"), raw);
   assert.deepEqual(JSON.parse(readFileSync(first.path, "utf8")), first.report);
+  const stored = writeEvidenceRecord(root, input);
+  assert.match(stored.name, /^[a-f0-9]{64}\.json$/);
+  assert.equal(writeEvidenceRecord(root, input).path, stored.path);
+  assert.equal(generateEvidenceFile(root, { recordName: stored.name,
+    candidateHash: JSON.parse(raw).candidateHash }).report.classification.overallOutcome, "verified");
   writeFileSync(recordsPath, " ".repeat(262_145));
   assert.throws(() => generateEvidenceFile(root));
   rmSync(recordsPath);

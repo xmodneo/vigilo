@@ -11,6 +11,39 @@ results and the frozen candidate artifact.
 Task 1.7 exercises [failure cleanup and provider expiry](docs/failure-cleanup.md)
 with controlled live sandbox failures.
 
+## Milestone 1 demonstration
+
+Milestone 1 proves the complete execution boundary with one controlled fixture.
+The happy path uses one repair sandbox to reproduce the known bug and create the
+candidate, followed by a different fresh verifier sandbox that receives only the
+pristine base and frozen candidate bytes. Run it with:
+
+```sh
+npm run demo
+```
+
+The command builds Vigilo, validates the committed fixture, reproduces the
+2-passed/1-failed threshold regression, applies only the pinned repair, freezes
+the exact candidate under `.vigilo/candidates/`, and confirms repair-sandbox
+cleanup. It then provisions a fresh verifier, independently installs dependencies,
+confirms deny-all networking before fixture scripts, and requires typecheck,
+build, and all three tests to pass without source mutation. Finally it writes a
+content-addressed execution record and versioned report under
+`.vigilo/evidence/`. The final JSON exits successfully only when every identity,
+result, separation, credential, and cleanup proof agrees.
+
+Exercise the existing Task 1.7 dependency-installation failure with:
+
+```sh
+npm run demo:failure
+```
+
+Expected failure-demo output classifies `dependency_installation_failure`, retains
+bounded diagnostic hashes/counts and the allowlisted npm code, starts no later
+work, and confirms stop, deletion, and absence. This controlled failure is a
+successful demonstration, so the command exits zero only when that failure and
+its cleanup are observed exactly.
+
 ## Prerequisites and pinned dependencies
 
 - Local Node.js **24.13.0** (`.nvmrc`); the probe rejects other Node majors.
@@ -123,6 +156,12 @@ Raw SDK errors/headers/tokens are never printed.
 - Local tests cover result classification and failure handling, including a
   narrowly mocked SDK failure path. They do **not** prove real VM isolation or
   satisfy acceptance. Task 1.1 requires a successful real `npm run probe`.
+- The Milestone 1 demo is intentionally limited to the committed single-package
+  Node.js 24/npm/Vitest fixture and one predetermined patch. It does not clone
+  GitHub repositories, invoke an AI agent, persist durable jobs, or publish pull
+  requests. The managed sandbox image pins Node's major version rather than an OS
+  digest, so each report records the observed runtime. `.vigilo/` artifacts are
+  local, ignored, unsigned evidence; the trusted host can replace them.
 
 ## Official API sources checked for this task
 
