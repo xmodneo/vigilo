@@ -14,7 +14,8 @@
     "probe": "node --env-file-if-exists=.env.local dist/src/probe.js",
     "baseline": "node --env-file-if-exists=.env.local dist/src/baseline.js",
     "candidate": "node --env-file-if-exists=.env.local dist/src/freeze-candidate.js",
-    "verify": "node --env-file-if-exists=.env.local dist/src/verify-candidate.js"
+    "verify": "node --env-file-if-exists=.env.local dist/src/verify-candidate.js",
+    "evidence": "node dist/src/evidence-report.js"
   },
   "dependencies": {
     "@vercel/sandbox": "3.2.1"

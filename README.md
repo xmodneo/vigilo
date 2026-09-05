@@ -5,7 +5,9 @@ a separate [controlled broken fixture](fixtures/README.md). Task 1.3 runs its
 [original failing baseline in a real sandbox](docs/baseline.md). Task 1.4
 [applies and freezes the predetermined candidate](docs/candidate.md). Task 1.5
 [verifies those frozen bytes in a fresh sandbox](docs/verification.md). There is
-no web app, database, or model integration.
+no web app, database, or model integration. Task 1.6 generates an offline
+[structured evidence report](docs/evidence-report.md) from recorded execution
+results and the frozen candidate artifact.
 
 ## Prerequisites and pinned dependencies
 
