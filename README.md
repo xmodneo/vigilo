@@ -1,11 +1,43 @@
-# Vigilo — execution boundary proofs
+# Vigilo
+
+Vigilo is a sandbox-first software maintenance platform. Milestone 1 proves its
+isolated repair boundary: reproduce a failure, freeze exact candidate bytes,
+verify those bytes in a fresh sandbox, produce structured evidence, and clean up.
+Task 2.1 adds the minimal web/API process. GitHub connection is coming next; this
+shell has no authentication, repository access, persistence, worker, or AI code.
+
+## Web/API shell
+
+Install the pinned dependencies and start local development:
+
+```sh
+npm ci --ignore-scripts
+npm run dev
+```
+
+Open `http://localhost:3000` for the landing page. The health endpoint is
+available at `http://localhost:3000/api/health` and returns the service status as
+JSON.
+
+Build and run the production server with:
+
+```sh
+npm run build
+npm start
+```
+
+`npm run build` compiles the existing Milestone 1 commands before building the
+Next.js application. `npm test` runs the Milestone 1 tests followed by the focused
+web tests. The sandbox demonstrations remain independently available through
+`npm run demo` and `npm run demo:failure`.
+
+## Milestone 1 execution boundary
 
 Task 1.1 proves the disposable Node.js 24 Vercel Sandbox boundary. Task 1.2 adds
 a separate [controlled broken fixture](fixtures/README.md). Task 1.3 runs its
 [original failing baseline in a real sandbox](docs/baseline.md). Task 1.4
 [applies and freezes the predetermined candidate](docs/candidate.md). Task 1.5
-[verifies those frozen bytes in a fresh sandbox](docs/verification.md). There is
-no web app, database, or model integration. Task 1.6 generates an offline
+[verifies those frozen bytes in a fresh sandbox](docs/verification.md). Task 1.6 generates an offline
 [structured evidence report](docs/evidence-report.md) from recorded execution
 results and the frozen candidate artifact.
 Task 1.7 exercises [failure cleanup and provider expiry](docs/failure-cleanup.md)

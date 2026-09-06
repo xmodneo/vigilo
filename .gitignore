@@ -1,5 +1,9 @@
 node_modules/
 dist/
+.next/
+.web-test-dist/
+next-env.d.ts
+*.tsbuildinfo
 .env*
 .vercel/
 .DS_Store

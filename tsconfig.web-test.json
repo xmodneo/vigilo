@@ -1,0 +1,18 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "incremental": false,
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "noEmit": false,
+    "outDir": ".web-test-dist",
+    "rootDir": ".",
+    "types": ["node"]
+  },
+  "include": [
+    "app/page.tsx",
+    "app/api/health/route.ts",
+    "web-test/**/*.ts"
+  ],
+  "exclude": ["node_modules", "dist", ".next", ".web-test-dist"]
+}
