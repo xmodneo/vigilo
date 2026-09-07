@@ -7,6 +7,7 @@
       "esnext"
     ],
     "allowJs": false,
+    "allowImportingTsExtensions": true,
     "skipLibCheck": true,
     "strict": true,
     "noEmit": true,
@@ -30,6 +31,8 @@
     ".next/types/**/*.ts",
     "app/**/*.ts",
     "app/**/*.tsx",
+    "db/**/*.ts",
+    "lib/**/*.ts",
     "web-test/**/*.ts",
     ".next/dev/types/**/*.ts"
   ],

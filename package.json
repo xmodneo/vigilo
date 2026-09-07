@@ -12,13 +12,16 @@
     "build": "npm run build:milestone1 && next build",
     "build:milestone1": "tsc -p tsconfig.milestone1.json",
     "start": "next start",
-    "typecheck": "npm run typecheck:milestone1 && npm run typecheck:web && npm run typecheck:web-tests",
+    "typecheck": "npm run typecheck:milestone1 && npm run typecheck:web && npm run typecheck:web-tests && npm run typecheck:auth-tests",
     "typecheck:milestone1": "tsc --noEmit -p tsconfig.milestone1.json",
     "typecheck:web": "tsc --noEmit -p tsconfig.json",
     "typecheck:web-tests": "tsc --noEmit -p tsconfig.web-test.json",
-    "test": "npm run test:milestone1 && npm run test:web",
+    "typecheck:auth-tests": "tsc --noEmit -p tsconfig.auth-test.json",
+    "test": "npm run test:milestone1 && npm run test:web && npm run test:auth",
     "test:milestone1": "npm run build:milestone1 && node --test dist/test/*.test.js",
-    "test:web": "tsc -p tsconfig.web-test.json && node --test .web-test-dist/web-test/*.test.js",
+    "test:web": "node -e \"require('node:fs').rmSync('.web-test-dist',{recursive:true,force:true})\" && tsc -p tsconfig.web-test.json && node --test .web-test-dist/web-test/*.test.js",
+    "test:auth": "node -e \"require('node:fs').rmSync('.auth-test-dist',{recursive:true,force:true})\" && tsc -p tsconfig.auth-test.json && node --test .auth-test-dist/auth-test/*.test.js",
+    "db:migrate": "node --env-file-if-exists=.env.local --import tsx db/migrate.ts",
     "probe": "node --env-file-if-exists=.env.local dist/src/probe.js",
     "baseline": "node --env-file-if-exists=.env.local dist/src/baseline.js",
     "candidate": "node --env-file-if-exists=.env.local dist/src/freeze-candidate.js",
@@ -29,16 +32,22 @@
     "demo:failure": "npm run build:milestone1 --silent && node --env-file-if-exists=.env.local dist/src/demo.js --failure"
   },
   "dependencies": {
+    "@better-auth/drizzle-adapter": "1.7.2",
     "@vercel/sandbox": "3.2.1",
+    "better-auth": "1.7.2",
+    "drizzle-orm": "0.45.2",
     "next": "16.3.4",
+    "postgres": "3.4.9",
     "react": "19.2.8",
     "react-dom": "19.2.8"
   },
   "devDependencies": {
+    "@electric-sql/pglite": "0.5.8",
     "@types/async-retry": "1.4.9",
     "@types/node": "24.13.3",
     "@types/react": "19.2.18",
     "@types/react-dom": "19.2.7",
+    "tsx": "4.23.13",
     "typescript": "7.0.2"
   }
 }

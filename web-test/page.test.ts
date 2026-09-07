@@ -11,4 +11,5 @@ test('landing page communicates the execution boundary and current status', () =
   assert.match(html, /independently verified before publication/i);
   assert.match(html, /Milestone 1 complete/i);
   assert.match(html, /GitHub connection coming next/i);
+  assert.match(html, /Sign in with GitHub/i);
 });

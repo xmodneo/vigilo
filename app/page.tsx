@@ -24,7 +24,10 @@ export default function Home() {
           <span className="wordmark-mark" aria-hidden="true">V</span>
           <span>Vigilo</span>
         </a>
-        <span className="release-label">Development preview</span>
+        <div className="site-actions">
+          <span className="release-label">Development preview</span>
+          <a className="header-action" href="/sign-in">Sign in with GitHub</a>
+        </div>
       </header>
 
       <section className="hero" aria-labelledby="hero-title">

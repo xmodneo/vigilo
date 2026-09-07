@@ -2,9 +2,11 @@ node_modules/
 dist/
 .next/
 .web-test-dist/
+.auth-test-dist/
 next-env.d.ts
 *.tsbuildinfo
 .env*
+!.env.example
 .vercel/
 .DS_Store
 .vercel

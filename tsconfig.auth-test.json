@@ -1,0 +1,25 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "incremental": false,
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "noEmit": false,
+    "outDir": ".auth-test-dist",
+    "rewriteRelativeImportExtensions": true,
+    "rootDir": ".",
+    "types": ["node"]
+  },
+  "include": [
+    "auth-test/**/*.ts",
+    "db/**/*.ts",
+    "lib/**/*.ts"
+  ],
+  "exclude": [
+    "node_modules",
+    "dist",
+    ".next",
+    ".web-test-dist",
+    ".auth-test-dist"
+  ]
+}

@@ -60,6 +60,26 @@ main {
   outline-offset: 0.25rem;
 }
 
+.site-actions {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+}
+
+.header-action {
+  padding: 0.55rem 0.8rem;
+  border: 1px solid var(--ink);
+  font-size: 0.8125rem;
+  font-weight: 700;
+  text-decoration: none;
+}
+
+.header-action:hover,
+.header-action:focus-visible {
+  color: var(--surface);
+  background: var(--ink);
+}
+
 .wordmark-mark {
   display: grid;
   width: 2rem;
@@ -220,6 +240,101 @@ footer span:first-child {
   font-weight: 700;
 }
 
+.auth-shell,
+.workspace-shell {
+  min-height: 100vh;
+  padding: 2rem 0;
+}
+
+.auth-card,
+.workspace-card {
+  width: min(100%, 42rem);
+  margin: 7rem auto 0;
+  padding: clamp(1.5rem, 5vw, 3rem);
+  border-top: 3px solid var(--accent);
+  background: var(--surface);
+}
+
+.auth-card h1,
+.workspace-card h1 {
+  max-width: none;
+  font-size: clamp(2.25rem, 7vw, 4rem);
+}
+
+.auth-card > p:not(.eyebrow),
+.workspace-next {
+  color: var(--muted);
+}
+
+.auth-action {
+  margin-top: 2rem;
+}
+
+.auth-action [role="alert"] {
+  margin: 0.75rem 0 0;
+  color: var(--accent-dark);
+  font-size: 0.875rem;
+}
+
+.primary-action,
+.secondary-action {
+  border: 1px solid var(--ink);
+  border-radius: 0;
+  font: inherit;
+  font-size: 0.875rem;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.primary-action {
+  padding: 0.8rem 1rem;
+  color: var(--surface);
+  background: var(--ink);
+}
+
+.secondary-action {
+  padding: 0.6rem 0.8rem;
+  color: var(--ink);
+  background: transparent;
+}
+
+.primary-action:disabled,
+.secondary-action:disabled {
+  cursor: wait;
+  opacity: 0.65;
+}
+
+.workspace-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.workspace-card dl {
+  margin: 2rem 0;
+  border-top: 1px solid var(--border);
+}
+
+.workspace-card dl div {
+  display: grid;
+  gap: 0.25rem;
+  padding: 1rem 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.workspace-card dt {
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.75rem;
+  text-transform: uppercase;
+}
+
+.workspace-card dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
 @media (min-width: 52rem) {
   main {
     width: min(100% - 4rem, 76rem);
@@ -253,6 +368,10 @@ footer span:first-child {
 }
 
 @media (max-width: 32rem) {
+  .site-actions .release-label {
+    display: none;
+  }
+
   .release-label {
     max-width: 8rem;
     text-align: right;

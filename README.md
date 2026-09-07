@@ -3,8 +3,9 @@
 Vigilo is a sandbox-first software maintenance platform. Milestone 1 proves its
 isolated repair boundary: reproduce a failure, freeze exact candidate bytes,
 verify those bytes in a fresh sandbox, produce structured evidence, and clean up.
-Task 2.1 adds the minimal web/API process. GitHub connection is coming next; this
-shell has no authentication, repository access, persistence, worker, or AI code.
+Task 2.2 adds GitHub identity sign-in, database-backed sessions, and one private
+workspace per user. GitHub repository access remains a separate future step; no
+GitHub App installation, repository access, worker, or AI code is present.
 
 ## Web/API shell
 
@@ -18,6 +19,41 @@ npm run dev
 Open `http://localhost:3000` for the landing page. The health endpoint is
 available at `http://localhost:3000/api/health` and returns the service status as
 JSON.
+
+## Local authentication and PostgreSQL
+
+Task 2.2 uses Better Auth for GitHub OAuth and server-side sessions. Create a
+GitHub OAuth App with:
+
+- Homepage URL: `http://localhost:3000`
+- Authorization callback URL: `http://localhost:3000/api/auth/callback/github`
+
+Copy `.env.example` to the ignored `.env.local` file and set `DATABASE_URL`,
+`BETTER_AUTH_SECRET`, `BETTER_AUTH_URL`, `GITHUB_CLIENT_ID`, and
+`GITHUB_CLIENT_SECRET`. Generate the auth secret locally with
+`openssl rand -base64 32`; do not commit or paste any secret into reports or
+chat. The OAuth App is used only to establish identity. Repository permissions
+will use a separate GitHub App in Task 2.3.
+
+Apply the checked-in PostgreSQL migration explicitly, then start the app:
+
+```sh
+npm run db:migrate
+npm run dev
+```
+
+Visit `http://localhost:3000/sign-in`. A successful GitHub sign-in creates one
+database-backed Vigilo session and idempotently provisions exactly one private
+workspace. `/app` and `/api/workspace` validate the session against PostgreSQL
+and resolve that workspace on the server for every request. Signing out deletes
+the active session. OAuth tokens are encrypted at rest by Better Auth and are
+never returned by the workspace endpoint.
+
+The reviewable schema is in `db/schema.ts`; SQL migrations and Drizzle snapshots
+are under `drizzle/`. Production startup never mutates the schema automatically.
+Authentication tests run the same PostgreSQL migration against an ephemeral
+PGlite PostgreSQL engine, so normal tests need neither live GitHub OAuth nor a
+separately managed test database.
 
 Build and run the production server with:
 
@@ -85,7 +121,8 @@ its cleanup are observed exactly.
   `@types/async-retry` **1.4.9** (required by the SDK's public declarations).
 - `package-lock.json` pins the resolved dependency tree. Install with `npm ci`.
 
-Tests use Node's built-in runner; no test framework dependency is needed.
+Tests use Node's built-in runner. Authentication integration tests use PGlite's
+embedded PostgreSQL engine and do not use SQLite.
 
 ## Local credentials
 
