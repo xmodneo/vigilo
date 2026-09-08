@@ -348,6 +348,49 @@ footer span:first-child {
   overflow-wrap: anywhere;
 }
 
+.repository-panel {
+  margin-top: 2rem;
+  padding-top: 2rem;
+  border-top: 1px solid var(--border);
+}
+
+.repository-panel h2 {
+  font-size: 1.5rem;
+}
+
+.repository-panel dl {
+  margin-top: 1.5rem;
+}
+
+.repository-list {
+  margin: 1.5rem 0 0;
+  padding: 0;
+  border-top: 1px solid var(--border);
+  list-style: none;
+}
+
+.repository-list li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 1rem 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.repository-list span {
+  display: block;
+  color: var(--muted);
+  font-size: 0.8125rem;
+}
+
+.repository-notice {
+  margin-top: 1.5rem;
+  padding: 1rem;
+  border-left: 3px solid var(--accent);
+  background: var(--background);
+}
+
 @media (min-width: 52rem) {
   main {
     width: min(100% - 4rem, 76rem);

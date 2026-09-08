@@ -5,8 +5,9 @@ isolated repair boundary: reproduce a failure, freeze exact candidate bytes,
 verify those bytes in a fresh sandbox, produce structured evidence, and clean up.
 Task 2.2 adds GitHub identity sign-in, database-backed sessions, and one private
 workspace per user. Task 2.3 associates a separately authorized GitHub App
-installation with that workspace. Repository selection and repository operations
-remain future work.
+installation with that workspace. Task 2.4 lists and selects repositories only
+when both the installation and the signed-in user currently have sufficient
+access. Repository operations remain future work.
 
 ## Web/API shell
 
@@ -33,8 +34,10 @@ Copy `.env.example` to the ignored `.env.local` file and set `DATABASE_URL`,
 `BETTER_AUTH_SECRET`, `BETTER_AUTH_URL`, `GITHUB_CLIENT_ID`, and
 `GITHUB_CLIENT_SECRET`. Generate the auth secret locally with
 `openssl rand -base64 32`; do not commit or paste any secret into reports or
-chat. The OAuth App is used only to establish identity. Repository permissions
-will use a separate GitHub App in Task 2.3.
+chat. The OAuth App is identity-only and uses Better Auth's default GitHub scopes
+(`read:user` and `user:email`). Its token is never used for repository discovery
+or authorization. The separate GitHub App is the authority for Vigilo's
+repository access.
 
 Apply the checked-in PostgreSQL migration explicitly, then start the app:
 
@@ -83,9 +86,28 @@ paste the PEM into source, chat, or an environment value. Apply the explicit
 migration with `npm run db:migrate`, restart the web process, sign in, and visit
 `http://localhost:3000/app/github`.
 
-GitHub App setup is intentionally manual for this local milestone. No webhook,
-repository listing, installation-token minting, or repository operation exists
-in Task 2.3.
+GitHub App setup is intentionally manual for this local milestone. Task 2.4 uses
+a short-lived, single-use state and PKCE flow to obtain a temporary GitHub App
+user access token. With that token, Vigilo verifies the signed-in GitHub user,
+checks access to the workspace's verified installation, and calls GitHub's
+user-installation repository endpoint. That endpoint supplies the intersection
+of repositories accessible to both the user and the App installation. Vigilo
+keeps only entries with explicit push or admin permission and immediately
+revokes the temporary token before storing bounded repository metadata.
+
+Apply the latest migration, then visit `http://localhost:3000/app/github`.
+Loading repositories requires a brief GitHub App authorization. Selecting one
+starts a fresh authorization whose token exchange is restricted to the selected
+stable repository ID, and the server revalidates eligibility before persistence.
+The token is never sent to browser JavaScript, logged, or stored. A selected
+repository stores only its stable ID and bounded metadata; no clone, source read,
+repository write, or execution-profile detection occurs in Task 2.4.
+
+Current API sources:
+
+- GitHub App user access tokens and PKCE: https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/generating-a-user-access-token-for-a-github-app
+- User-accessible installations and repositories: https://docs.github.com/en/rest/apps/installations
+- GitHub App token revocation: https://docs.github.com/en/rest/apps/oauth-applications
 
 Build and run the production server with:
 

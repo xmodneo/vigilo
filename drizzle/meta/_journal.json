@@ -15,6 +15,20 @@
       "when": 1788772800000,
       "tag": "0001_github-installation",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1788861600000,
+      "tag": "0002_repository",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1788948000000,
+      "tag": "0003_repository-access",
+      "breakpoints": true
     }
   ]
 }

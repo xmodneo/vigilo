@@ -121,6 +121,89 @@ test('GitHub client verifies user and installation without minting an installati
   assert.match(requests[4]?.headers.get('authorization') ?? '', /^Basic /);
 });
 
+function repositoryResponse(input: {
+  id: number;
+  permissions?: { admin: boolean; push: boolean };
+}) {
+  return {
+    default_branch: 'main',
+    full_name: 'xmodneo/vigilo',
+    id: input.id,
+    name: 'vigilo',
+    owner: { id: 62422139, login: 'xmodneo' },
+    permissions: input.permissions,
+    private: false,
+  };
+}
+
+test('repository access uses the GitHub App user-token intersection and revokes the token', async () => {
+  const keys = keyPair();
+  const requests: Array<{ body: string; headers: Headers; method: string; url: string }> = [];
+  const responses = [
+    Response.json({ access_token: 'ghu_transient-repository-token' }),
+    Response.json({
+      repositories: [repositoryResponse({
+        id: 8101,
+        permissions: { admin: false, push: true },
+      })],
+      total_count: 1,
+    }),
+    new Response(null, { status: 204 }),
+  ];
+  const fetchStub: typeof fetch = async (input, init) => {
+    requests.push({
+      body: typeof init?.body === 'string' ? init.body : '',
+      headers: new Headers(init?.headers),
+      method: init?.method ?? 'GET',
+      url: String(input),
+    });
+    const response = responses.shift();
+    assert.ok(response);
+    return response;
+  };
+  const client = new GitHubApiClient(CONFIGURATION, keys.privateKey, fetchStub, () => NOW);
+
+  const token = await client.exchangeAuthorizationCode({
+    code: 'one-time-code',
+    codeVerifier: 'valid-code-verifier-0123456789',
+    redirectUri: 'http://localhost:3000/api/github/installations/callback',
+    repositoryId: 8101,
+  });
+  const repositories = await client.listUserInstallationRepositories(token, 7001);
+  await client.revokeUserAccessToken(token);
+
+  const exchangeBody = new URLSearchParams(requests[0]?.body);
+  assert.equal(exchangeBody.get('repository_id'), '8101');
+  assert.equal(requests[0]?.url, 'https://github.com/login/oauth/access_token');
+  assert.equal(requests[0]?.method, 'POST');
+  assert.match(requests[1]?.url ?? '', /\/user\/installations\/7001\/repositories\?/);
+  assert.equal(requests[1]?.headers.get('authorization'), 'Bearer ghu_transient-repository-token');
+  assert.equal(
+    requests[2]?.url,
+    `https://api.github.com/applications/${CONFIGURATION.clientId}/token`,
+  );
+  assert.equal(requests[2]?.method, 'DELETE');
+  assert.deepEqual(repositories.map((repository) => repository.id), [8101]);
+  assert.equal(repositories[0]?.permissions.push, true);
+  assert.equal(requests.some((request) => request.url.includes('/user/repos')), false);
+  assert.equal(requests.some((request) => request.url.includes('/access_tokens')), false);
+});
+
+test('repository discovery rejects malformed provider metadata', async () => {
+  const keys = keyPair();
+  const client = new GitHubApiClient(
+    CONFIGURATION,
+    keys.privateKey,
+    async () => Response.json([repositoryResponse({ id: 8101 })]),
+    () => NOW,
+  );
+
+  await assert.rejects(
+    client.listUserInstallationRepositories('ghu_user-sentinel', 7001),
+    (error: unknown) => error instanceof Error && error.message === 'github_api_error',
+  );
+});
+
 test('GitHub client rejects malformed, unavailable, and oversized provider responses generically', async () => {
   const keys = keyPair();
 

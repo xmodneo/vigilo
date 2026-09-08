@@ -143,10 +143,73 @@ export const githubInstallationAttempt = pgTable(
   ],
 );
 
+export const repository = pgTable(
+  'repository',
+  {
+    githubRepositoryId: bigint('github_repository_id', { mode: 'number' }).primaryKey(),
+    workspaceId: text('workspace_id')
+      .notNull()
+      .unique()
+      .references(() => workspace.id, { onDelete: 'cascade' }),
+    installationId: bigint('installation_id', { mode: 'number' })
+      .notNull()
+      .references(() => githubInstallation.installationId, { onDelete: 'cascade' }),
+    ownerId: bigint('owner_id', { mode: 'number' }).notNull(),
+    ownerLogin: text('owner_login').notNull(),
+    name: text('name').notNull(),
+    fullName: text('full_name').notNull(),
+    defaultBranch: text('default_branch'),
+    isPrivate: boolean('is_private').notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [index('repository_installation_id_idx').on(table.installationId)],
+);
+
+export const githubRepositoryAccessAttempt = pgTable(
+  'github_repository_access_attempt',
+  {
+    id: text('id').primaryKey(),
+    workspaceId: text('workspace_id')
+      .notNull()
+      .references(() => workspace.id, { onDelete: 'cascade' }),
+    sessionId: text('session_id')
+      .notNull()
+      .references(() => session.id, { onDelete: 'cascade' }),
+    installationId: bigint('installation_id', { mode: 'number' })
+      .notNull()
+      .references(() => githubInstallation.installationId, { onDelete: 'cascade' }),
+    stateHash: text('state_hash').notNull().unique(),
+    operation: text('operation').notNull(),
+    repositoryId: bigint('repository_id', { mode: 'number' }),
+    codeVerifier: text('code_verifier'),
+    repositoriesJson: text('repositories_json'),
+    expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
+    consumedAt: timestamp('consumed_at', { withTimezone: true }),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    index('github_repository_access_attempt_workspace_id_idx').on(table.workspaceId),
+    index('github_repository_access_attempt_session_id_idx').on(table.sessionId),
+    index('github_repository_access_attempt_expires_at_idx').on(table.expiresAt),
+    check(
+      'github_repository_access_attempt_operation_check',
+      sql`${table.operation} in ('list', 'select')`,
+    ),
+    check(
+      'github_repository_access_attempt_repository_check',
+      sql`(${table.operation} = 'list' and ${table.repositoryId} is null) or (${table.operation} = 'select' and ${table.repositoryId} is not null)`,
+    ),
+  ],
+);
+
 export const authSchema = {
   account,
   githubInstallation,
   githubInstallationAttempt,
+  githubRepositoryAccessAttempt,
+  repository,
   session,
   user,
   verification,

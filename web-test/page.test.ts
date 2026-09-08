@@ -10,7 +10,7 @@ test('landing page communicates the execution boundary and current status', () =
   assert.match(html, /sandbox-first software maintenance platform/i);
   assert.match(html, /independently verified before publication/i);
   assert.match(html, /Milestone 1 complete/i);
-  assert.match(html, /GitHub App connection available/i);
-  assert.match(html, /repository selection comes next/i);
+  assert.match(html, /Repository selection available/i);
+  assert.match(html, /execution setup comes next/i);
   assert.match(html, /Sign in with GitHub/i);
 });

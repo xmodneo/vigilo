@@ -9,6 +9,10 @@ import type {
   GitHubInstallationGateway,
   VerifiedGitHubInstallation,
 } from './types.ts';
+import type {
+  GitHubRepositoryAccessGateway,
+  GitHubUserInstallationRepository,
+} from '../github-repositories/types.ts';
 
 const API_BASE_URL = 'https://api.github.com';
 const API_VERSION = '2026-03-10';
@@ -139,7 +143,35 @@ function parseInstallation(value: unknown): VerifiedGitHubInstallation {
   };
 }
 
-export class GitHubApiClient implements GitHubInstallationGateway {
+function booleanValue(value: unknown): boolean {
+  if (typeof value !== 'boolean') throw new GitHubProviderError();
+  return value;
+}
+
+function parseUserInstallationRepository(value: unknown): GitHubUserInstallationRepository {
+  const record = objectValue(value);
+  const owner = objectValue(record.owner);
+  const permissions = objectValue(record.permissions);
+  const defaultBranch = record.default_branch;
+  if (defaultBranch !== null && typeof defaultBranch !== 'string') {
+    throw new GitHubProviderError();
+  }
+  return {
+    defaultBranch: defaultBranch === null ? null : nonemptyString(defaultBranch),
+    fullName: nonemptyString(record.full_name, 512),
+    id: positiveSafeInteger(record.id),
+    isPrivate: booleanValue(record.private),
+    name: nonemptyString(record.name),
+    ownerId: positiveSafeInteger(owner.id),
+    ownerLogin: nonemptyString(owner.login),
+    permissions: {
+      admin: booleanValue(permissions.admin),
+      push: booleanValue(permissions.push),
+    },
+  };
+}
+
+export class GitHubApiClient implements GitHubInstallationGateway, GitHubRepositoryAccessGateway {
   private readonly privateKey: KeyObject;
 
   constructor(
@@ -159,6 +191,7 @@ export class GitHubApiClient implements GitHubInstallationGateway {
     code: string;
     codeVerifier: string;
     redirectUri: string;
+    repositoryId?: number;
   }): Promise<string> {
     const body = new URLSearchParams({
       client_id: this.configuration.clientId,
@@ -167,6 +200,9 @@ export class GitHubApiClient implements GitHubInstallationGateway {
       code_verifier: input.codeVerifier,
       redirect_uri: input.redirectUri,
     });
+    if (input.repositoryId !== undefined) {
+      body.set('repository_id', String(input.repositoryId));
+    }
     const result = objectValue(
       await this.requestJson(`${GITHUB_BASE_URL}/login/oauth/access_token`, {
         body: body.toString(),
@@ -214,6 +250,48 @@ export class GitHubApiClient implements GitHubInstallationGateway {
         headers: { Authorization: `Bearer ${jwt}` },
       }),
     );
+  }
+
+  async listUserInstallationRepositories(
+    accessToken: string,
+    installationId: number,
+  ): Promise<GitHubUserInstallationRepository[]> {
+    const repositories: GitHubUserInstallationRepository[] = [];
+    for (let page = 1; page <= 100; page += 1) {
+      const result = objectValue(
+        await this.apiJson(
+          `/user/installations/${installationId}/repositories?per_page=100&page=${page}`,
+          { headers: { Authorization: `Bearer ${accessToken}` } },
+        ),
+      );
+      if (!Array.isArray(result.repositories) || result.repositories.length > 100) {
+        throw new GitHubProviderError();
+      }
+      repositories.push(...result.repositories.map(parseUserInstallationRepository));
+      if (result.repositories.length < 100) return repositories;
+    }
+    throw new GitHubProviderError();
+  }
+
+  async revokeUserAccessToken(accessToken: string): Promise<void> {
+    const authorization = Buffer.from(
+      `${this.configuration.clientId}:${this.configuration.clientSecret}`,
+      'utf8',
+    ).toString('base64');
+    const response = await this.request(
+      `${API_BASE_URL}/applications/${encodeURIComponent(this.configuration.clientId)}/token`,
+      {
+        body: JSON.stringify({ access_token: accessToken }),
+        headers: {
+          Accept: 'application/vnd.github+json',
+          Authorization: `Basic ${authorization}`,
+          'Content-Type': 'application/json',
+          'X-GitHub-Api-Version': API_VERSION,
+        },
+        method: 'DELETE',
+      },
+    );
+    if (response.status !== 204) throw new GitHubProviderError();
   }
 
   async revokeUserAuthorization(accessToken: string): Promise<void> {

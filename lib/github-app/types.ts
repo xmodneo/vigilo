@@ -27,6 +27,7 @@ export interface GitHubInstallationGateway {
     code: string;
     codeVerifier: string;
     redirectUri: string;
+    repositoryId?: number;
   }): Promise<string>;
   getAuthenticatedUserId(accessToken: string): Promise<string>;
   listAccessibleInstallationIds(accessToken: string): Promise<number[]>;

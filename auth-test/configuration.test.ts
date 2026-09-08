@@ -29,6 +29,12 @@ test('production auth configuration enables database OAuth state and token encry
   ]);
   assert.deepEqual(options.trustedOrigins, ['https://vigilo.example']);
   assert.equal(options.logger?.disabled, true);
+  const githubProvider = options.socialProviders?.github;
+  assert.equal(typeof githubProvider, 'object');
+  assert.notEqual(githubProvider, null);
+  if (typeof githubProvider === 'object' && githubProvider !== null) {
+    assert.equal(githubProvider.scope, undefined);
+  }
 });
 
 test('server environment accepts local HTTP and requires PostgreSQL and a strong auth secret', () => {
@@ -81,6 +87,7 @@ test('GitHub authorization starts with state, PKCE, and the configured callback'
     'http://localhost:3000/api/auth/callback/github',
   );
   assert.match(authorizationUrl.searchParams.get('scope') ?? '', /user:email/);
+  assert.doesNotMatch(authorizationUrl.searchParams.get('scope') ?? '', /(?:^|\s)repo(?:\s|$)/);
   assert.ok(response.headers.get('set-cookie'));
   assert.equal(storedState.length, 1);
 });

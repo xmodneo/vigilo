@@ -49,7 +49,7 @@ export default function Home() {
           </p>
           <div className="next-step">
             <span className="status-dot" aria-hidden="true" />
-            <span>GitHub App connection available; repository selection comes next</span>
+            <span>Repository selection available; execution setup comes next</span>
           </div>
         </aside>
       </section>
