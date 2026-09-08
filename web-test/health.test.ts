@@ -11,6 +11,6 @@ test('GET /api/health returns the current Vigilo Milestone 2 status', async () =
   assert.deepEqual(await response.json(), {
     service: 'vigilo-web',
     status: 'ok',
-    milestone: '2.2',
+    milestone: '2.3',
   });
 });

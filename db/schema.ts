@@ -1,11 +1,14 @@
 import {
+  bigint,
   boolean,
+  check,
   index,
   pgTable,
   text,
   timestamp,
   uniqueIndex,
 } from 'drizzle-orm/pg-core';
+import { sql } from 'drizzle-orm';
 
 export const user = pgTable('user', {
   id: text('id').primaryKey(),
@@ -86,4 +89,66 @@ export const workspace = pgTable(
   (table) => [uniqueIndex('workspace_owner_user_id_unique').on(table.ownerUserId)],
 );
 
-export const authSchema = { account, session, user, verification, workspace };
+export const githubInstallation = pgTable(
+  'github_installation',
+  {
+    installationId: bigint('installation_id', { mode: 'number' }).primaryKey(),
+    workspaceId: text('workspace_id')
+      .notNull()
+      .unique()
+      .references(() => workspace.id, { onDelete: 'cascade' }),
+    githubAccountId: bigint('github_account_id', { mode: 'number' }).notNull(),
+    accountLogin: text('account_login').notNull(),
+    accountType: text('account_type').notNull(),
+    status: text('status').notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    check(
+      'github_installation_account_type_check',
+      sql`${table.accountType} in ('User', 'Organization')`,
+    ),
+    check('github_installation_status_check', sql`${table.status} = 'active'`),
+  ],
+);
+
+export const githubInstallationAttempt = pgTable(
+  'github_installation_attempt',
+  {
+    id: text('id').primaryKey(),
+    workspaceId: text('workspace_id')
+      .notNull()
+      .references(() => workspace.id, { onDelete: 'cascade' }),
+    sessionId: text('session_id')
+      .notNull()
+      .references(() => session.id, { onDelete: 'cascade' }),
+    stateHash: text('state_hash').notNull().unique(),
+    phase: text('phase').notNull(),
+    installationId: bigint('installation_id', { mode: 'number' }),
+    codeVerifier: text('code_verifier'),
+    expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
+    consumedAt: timestamp('consumed_at', { withTimezone: true }),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    index('github_installation_attempt_workspace_id_idx').on(table.workspaceId),
+    index('github_installation_attempt_session_id_idx').on(table.sessionId),
+    index('github_installation_attempt_expires_at_idx').on(table.expiresAt),
+    check(
+      'github_installation_attempt_phase_check',
+      sql`${table.phase} in ('installation', 'authorization')`,
+    ),
+  ],
+);
+
+export const authSchema = {
+  account,
+  githubInstallation,
+  githubInstallationAttempt,
+  session,
+  user,
+  verification,
+  workspace,
+};

@@ -4,7 +4,10 @@ const nextConfig: NextConfig = {
   agentRules: false,
   logging: {
     incomingRequests: {
-      ignore: [/^\/api\/auth\/callback(?:\/|$)/],
+      ignore: [
+        /^\/api\/auth\/callback(?:\/|$)/,
+        /^\/api\/github\/installations\/(?:setup|callback)(?:\?|$)/,
+      ],
     },
   },
 };

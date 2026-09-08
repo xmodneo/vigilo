@@ -14,7 +14,8 @@
     "next.config.ts",
     "app/page.tsx",
     "app/api/health/route.ts",
-    "web-test/**/*.ts"
+    "web-test/**/*.ts",
+    "web-test/**/*.tsx"
   ],
   "exclude": ["node_modules", "dist", ".next", ".web-test-dist"]
 }

@@ -8,6 +8,13 @@
       "when": 1788660000589,
       "tag": "0000_auth-workspace",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1788772800000,
+      "tag": "0001_github-installation",
+      "breakpoints": true
     }
   ]
 }

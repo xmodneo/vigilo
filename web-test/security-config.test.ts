@@ -3,7 +3,7 @@ import test from 'node:test';
 
 import nextConfig from '../next.config.js';
 
-test('development logs omit OAuth callback URLs', () => {
+test('development logs omit identity and GitHub App callback URLs', () => {
   const logging = nextConfig.logging;
 
   assert.equal(typeof logging, 'object');
@@ -30,5 +30,14 @@ test('development logs omit OAuth callback URLs', () => {
     ),
     true,
   );
+  for (const callbackPath of [
+    '/api/github/installations/setup?installation_id=7001&state=temporary',
+    '/api/github/installations/callback?code=temporary&state=temporary',
+  ]) {
+    assert.equal(
+      ignoredRequests.some((pattern) => pattern.test(callbackPath)),
+      true,
+    );
+  }
   assert.equal(ignoredRequests.some((pattern) => pattern.test('/api/health')), false);
 });

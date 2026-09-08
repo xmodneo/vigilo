@@ -4,8 +4,9 @@ Vigilo is a sandbox-first software maintenance platform. Milestone 1 proves its
 isolated repair boundary: reproduce a failure, freeze exact candidate bytes,
 verify those bytes in a fresh sandbox, produce structured evidence, and clean up.
 Task 2.2 adds GitHub identity sign-in, database-backed sessions, and one private
-workspace per user. GitHub repository access remains a separate future step; no
-GitHub App installation, repository access, worker, or AI code is present.
+workspace per user. Task 2.3 associates a separately authorized GitHub App
+installation with that workspace. Repository selection and repository operations
+remain future work.
 
 ## Web/API shell
 
@@ -54,6 +55,37 @@ are under `drizzle/`. Production startup never mutates the schema automatically.
 Authentication tests run the same PostgreSQL migration against an ephemeral
 PGlite PostgreSQL engine, so normal tests need neither live GitHub OAuth nor a
 separately managed test database.
+
+## Local GitHub App installation
+
+Task 2.3 keeps identity OAuth and repository authorization separate. The OAuth
+App described above answers who signed in. A distinct GitHub App records what
+repository access the user grants to Vigilo. The GitHub App requests only:
+
+- Metadata: read
+- Contents: read and write
+- Pull requests: read and write
+
+The current installation flow uses `/api/github/installations/setup` as the App
+setup URL and `/api/github/installations/callback` as its OAuth callback. GitHub
+documents that the `installation_id` in a setup redirect can be spoofed. Vigilo
+therefore binds the installation attempt to the current database session and
+workspace with a short-lived, single-use state value, then uses a transient
+GitHub App user authorization to confirm that the signed-in GitHub user can
+access the installation. It independently verifies the installation with an App
+JWT before storing stable installation facts. The transient user grant is
+revoked immediately. No installation access token is minted or stored.
+
+After creating the local development GitHub App, configure the additional
+`GITHUB_APP_*` values from `.env.example`. Save the downloaded private key at
+`.secrets/vigilo-dev.pem` with file mode `0600`; `.secrets/` is ignored. Never
+paste the PEM into source, chat, or an environment value. Apply the explicit
+migration with `npm run db:migrate`, restart the web process, sign in, and visit
+`http://localhost:3000/app/github`.
+
+GitHub App setup is intentionally manual for this local milestone. No webhook,
+repository listing, installation-token minting, or repository operation exists
+in Task 2.3.
 
 Build and run the production server with:
 

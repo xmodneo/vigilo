@@ -5,6 +5,9 @@ import type { VigiloDatabase } from '../db/types.ts';
 import { ensureWorkspaceForUser } from '../workspaces.ts';
 
 type AuthSession = {
+  session: {
+    id: string;
+  };
   user: {
     id: string;
     name: string;
@@ -15,6 +18,7 @@ type AuthSession = {
 export type SessionReader = (headers: Headers) => Promise<AuthSession | null>;
 
 export interface AuthenticatedWorkspace {
+  sessionId: string;
   user: AuthSession['user'];
   githubUserId: string;
   workspace: {
@@ -58,6 +62,7 @@ export async function resolveAuthenticatedWorkspace(
   const ownedWorkspace = await ensureWorkspaceForUser(database, currentSession.user.id);
 
   return {
+    sessionId: currentSession.session.id,
     user: currentSession.user,
     githubUserId: githubAccount.accountId,
     workspace: {

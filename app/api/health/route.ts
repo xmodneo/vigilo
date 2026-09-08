@@ -2,6 +2,6 @@ export function GET(): Response {
   return Response.json({
     service: 'vigilo-web',
     status: 'ok',
-    milestone: '2.2',
+    milestone: '2.3',
   });
 }

@@ -286,6 +286,19 @@ footer span:first-child {
   cursor: pointer;
 }
 
+.button-link {
+  text-decoration: none;
+}
+
+.connection-status {
+  color: var(--muted);
+  font-weight: 700;
+}
+
+.connection-status.is-connected {
+  color: var(--success);
+}
+
 .primary-action {
   padding: 0.8rem 1rem;
   color: var(--surface);

@@ -37,7 +37,10 @@ export function WorkspaceView({ githubUserId, user, workspaceId }: WorkspaceView
             <dd>{workspaceId}</dd>
           </div>
         </dl>
-        <p className="workspace-next">Repository connection comes next.</p>
+        <p className="workspace-next">
+          <a href="/app/github">Connect a GitHub App installation</a> to prepare for
+          repository selection.
+        </p>
       </section>
     </main>
   );
