@@ -204,6 +204,132 @@ test('repository discovery rejects malformed provider metadata', async () => {
   );
 });
 
+test('execution-profile inspection uses one read-only repository token and immutable refs', async () => {
+  const keys = keyPair();
+  const requests: Array<{ body: string; headers: Headers; method: string; url: string }> = [];
+  const commit = 'a'.repeat(40);
+  const packageContent = '{"name":"vigilo"}';
+  const packageBlobSha = 'b'.repeat(40);
+  const responses = [
+    Response.json({
+      permissions: { contents: 'read', metadata: 'read' },
+      repositories: [repositoryResponse({ id: 8101 })],
+      repository_selection: 'selected',
+      token: 'ghs_installation-token-sentinel',
+    }, { status: 201 }),
+    Response.json(repositoryResponse({ id: 8101 })),
+    Response.json({ object: { sha: commit, type: 'commit' }, ref: 'refs/heads/main' }),
+    Response.json([
+      { name: 'package.json', path: 'package.json', sha: packageBlobSha, size: packageContent.length, type: 'file' },
+    ]),
+    Response.json({
+      content: Buffer.from(packageContent).toString('base64'),
+      encoding: 'base64',
+      name: 'package.json',
+      path: 'package.json',
+      sha: packageBlobSha,
+      size: packageContent.length,
+      type: 'file',
+    }),
+    new Response(null, { status: 204 }),
+  ];
+  const fetchStub: typeof fetch = async (input, init) => {
+    requests.push({
+      body: typeof init?.body === 'string' ? init.body : '',
+      headers: new Headers(init?.headers),
+      method: init?.method ?? 'GET',
+      url: String(input),
+    });
+    const response = responses.shift();
+    assert.ok(response);
+    return response;
+  };
+  const client = new GitHubApiClient(CONFIGURATION, keys.privateKey, fetchStub, () => NOW);
+
+  const scoped = await client.createInstallationAccessToken({
+    installationId: 7001,
+    repositoryId: 8101,
+  });
+  const metadata = await client.getRepositoryMetadata(
+    scoped.accessToken,
+    scoped.repository.ownerLogin,
+    scoped.repository.name,
+  );
+  const resolved = await client.resolveBranchCommit({
+    accessToken: scoped.accessToken,
+    branch: metadata.defaultBranch,
+    owner: metadata.ownerLogin,
+    repository: metadata.name,
+  });
+  const root = await client.getRepositoryRoot({
+    accessToken: scoped.accessToken,
+    owner: metadata.ownerLogin,
+    ref: resolved,
+    repository: metadata.name,
+  });
+  const packageJson = await client.getRepositoryFile({
+    accessToken: scoped.accessToken,
+    owner: metadata.ownerLogin,
+    path: 'package.json',
+    ref: resolved,
+    repository: metadata.name,
+  });
+  await client.revokeInstallationAccessToken(scoped.accessToken);
+
+  assert.equal(scoped.repository.id, 8101);
+  assert.equal(resolved, commit);
+  assert.equal(root[0]?.path, 'package.json');
+  assert.equal(packageJson?.content, packageContent);
+  assert.deepEqual(JSON.parse(requests[0]?.body ?? ''), {
+    permissions: { contents: 'read', metadata: 'read' },
+    repository_ids: [8101],
+  });
+  assert.match(requests[0]?.headers.get('authorization') ?? '', /^Bearer [^.]+\.[^.]+\.[^.]+$/);
+  assert.equal(requests[1]?.headers.get('authorization'), 'Bearer ghs_installation-token-sentinel');
+  assert.match(requests[2]?.url ?? '', /\/git\/ref\/heads%2Fmain$/);
+  assert.match(requests[3]?.url ?? '', new RegExp(`/contents\\?ref=${commit}$`));
+  assert.match(requests[4]?.url ?? '', new RegExp(`/contents/package.json\\?ref=${commit}$`));
+  assert.equal(requests[5]?.url, 'https://api.github.com/installation/token');
+  assert.equal(requests[5]?.method, 'DELETE');
+  assert.equal(requests[5]?.headers.get('authorization'), 'Bearer ghs_installation-token-sentinel');
+  assert.doesNotMatch(JSON.stringify({ metadata, root, packageJson }), /ghs_installation-token-sentinel/);
+});
+
+test('malformed scoped-token repository metadata triggers immediate token revocation', async () => {
+  const keys = keyPair();
+  const requests: Array<{ headers: Headers; method: string; url: string }> = [];
+  const responses = [
+    Response.json({
+      repositories: [{ ...repositoryResponse({ id: 8101 }), id: 'invalid' }],
+      token: 'ghs_malformed-response-token',
+    }, { status: 201 }),
+    new Response(null, { status: 204 }),
+  ];
+  const client = new GitHubApiClient(
+    CONFIGURATION,
+    keys.privateKey,
+    async (input, init) => {
+      requests.push({
+        headers: new Headers(init?.headers),
+        method: init?.method ?? 'GET',
+        url: String(input),
+      });
+      const response = responses.shift();
+      assert.ok(response);
+      return response;
+    },
+    () => NOW,
+  );
+
+  await assert.rejects(
+    client.createInstallationAccessToken({ installationId: 7001, repositoryId: 8101 }),
+    (error: unknown) => error instanceof Error && error.message === 'github_api_error',
+  );
+  assert.equal(requests[1]?.url, 'https://api.github.com/installation/token');
+  assert.equal(requests[1]?.method, 'DELETE');
+  assert.equal(requests[1]?.headers.get('authorization'), 'Bearer ghs_malformed-response-token');
+});
+
 test('GitHub client rejects malformed, unavailable, and oversized provider responses generically', async () => {
   const keys = keyPair();
 

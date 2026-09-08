@@ -3,6 +3,7 @@ import {
   boolean,
   check,
   index,
+  integer,
   pgTable,
   text,
   timestamp,
@@ -204,8 +205,105 @@ export const githubRepositoryAccessAttempt = pgTable(
   ],
 );
 
+export const executionProfile = pgTable(
+  'execution_profile',
+  {
+    githubRepositoryId: bigint('github_repository_id', { mode: 'number' })
+      .primaryKey()
+      .references(() => repository.githubRepositoryId, { onDelete: 'cascade' }),
+    workspaceId: text('workspace_id')
+      .notNull()
+      .references(() => workspace.id, { onDelete: 'cascade' }),
+    installationId: bigint('installation_id', { mode: 'number' })
+      .notNull()
+      .references(() => githubInstallation.installationId, { onDelete: 'cascade' }),
+    profileVersion: integer('profile_version').notNull(),
+    profileIdentity: text('profile_identity').unique(),
+    baseCommitSha: text('base_commit_sha').notNull(),
+    runtimeFamily: text('runtime_family'),
+    nodeMajor: integer('node_major'),
+    packageManager: text('package_manager'),
+    lockfileType: text('lockfile_type'),
+    installOperation: text('install_operation'),
+    typecheckScript: text('typecheck_script'),
+    buildScript: text('build_script'),
+    testScript: text('test_script'),
+    testRunner: text('test_runner'),
+    packageJsonBlobSha: text('package_json_blob_sha'),
+    packageJsonContentSha256: text('package_json_content_sha256'),
+    packageLockBlobSha: text('package_lock_blob_sha'),
+    packageLockContentSha256: text('package_lock_content_sha256'),
+    status: text('status').notNull(),
+    unsupportedReason: text('unsupported_reason'),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    index('execution_profile_workspace_id_idx').on(table.workspaceId),
+    index('execution_profile_installation_id_idx').on(table.installationId),
+    check('execution_profile_version_check', sql`${table.profileVersion} = 2`),
+    check('execution_profile_commit_sha_check', sql`${table.baseCommitSha} ~ '^[0-9a-f]{40}$'`),
+    check(
+      'execution_profile_status_check',
+      sql`${table.status} in ('ready', 'unsupported')`,
+    ),
+    check(
+      'execution_profile_ready_fields_check',
+      sql`(
+        ${table.status} = 'ready'
+        and ${table.profileIdentity} ~ '^[0-9a-f]{64}$'
+        and ${table.runtimeFamily} = 'node'
+        and ${table.nodeMajor} = 24
+        and ${table.packageManager} = 'npm'
+        and ${table.lockfileType} = 'package-lock'
+        and ${table.installOperation} = 'ci'
+        and (${table.typecheckScript} is null or ${table.typecheckScript} = 'typecheck')
+        and (${table.buildScript} is null or ${table.buildScript} = 'build')
+        and ${table.testScript} = 'test'
+        and ${table.testRunner} in ('node-test', 'vitest', 'jest')
+        and ${table.packageJsonBlobSha} ~ '^[0-9a-f]{40}$'
+        and ${table.packageJsonContentSha256} ~ '^[0-9a-f]{64}$'
+        and ${table.packageLockBlobSha} ~ '^[0-9a-f]{40}$'
+        and ${table.packageLockContentSha256} ~ '^[0-9a-f]{64}$'
+        and ${table.unsupportedReason} is null
+      ) or (
+        ${table.status} = 'unsupported'
+        and ${table.profileIdentity} is null
+        and ${table.runtimeFamily} is null
+        and ${table.nodeMajor} is null
+        and ${table.packageManager} is null
+        and ${table.lockfileType} is null
+        and ${table.installOperation} is null
+        and ${table.typecheckScript} is null
+        and ${table.buildScript} is null
+        and ${table.testScript} is null
+        and ${table.testRunner} is null
+        and ${table.packageJsonBlobSha} is null
+        and ${table.packageJsonContentSha256} is null
+        and ${table.packageLockBlobSha} is null
+        and ${table.packageLockContentSha256} is null
+        and ${table.unsupportedReason} in (
+          'ambiguous_test_runner',
+          'conflicting_lockfiles',
+          'invalid_package_lock',
+          'invalid_script_graph',
+          'malformed_package_json',
+          'missing_package_json',
+          'missing_package_lock',
+          'missing_test_script',
+          'unsupported_monorepo',
+          'unsupported_node_version',
+          'unsupported_package_manager',
+          'unsupported_test_runner'
+        )
+      )`,
+    ),
+  ],
+);
+
 export const authSchema = {
   account,
+  executionProfile,
   githubInstallation,
   githubInstallationAttempt,
   githubRepositoryAccessAttempt,

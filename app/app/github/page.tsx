@@ -5,6 +5,8 @@ import { AccessDeniedError } from '../../../lib/auth/protected-context';
 import { resolveRequestWorkspace } from '../../../lib/auth/resolve-request';
 import { findGitHubInstallation } from '../../../lib/github-app/flow';
 import { getAuthDatabase } from '../../../lib/auth/server';
+import { publicExecutionProfile } from '../../../lib/execution-profiles/handlers';
+import { getExecutionProfileForContext } from '../../../lib/execution-profiles/server';
 import { getRepositoryOverviewForContext } from '../../../lib/github-repositories/server';
 import { GitHubConnectionView } from './github-connection-view';
 
@@ -19,6 +21,7 @@ export default async function GitHubConnectionPage() {
     let repositories = undefined;
     let repositoryError: 'unavailable' | undefined;
     let selectedRepository = undefined;
+    let executionProfile = undefined;
     if (installation) {
       try {
         const overview = await getRepositoryOverviewForContext(context);
@@ -31,6 +34,9 @@ export default async function GitHubConnectionPage() {
               isPrivate: overview.selected.isPrivate,
             }
           : null;
+        executionProfile = overview.selected
+          ? publicExecutionProfile(await getExecutionProfileForContext(context))
+          : null;
       } catch {
         repositoryError = 'unavailable';
       }
@@ -39,6 +45,7 @@ export default async function GitHubConnectionPage() {
     return (
       <GitHubConnectionView
         installation={installation}
+        {...(executionProfile !== undefined ? { executionProfile } : {})}
         {...(repositories ? { repositories } : {})}
         {...(repositoryError ? { repositoryError } : {})}
         {...(selectedRepository !== undefined ? { selectedRepository } : {})}

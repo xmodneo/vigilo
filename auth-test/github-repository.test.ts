@@ -4,6 +4,7 @@ import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
 import {
+  executionProfile,
   githubInstallation,
   githubRepositoryAccessAttempt,
   repository,
@@ -319,6 +320,62 @@ test('write access lost after listing is rejected by fresh selection authorizati
       error instanceof RepositoryAccessError && error.code === 'repository_not_eligible',
   );
   assert.equal((await testContext.database.select().from(repository)).length, 0);
+});
+
+test('selecting a different stable repository invalidates the previous execution profile', async (t) => {
+  const testContext = await createTestContext();
+  t.after(() => testContext.client.close());
+  const authenticated = await authenticatedWorkspace(testContext);
+  const gateway = new FakeRepositoryGateway();
+  gateway.repositories = [
+    providerRepository(FIRST_REPOSITORY, { push: true }),
+    providerRepository(SECOND_REPOSITORY, { push: true }),
+  ];
+  await authorize(
+    testContext.database,
+    authenticated.context,
+    { operation: 'select', repositoryId: FIRST_REPOSITORY.id },
+  );
+  await complete(testContext.database, authenticated.context, gateway);
+  await testContext.database.insert(executionProfile).values({
+    baseCommitSha: 'a'.repeat(40),
+    buildScript: 'build',
+    githubRepositoryId: FIRST_REPOSITORY.id,
+    installOperation: 'ci',
+    installationId: authenticated.installationId,
+    lockfileType: 'package-lock',
+    nodeMajor: 24,
+    packageJsonBlobSha: 'b'.repeat(40),
+    packageJsonContentSha256: 'c'.repeat(64),
+    packageLockBlobSha: 'd'.repeat(40),
+    packageLockContentSha256: 'e'.repeat(64),
+    packageManager: 'npm',
+    profileIdentity: 'f'.repeat(64),
+    profileVersion: 2,
+    runtimeFamily: 'node',
+    status: 'ready',
+    testRunner: 'node-test',
+    testScript: 'test',
+    typecheckScript: 'typecheck',
+    workspaceId: authenticated.context.workspace.id,
+  });
+
+  const secondState = 'second-selection-state-0123456789';
+  await authorize(
+    testContext.database,
+    authenticated.context,
+    { operation: 'select', repositoryId: SECOND_REPOSITORY.id },
+    secondState,
+  );
+  await complete(
+    testContext.database,
+    authenticated.context,
+    gateway,
+    secondState,
+  );
+
+  assert.equal((await testContext.database.select().from(repository))[0]?.githubRepositoryId, SECOND_REPOSITORY.id);
+  assert.equal((await testContext.database.select().from(executionProfile)).length, 0);
 });
 
 test('wrong user, inaccessible installation, replay, and cross-session state fail closed', async (t) => {

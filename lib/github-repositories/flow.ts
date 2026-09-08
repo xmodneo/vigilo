@@ -281,10 +281,17 @@ async function persistSelectedRepository(
       .where(eq(repository.workspaceId, context.workspace.id))
       .limit(1);
     if (existing) {
-      await database
-        .update(repository)
-        .set(values)
-        .where(eq(repository.workspaceId, context.workspace.id));
+      if (existing.githubRepositoryId === selected.id) {
+        await database
+          .update(repository)
+          .set(values)
+          .where(eq(repository.workspaceId, context.workspace.id));
+      } else {
+        await database
+          .delete(repository)
+          .where(eq(repository.workspaceId, context.workspace.id));
+        await database.insert(repository).values(values);
+      }
     } else {
       await database.insert(repository).values(values);
     }

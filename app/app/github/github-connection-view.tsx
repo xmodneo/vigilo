@@ -12,7 +12,49 @@ interface RepositorySummary {
   isPrivate: boolean;
 }
 
+type ExecutionProfileSummary =
+  | {
+      baseRevision: string;
+      build: { script: 'build'; tool: 'npm' } | null;
+      install: { operation: 'ci'; tool: 'npm' };
+      nodeMajor: number | null;
+      packageManager: string | null;
+      profileIdentity: string | null;
+      profileVersion: number;
+      runtimeFamily: string | null;
+      status: 'ready';
+      test: { script: 'test'; tool: 'npm' };
+      testRunner: string | null;
+      typecheck: { script: 'typecheck'; tool: 'npm' } | null;
+    }
+  | {
+      baseRevision: string;
+      profileVersion: number;
+      reason: string | null;
+      status: 'unsupported';
+    };
+
+const unsupportedReasons: Record<string, string> = {
+  ambiguous_test_runner: 'Multiple test runners were detected.',
+  conflicting_lockfiles: 'Competing package-manager lockfiles were found.',
+  invalid_package_lock: 'package-lock.json could not be validated.',
+  invalid_script_graph: 'The test script delegation graph is unsafe or ambiguous.',
+  malformed_package_json: 'package.json could not be validated.',
+  missing_package_json: 'A root package.json is required.',
+  missing_package_lock: 'A committed root package-lock.json is required.',
+  missing_test_script: 'A root test script is required.',
+  unsupported_monorepo: 'Workspaces and monorepo layouts are not supported in V1.',
+  unsupported_node_version: 'The repository must support Node.js 24.',
+  unsupported_package_manager: 'The repository must use npm.',
+  unsupported_test_runner: 'Use Node test, Vitest, or Jest for V1.',
+};
+
+function npmEntrypoint(script: string): string {
+  return script === 'test' ? 'npm test' : `npm run ${script}`;
+}
+
 export interface GitHubConnectionViewProps {
+  executionProfile?: ExecutionProfileSummary | null;
   installation: InstallationSummary | null;
   repositories?: RepositorySummary[];
   repositoryError?: 'unavailable';
@@ -21,6 +63,7 @@ export interface GitHubConnectionViewProps {
 }
 
 export function GitHubConnectionView({
+  executionProfile = null,
   installation,
   repositories,
   repositoryError,
@@ -83,12 +126,37 @@ export function GitHubConnectionView({
                   </div>
                   <div>
                     <dt>Execution profile</dt>
-                    <dd>Not configured yet</dd>
+                    <dd>
+                      {executionProfile?.status === 'ready'
+                        ? 'Ready'
+                        : executionProfile?.status === 'unsupported'
+                          ? 'Unsupported'
+                          : 'Not configured yet'}
+                    </dd>
                   </div>
                 </dl>
-                <button className="primary-action" type="button" disabled>
-                  Continue
-                </button>
+                {executionProfile?.status === 'ready' && (
+                  <dl>
+                    <div><dt>Runtime</dt><dd>Node.js {executionProfile.nodeMajor}</dd></div>
+                    <div><dt>Package manager</dt><dd>{executionProfile.packageManager}</dd></div>
+                    <div><dt>Base revision</dt><dd><code>{executionProfile.baseRevision.slice(0, 12)}</code></dd></div>
+                    <div><dt>Install</dt><dd>npm ci</dd></div>
+                    <div><dt>Typecheck</dt><dd>{executionProfile.typecheck ? npmEntrypoint(executionProfile.typecheck.script) : 'Not configured'}</dd></div>
+                    <div><dt>Build</dt><dd>{executionProfile.build ? npmEntrypoint(executionProfile.build.script) : 'Not configured'}</dd></div>
+                    <div><dt>Test</dt><dd>{npmEntrypoint(executionProfile.test.script)}</dd></div>
+                    <div><dt>Test runner</dt><dd>{executionProfile.testRunner === 'node-test' ? 'Node built-in test runner' : executionProfile.testRunner}</dd></div>
+                  </dl>
+                )}
+                {executionProfile?.status === 'unsupported' && (
+                  <div className="repository-notice" role="status">
+                    {unsupportedReasons[executionProfile.reason ?? ''] ?? 'The repository does not meet the V1 execution contract.'}
+                  </div>
+                )}
+                <form action="/api/github/repositories/profile" method="post">
+                  <button className="primary-action" type="submit">
+                    {executionProfile ? 'Recompute execution profile' : 'Detect execution profile'}
+                  </button>
+                </form>
                 <form action="/api/github/repositories/authorize" method="post">
                   <button className="secondary-action" type="submit">
                     Refresh repository access

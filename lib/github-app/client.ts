@@ -13,6 +13,12 @@ import type {
   GitHubRepositoryAccessGateway,
   GitHubUserInstallationRepository,
 } from '../github-repositories/types.ts';
+import type {
+  GitHubExecutionProfileGateway,
+  InspectedRepositoryFile,
+  InstallationRepositoryMetadata,
+  RepositoryRootEntry,
+} from '../execution-profiles/types.ts';
 
 const API_BASE_URL = 'https://api.github.com';
 const API_VERSION = '2026-03-10';
@@ -171,7 +177,85 @@ function parseUserInstallationRepository(value: unknown): GitHubUserInstallation
   };
 }
 
-export class GitHubApiClient implements GitHubInstallationGateway, GitHubRepositoryAccessGateway {
+function parseInstallationRepository(value: unknown): InstallationRepositoryMetadata {
+  const record = objectValue(value);
+  const owner = objectValue(record.owner);
+  return {
+    defaultBranch: nonemptyString(record.default_branch),
+    fullName: nonemptyString(record.full_name, 512),
+    id: positiveSafeInteger(record.id),
+    isPrivate: booleanValue(record.private),
+    name: nonemptyString(record.name),
+    ownerId: positiveSafeInteger(owner.id),
+    ownerLogin: nonemptyString(owner.login),
+  };
+}
+
+function gitSha(value: unknown): string {
+  const sha = nonemptyString(value, 40);
+  if (!/^[0-9a-f]{40}$/.test(sha)) throw new GitHubProviderError();
+  return sha;
+}
+
+function parseRootEntries(value: unknown): RepositoryRootEntry[] {
+  if (!Array.isArray(value) || value.length > 1_000) throw new GitHubProviderError();
+  const seen = new Set<string>();
+  return value.map((candidate) => {
+    const record = objectValue(candidate);
+    const type = nonemptyString(record.type);
+    if (!['dir', 'file', 'submodule', 'symlink'].includes(type)) {
+      throw new GitHubProviderError();
+    }
+    const name = nonemptyString(record.name);
+    const path = nonemptyString(record.path, 512);
+    if (
+      path !== name ||
+      name === '.' ||
+      name === '..' ||
+      name.includes('/') ||
+      name.includes('\\') ||
+      seen.has(path)
+    ) {
+      throw new GitHubProviderError();
+    }
+    seen.add(path);
+    const size = record.size;
+    if (typeof size !== 'number' || !Number.isSafeInteger(size) || size < 0) {
+      throw new GitHubProviderError();
+    }
+    return {
+      name,
+      path,
+      sha: gitSha(record.sha),
+      size,
+      type: type as RepositoryRootEntry['type'],
+    };
+  });
+}
+
+function parseRepositoryFile(value: unknown): InspectedRepositoryFile {
+  const record = objectValue(value);
+  if (
+    record.type !== 'file' ||
+    record.encoding !== 'base64' ||
+    typeof record.content !== 'string'
+  ) {
+    throw new GitHubProviderError();
+  }
+  const size = record.size;
+  if (typeof size !== 'number' || !Number.isSafeInteger(size) || size < 0) {
+    throw new GitHubProviderError();
+  }
+  const encoded = record.content.replace(/\s/g, '');
+  if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(encoded)) {
+    throw new GitHubProviderError();
+  }
+  const bytes = Buffer.from(encoded, 'base64');
+  if (bytes.byteLength !== size) throw new GitHubProviderError();
+  return { content: bytes.toString('utf8'), sha: gitSha(record.sha) };
+}
+
+export class GitHubApiClient implements GitHubInstallationGateway, GitHubRepositoryAccessGateway, GitHubExecutionProfileGateway {
   private readonly privateKey: KeyObject;
 
   constructor(
@@ -250,6 +334,127 @@ export class GitHubApiClient implements GitHubInstallationGateway, GitHubReposit
         headers: { Authorization: `Bearer ${jwt}` },
       }),
     );
+  }
+
+  async createInstallationAccessToken(input: {
+    installationId: number;
+    repositoryId: number;
+  }): Promise<{ accessToken: string; repository: InstallationRepositoryMetadata }> {
+    const jwt = createGitHubAppJwt(
+      this.configuration.clientId,
+      this.privateKey,
+      this.now(),
+    );
+    const result = objectValue(
+      await this.apiJson(`/app/installations/${input.installationId}/access_tokens`, {
+        body: JSON.stringify({
+          permissions: { contents: 'read', metadata: 'read' },
+          repository_ids: [input.repositoryId],
+        }),
+        headers: {
+          Authorization: `Bearer ${jwt}`,
+          'Content-Type': 'application/json',
+        },
+        method: 'POST',
+      }),
+    );
+    const accessToken = nonemptyString(result.token, 2_048);
+    let repository: InstallationRepositoryMetadata;
+    try {
+      if (!Array.isArray(result.repositories) || result.repositories.length !== 1) {
+        throw new GitHubProviderError();
+      }
+      repository = parseInstallationRepository(result.repositories[0]);
+      if (repository.id !== input.repositoryId) throw new GitHubProviderError();
+    } catch {
+      try {
+        await this.revokeInstallationAccessToken(accessToken);
+      } catch {
+        // Provider expiry remains the fallback when immediate revocation fails.
+      }
+      throw new GitHubProviderError();
+    }
+    return {
+      accessToken,
+      repository,
+    };
+  }
+
+  async getRepositoryMetadata(
+    accessToken: string,
+    owner: string,
+    repository: string,
+  ): Promise<InstallationRepositoryMetadata> {
+    return parseInstallationRepository(
+      await this.apiJson(
+        `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repository)}`,
+        { headers: { Authorization: `Bearer ${accessToken}` } },
+      ),
+    );
+  }
+
+  async resolveBranchCommit(input: {
+    accessToken: string;
+    branch: string;
+    owner: string;
+    repository: string;
+  }): Promise<string> {
+    const result = objectValue(
+      await this.apiJson(
+        `/repos/${encodeURIComponent(input.owner)}/${encodeURIComponent(input.repository)}/git/ref/${encodeURIComponent(`heads/${input.branch}`)}`,
+        { headers: { Authorization: `Bearer ${input.accessToken}` } },
+      ),
+    );
+    const object = objectValue(result.object);
+    if (object.type !== 'commit') throw new GitHubProviderError();
+    return gitSha(object.sha);
+  }
+
+  async getRepositoryRoot(input: {
+    accessToken: string;
+    owner: string;
+    ref: string;
+    repository: string;
+  }): Promise<RepositoryRootEntry[]> {
+    return parseRootEntries(
+      await this.apiJson(
+        `/repos/${encodeURIComponent(input.owner)}/${encodeURIComponent(input.repository)}/contents?ref=${encodeURIComponent(input.ref)}`,
+        { headers: { Authorization: `Bearer ${input.accessToken}` } },
+      ),
+    );
+  }
+
+  async getRepositoryFile(input: {
+    accessToken: string;
+    owner: string;
+    path: 'package-lock.json' | 'package.json';
+    ref: string;
+    repository: string;
+  }): Promise<InspectedRepositoryFile | null> {
+    const response = await this.request(
+      `${API_BASE_URL}/repos/${encodeURIComponent(input.owner)}/${encodeURIComponent(input.repository)}/contents/${input.path}?ref=${encodeURIComponent(input.ref)}`,
+      {
+        headers: {
+          Accept: 'application/vnd.github+json',
+          Authorization: `Bearer ${input.accessToken}`,
+          'X-GitHub-Api-Version': API_VERSION,
+        },
+      },
+    );
+    if (response.status === 404) return null;
+    return parseRepositoryFile(await readBoundedJson(response));
+  }
+
+  async revokeInstallationAccessToken(accessToken: string): Promise<void> {
+    const response = await this.request(`${API_BASE_URL}/installation/token`, {
+      headers: {
+        Accept: 'application/vnd.github+json',
+        Authorization: `Bearer ${accessToken}`,
+        'X-GitHub-Api-Version': API_VERSION,
+      },
+      method: 'DELETE',
+    });
+    if (response.status !== 204) throw new GitHubProviderError();
   }
 
   async listUserInstallationRepositories(

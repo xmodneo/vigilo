@@ -29,6 +29,13 @@
       "when": 1788948000000,
       "tag": "0003_repository-access",
       "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1789034400000,
+      "tag": "0004_execution-profile",
+      "breakpoints": true
     }
   ]
 }

@@ -89,6 +89,80 @@ test('GitHub connection page shows selected repository and unconfigured executio
   assert.match(html, /xmodneo\/vigilo/);
   assert.match(html, /Execution profile/);
   assert.match(html, /Not configured yet/);
-  assert.match(html, /Continue/);
+  assert.match(html, /Detect execution profile/);
+  assert.match(html, /action="\/api\/github\/repositories\/profile"/);
   assert.match(html, /Refresh repository access/);
+});
+
+test('selected repository renders a Ready allowlisted execution profile', () => {
+  const html = renderToStaticMarkup(
+    <GitHubConnectionView
+      executionProfile={{
+        baseRevision: 'a'.repeat(40),
+        build: { script: 'build', tool: 'npm' },
+        install: { operation: 'ci', tool: 'npm' },
+        nodeMajor: 24,
+        packageManager: 'npm',
+        profileIdentity: 'b'.repeat(64),
+        profileVersion: 2,
+        runtimeFamily: 'node',
+        status: 'ready',
+        test: { script: 'test', tool: 'npm' },
+        testRunner: 'node-test',
+        typecheck: { script: 'typecheck', tool: 'npm' },
+      }}
+      installation={{
+        accountLogin: 'xmodneo',
+        accountType: 'User',
+        installationId: 7001,
+        status: 'active',
+      }}
+      selectedRepository={{
+        defaultBranch: 'main',
+        fullName: 'xmodneo/vigilo',
+        id: 8101,
+        isPrivate: false,
+      }}
+      workspaceId="workspace-1"
+    />,
+  );
+
+  assert.match(html, /Ready/);
+  assert.match(html, /Node.js 24/);
+  assert.match(html, /npm ci/);
+  assert.match(html, /npm run typecheck/);
+  assert.match(html, /npm run build/);
+  assert.match(html, /npm test/);
+  assert.match(html, /Node built-in test runner/);
+  assert.match(html, /aaaaaaaaaaaa/);
+  assert.doesNotMatch(html, /node --test|ghs_|package-lock.*content/i);
+});
+
+test('unsupported profile renders only its safe classification reason', () => {
+  const html = renderToStaticMarkup(
+    <GitHubConnectionView
+      executionProfile={{
+        baseRevision: 'a'.repeat(40),
+        profileVersion: 2,
+        reason: 'conflicting_lockfiles',
+        status: 'unsupported',
+      }}
+      installation={{
+        accountLogin: 'xmodneo',
+        accountType: 'User',
+        installationId: 7001,
+        status: 'active',
+      }}
+      selectedRepository={{
+        defaultBranch: 'main',
+        fullName: 'xmodneo/vigilo',
+        id: 8101,
+        isPrivate: false,
+      }}
+      workspaceId="workspace-1"
+    />,
+  );
+  assert.match(html, /Unsupported/);
+  assert.match(html, /Competing package-manager lockfiles were found/);
+  assert.match(html, /Recompute execution profile/);
 });
