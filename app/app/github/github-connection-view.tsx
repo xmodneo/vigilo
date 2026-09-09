@@ -34,6 +34,17 @@ type ExecutionProfileSummary =
       status: 'unsupported';
     };
 
+interface BaselineSummary {
+  baseRevision: string;
+  build: string | null;
+  cleanup: 'confirmed' | 'unconfirmed';
+  install: string;
+  networkIsolation: 'confirmed' | 'unconfirmed';
+  outcome: string;
+  test: string;
+  typecheck: string | null;
+}
+
 const unsupportedReasons: Record<string, string> = {
   ambiguous_test_runner: 'Multiple test runners were detected.',
   conflicting_lockfiles: 'Competing package-manager lockfiles were found.',
@@ -54,6 +65,7 @@ function npmEntrypoint(script: string): string {
 }
 
 export interface GitHubConnectionViewProps {
+  baseline?: BaselineSummary | null;
   executionProfile?: ExecutionProfileSummary | null;
   installation: InstallationSummary | null;
   repositories?: RepositorySummary[];
@@ -63,6 +75,7 @@ export interface GitHubConnectionViewProps {
 }
 
 export function GitHubConnectionView({
+  baseline = null,
   executionProfile = null,
   installation,
   repositories,
@@ -136,16 +149,37 @@ export function GitHubConnectionView({
                   </div>
                 </dl>
                 {executionProfile?.status === 'ready' && (
-                  <dl>
-                    <div><dt>Runtime</dt><dd>Node.js {executionProfile.nodeMajor}</dd></div>
-                    <div><dt>Package manager</dt><dd>{executionProfile.packageManager}</dd></div>
-                    <div><dt>Base revision</dt><dd><code>{executionProfile.baseRevision.slice(0, 12)}</code></dd></div>
-                    <div><dt>Install</dt><dd>npm ci</dd></div>
-                    <div><dt>Typecheck</dt><dd>{executionProfile.typecheck ? npmEntrypoint(executionProfile.typecheck.script) : 'Not configured'}</dd></div>
-                    <div><dt>Build</dt><dd>{executionProfile.build ? npmEntrypoint(executionProfile.build.script) : 'Not configured'}</dd></div>
-                    <div><dt>Test</dt><dd>{npmEntrypoint(executionProfile.test.script)}</dd></div>
-                    <div><dt>Test runner</dt><dd>{executionProfile.testRunner === 'node-test' ? 'Node built-in test runner' : executionProfile.testRunner}</dd></div>
-                  </dl>
+                  <>
+                    <dl>
+                      <div><dt>Runtime</dt><dd>Node.js {executionProfile.nodeMajor}</dd></div>
+                      <div><dt>Package manager</dt><dd>{executionProfile.packageManager}</dd></div>
+                      <div><dt>Base revision</dt><dd><code>{executionProfile.baseRevision.slice(0, 12)}</code></dd></div>
+                      <div><dt>Install</dt><dd>npm ci</dd></div>
+                      <div><dt>Typecheck</dt><dd>{executionProfile.typecheck ? npmEntrypoint(executionProfile.typecheck.script) : 'Not configured'}</dd></div>
+                      <div><dt>Build</dt><dd>{executionProfile.build ? npmEntrypoint(executionProfile.build.script) : 'Not configured'}</dd></div>
+                      <div><dt>Test</dt><dd>{npmEntrypoint(executionProfile.test.script)}</dd></div>
+                      <div><dt>Test runner</dt><dd>{executionProfile.testRunner === 'node-test' ? 'Node built-in test runner' : executionProfile.testRunner}</dd></div>
+                    </dl>
+                    <form action="/api/github/repositories/baseline" method="post">
+                      <button className="primary-action" type="submit">Run baseline</button>
+                    </form>
+                    {baseline && (
+                      <section className="repository-panel" aria-labelledby="baseline-title">
+                        <p className="eyebrow">Execution evidence</p>
+                        <h3 id="baseline-title">Baseline</h3>
+                        <dl>
+                          <div><dt>Revision</dt><dd><code>{baseline.baseRevision.slice(0, 12)}</code></dd></div>
+                          <div><dt>Install</dt><dd>{baseline.install}</dd></div>
+                          <div><dt>Typecheck</dt><dd>{baseline.typecheck ?? 'Not configured'}</dd></div>
+                          <div><dt>Build</dt><dd>{baseline.build ?? 'Not configured'}</dd></div>
+                          <div><dt>Tests</dt><dd>{baseline.test}</dd></div>
+                          <div><dt>Network isolation</dt><dd>{baseline.networkIsolation}</dd></div>
+                          <div><dt>Cleanup</dt><dd>{baseline.cleanup}</dd></div>
+                          <div><dt>Outcome</dt><dd>{baseline.outcome}</dd></div>
+                        </dl>
+                      </section>
+                    )}
+                  </>
                 )}
                 {executionProfile?.status === 'unsupported' && (
                   <div className="repository-notice" role="status">

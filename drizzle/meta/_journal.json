@@ -36,6 +36,13 @@
       "when": 1789034400000,
       "tag": "0004_execution-profile",
       "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1789120800000,
+      "tag": "0005_repository-baseline",
+      "breakpoints": true
     }
   ]
 }

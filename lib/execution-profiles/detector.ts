@@ -273,7 +273,7 @@ function validatePackageLock(value: JsonObject): boolean {
   return true;
 }
 
-function profileIdentity(
+export function computeExecutionProfileIdentity(
   profile: Omit<ReadyExecutionProfileDraft, 'profileIdentity' | 'status'>,
 ): string {
   return createHash('sha256')
@@ -364,7 +364,7 @@ export function detectExecutionProfile(
 
   return {
     ...withoutIdentity,
-    profileIdentity: profileIdentity(withoutIdentity),
+    profileIdentity: computeExecutionProfileIdentity(withoutIdentity),
     status: 'ready',
   };
 }

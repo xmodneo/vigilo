@@ -1,11 +1,11 @@
 import type { Sandbox } from "@vercel/sandbox";
-import { SandboxBoundary, CREDENTIALS_SCRIPT } from "./sandbox-boundary.js";
+import { SandboxBoundary, CREDENTIALS_SCRIPT } from "./sandbox-boundary.ts";
 
 export const ROOT = "/vercel/sandbox/fixture";
 export const INSTALL_POLICY = { allow: ["registry.npmjs.org"] };
 export const INSTALL_ARGS = ["ci", "--ignore-scripts", "--no-audit", "--no-fund", "--registry=https://registry.npmjs.org", "--fetch-retries=0", "--fetch-timeout=15000"];
 const MAX_REPORT_BYTES = 65_536;
-export type FailureKind = "infrastructure_failure" | "dependency_installation_failure" | "command_timeout" | "unexpected_test_failure" | "build_failure" | "candidate_verification_failure";
+export type FailureKind = "infrastructure_failure" | "dependency_installation_failure" | "command_timeout" | "unexpected_test_failure" | "build_failure" | "candidate_verification_failure" | "typecheck_failure" | "test_failure" | "baseline_failure";
 export class ExecutionFailure extends Error {
   constructor(readonly kind: FailureKind, code: string) { super(code); }
 }
@@ -68,8 +68,8 @@ export async function boundedReport(sandbox: Sandbox, signal: AbortSignal) {
 }
 
 export function fixtureExecutor(sandbox: Sandbox, boundary: SandboxBoundary, signal: AbortSignal) {
-  const trustedNode = async (args: string[]) => {
-    const result = await sandbox.runCommand({ cmd: "node", args, signal });
+  const trustedNode = async (args: string[], timeoutMs = 30_000) => {
+    const result = await sandbox.runCommand({ cmd: "node", args, signal, timeoutMs });
     boundary.assertSameSession(sandbox);
     if (result.exitCode !== 0) throw new ExecutionFailure("infrastructure_failure", "harness_command_failed");
     return (await result.stdout()).trim();
@@ -81,7 +81,7 @@ export function fixtureExecutor(sandbox: Sandbox, boundary: SandboxBoundary, sig
     evidence.status = "failed";
     const result = object(JSON.parse(await trustedNode(["-e", COMMAND_SCRIPT, JSON.stringify({
       args: evidence.command.slice(1), cwd: ROOT, timeoutMs: evidence.timeoutMs,
-    })])));
+    })], evidence.timeoutMs + 10_000)));
     if (!(result.exitCode === null || Number.isInteger(result.exitCode)) || typeof result.timedOut !== "boolean" ||
         typeof result.spawnFailed !== "boolean" || typeof result.signalTermination !== "boolean" ||
         typeof result.stdoutSha256 !== "string" || !/^[a-f0-9]{64}$/.test(result.stdoutSha256) ||

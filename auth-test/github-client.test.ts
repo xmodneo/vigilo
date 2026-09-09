@@ -330,6 +330,29 @@ test('malformed scoped-token repository metadata triggers immediate token revoca
   assert.equal(requests[1]?.headers.get('authorization'), 'Bearer ghs_malformed-response-token');
 });
 
+test('exact-revision archive download follows only GitHub codeload without forwarding credentials', async () => {
+  const keys = keyPair();
+  const requests: Array<{ headers: Headers; redirect: RequestRedirect | undefined; url: string }> = [];
+  const responses = [
+    new Response(null, { status: 302, headers: { location: 'https://codeload.github.com/octo/repo/legacy.tar.gz/aaaaaaaa?temporary=1' } }),
+    new Response(Buffer.from('archive-bytes'), { status: 200, headers: { 'content-length': '13' } }),
+  ];
+  const client = new GitHubApiClient(CONFIGURATION, keys.privateKey, async (input, init) => {
+    requests.push({ headers: new Headers(init?.headers), redirect: init?.redirect, url: String(input) });
+    return responses.shift()!;
+  }, () => NOW);
+  const archive = await client.downloadRepositoryArchive({
+    accessToken: 'ghs_archive-token-sentinel', owner: 'octo', ref: 'a'.repeat(40), repository: 'repo',
+  });
+  assert.equal(archive.toString(), 'archive-bytes');
+  assert.match(requests[0]?.url ?? '', new RegExp(`/tarball/${'a'.repeat(40)}$`));
+  assert.equal(requests[0]?.headers.get('authorization'), 'Bearer ghs_archive-token-sentinel');
+  assert.equal(requests[0]?.redirect, 'manual');
+  assert.equal(requests[1]?.url, 'https://codeload.github.com/octo/repo/legacy.tar.gz/aaaaaaaa?temporary=1');
+  assert.equal(requests[1]?.headers.has('authorization'), false);
+  assert.equal(requests[1]?.redirect, 'error');
+});
+
 test('GitHub client rejects malformed, unavailable, and oversized provider responses generically', async () => {
   const keys = keyPair();
 

@@ -24,6 +24,7 @@ const API_BASE_URL = 'https://api.github.com';
 const API_VERSION = '2026-03-10';
 const GITHUB_BASE_URL = 'https://github.com';
 const MAX_RESPONSE_BYTES = 1_000_000;
+const MAX_ARCHIVE_BYTES = 50 * 1024 * 1024;
 const REQUEST_TIMEOUT_MS = 10_000;
 
 export class GitHubProviderError extends Error {
@@ -89,6 +90,32 @@ async function readBoundedJson(response: Response): Promise<unknown> {
   } catch {
     throw new GitHubProviderError();
   }
+}
+
+async function readBoundedBuffer(response: Response, maximumBytes: number): Promise<Buffer> {
+  if (!response.ok || !response.body) throw new GitHubProviderError();
+  const declared = Number(response.headers.get('content-length') ?? '0');
+  if (declared && (!Number.isSafeInteger(declared) || declared > maximumBytes)) {
+    throw new GitHubProviderError();
+  }
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let length = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      length += value.byteLength;
+      if (length > maximumBytes) {
+        await reader.cancel();
+        throw new GitHubProviderError();
+      }
+      chunks.push(value);
+    }
+  } catch {
+    throw new GitHubProviderError();
+  }
+  return Buffer.concat(chunks, length);
 }
 
 function positiveSafeInteger(value: unknown): number {
@@ -457,6 +484,44 @@ export class GitHubApiClient implements GitHubInstallationGateway, GitHubReposit
     if (response.status !== 204) throw new GitHubProviderError();
   }
 
+  async downloadRepositoryArchive(input: {
+    accessToken: string;
+    owner: string;
+    ref: string;
+    repository: string;
+  }): Promise<Buffer> {
+    const response = await this.request(
+      `${API_BASE_URL}/repos/${encodeURIComponent(input.owner)}/${encodeURIComponent(input.repository)}/tarball/${encodeURIComponent(input.ref)}`,
+      {
+        headers: {
+          Accept: 'application/vnd.github+json',
+          Authorization: `Bearer ${input.accessToken}`,
+          'X-GitHub-Api-Version': API_VERSION,
+        },
+      },
+      'manual',
+    );
+    if (response.status !== 302) throw new GitHubProviderError();
+    const location = response.headers.get('location');
+    if (!location) throw new GitHubProviderError();
+    let archiveUrl: URL;
+    try {
+      archiveUrl = new URL(location);
+    } catch {
+      throw new GitHubProviderError();
+    }
+    if (
+      archiveUrl.protocol !== 'https:' ||
+      archiveUrl.hostname !== 'codeload.github.com' ||
+      archiveUrl.username ||
+      archiveUrl.password ||
+      archiveUrl.hash
+    ) {
+      throw new GitHubProviderError();
+    }
+    return readBoundedBuffer(await this.request(archiveUrl.toString(), {}), MAX_ARCHIVE_BYTES);
+  }
+
   async listUserInstallationRepositories(
     accessToken: string,
     installationId: number,
@@ -537,7 +602,11 @@ export class GitHubApiClient implements GitHubInstallationGateway, GitHubReposit
     return readBoundedJson(await this.request(url, init));
   }
 
-  private async request(url: string, init: RequestInit): Promise<Response> {
+  private async request(
+    url: string,
+    init: RequestInit,
+    redirect: RequestRedirect = 'error',
+  ): Promise<Response> {
     try {
       return await this.fetchImplementation(url, {
         ...init,
@@ -545,7 +614,7 @@ export class GitHubApiClient implements GitHubInstallationGateway, GitHubReposit
           'User-Agent': 'Vigilo',
           ...init.headers,
         },
-        redirect: 'error',
+        redirect,
         signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       });
     } catch {

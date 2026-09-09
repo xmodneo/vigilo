@@ -111,6 +111,10 @@ test('selected repository renders a Ready allowlisted execution profile', () => 
         testRunner: 'node-test',
         typecheck: { script: 'typecheck', tool: 'npm' },
       }}
+      baseline={{
+        baseRevision: 'a'.repeat(40), build: 'completed', cleanup: 'confirmed', install: 'completed',
+        networkIsolation: 'confirmed', outcome: 'baseline_passed', test: 'completed', typecheck: 'completed',
+      }}
       installation={{
         accountLogin: 'xmodneo',
         accountType: 'User',
@@ -134,6 +138,11 @@ test('selected repository renders a Ready allowlisted execution profile', () => 
   assert.match(html, /npm run build/);
   assert.match(html, /npm test/);
   assert.match(html, /Node built-in test runner/);
+  assert.match(html, /Run baseline/);
+  assert.match(html, /Execution evidence/);
+  assert.match(html, /baseline_passed/);
+  assert.match(html, /Network isolation.*confirmed/);
+  assert.match(html, /Cleanup.*confirmed/);
   assert.match(html, /aaaaaaaaaaaa/);
   assert.doesNotMatch(html, /node --test|ghs_|package-lock.*content/i);
 });

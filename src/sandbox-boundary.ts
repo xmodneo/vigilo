@@ -9,7 +9,11 @@ export function requireNode24(output: string): string {
 }
 
 export const CREDENTIALS_SCRIPT = `
-  const names = ['VERCEL_TOKEN', 'VERCEL_TEAM_ID', 'VERCEL_PROJECT_ID', 'VERCEL_OIDC_TOKEN'];
+  const names = [
+    'VERCEL_TOKEN', 'VERCEL_TEAM_ID', 'VERCEL_PROJECT_ID', 'VERCEL_OIDC_TOKEN',
+    'DATABASE_URL', 'BETTER_AUTH_SECRET', 'GITHUB_CLIENT_SECRET',
+    'GITHUB_APP_CLIENT_SECRET', 'GITHUB_APP_PRIVATE_KEY_PATH', 'GITHUB_TOKEN', 'GH_TOKEN'
+  ];
   console.log(names.some(name => Boolean(process.env[name])) ? 'present' : 'absent');
 `;
 

@@ -44,7 +44,7 @@ function sameRepository(
   );
 }
 
-function validInstallation(
+export function validExecutionInstallation(
   value: Awaited<ReturnType<GitHubExecutionProfileGateway['getInstallation']>>,
   installationId: number,
   configuration: GitHubAppConfiguration,
@@ -203,7 +203,7 @@ export async function detectSelectedRepositoryExecutionProfile(
 
   try {
     const installation = await gateway.getInstallation(selected.installationId);
-    if (!validInstallation(installation, selected.installationId, configuration)) {
+    if (!validExecutionInstallation(installation, selected.installationId, configuration)) {
       throw new ExecutionProfileError('installation_unavailable');
     }
     const scoped = await gateway.createInstallationAccessToken({
@@ -270,7 +270,7 @@ export async function detectSelectedRepositoryExecutionProfile(
     if (confirmedCommitSha !== baseCommitSha || !sameRepository(metadata, confirmedMetadata)) {
       throw new ExecutionProfileError('repository_state_changed');
     }
-    if (!validInstallation(confirmedInstallation, selected.installationId, configuration)) {
+    if (!validExecutionInstallation(confirmedInstallation, selected.installationId, configuration)) {
       throw new ExecutionProfileError('installation_unavailable');
     }
 

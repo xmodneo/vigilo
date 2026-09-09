@@ -8,6 +8,8 @@ import { getAuthDatabase } from '../../../lib/auth/server';
 import { publicExecutionProfile } from '../../../lib/execution-profiles/handlers';
 import { getExecutionProfileForContext } from '../../../lib/execution-profiles/server';
 import { getRepositoryOverviewForContext } from '../../../lib/github-repositories/server';
+import { publicBaseline } from '../../../lib/repository-baselines/handlers';
+import { getRepositoryBaselineForContext } from '../../../lib/repository-baselines/server';
 import { GitHubConnectionView } from './github-connection-view';
 
 export default async function GitHubConnectionPage() {
@@ -22,6 +24,7 @@ export default async function GitHubConnectionPage() {
     let repositoryError: 'unavailable' | undefined;
     let selectedRepository = undefined;
     let executionProfile = undefined;
+    let baseline = undefined;
     if (installation) {
       try {
         const overview = await getRepositoryOverviewForContext(context);
@@ -37,6 +40,9 @@ export default async function GitHubConnectionPage() {
         executionProfile = overview.selected
           ? publicExecutionProfile(await getExecutionProfileForContext(context))
           : null;
+        baseline = overview.selected
+          ? publicBaseline(await getRepositoryBaselineForContext(context))
+          : null;
       } catch {
         repositoryError = 'unavailable';
       }
@@ -45,6 +51,7 @@ export default async function GitHubConnectionPage() {
     return (
       <GitHubConnectionView
         installation={installation}
+        {...(baseline !== undefined ? { baseline } : {})}
         {...(executionProfile !== undefined ? { executionProfile } : {})}
         {...(repositories ? { repositories } : {})}
         {...(repositoryError ? { repositoryError } : {})}
