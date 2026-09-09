@@ -5,11 +5,9 @@ import { and, desc, eq, inArray } from 'drizzle-orm';
 import { repairRun, repairRunEvent, repositoryBaseline } from '../../db/schema.ts';
 import type { AuthenticatedWorkspace } from '../auth/protected-context.ts';
 import type { VigiloDatabase } from '../db/types.ts';
-import type { GitHubAppConfiguration } from '../github-app/types.ts';
 import { resolveBaselineAuthority } from '../repository-baselines/authority.ts';
-import { executeSelectedRepositoryBaseline } from '../repository-baselines/flow.ts';
-import type { BaselineEvidence, GitHubBaselineGateway } from '../repository-baselines/types.ts';
-import { classifyBaselineOutcome, validateTransition } from './state-machine.ts';
+import { REPAIR_JOB_VERSION, type TransactionalRepairQueue } from './queue.ts';
+import { validateTransition } from './state-machine.ts';
 import type { RepairRunIdentity, RepairRunResult, RepairRunState } from './types.ts';
 
 export class RepairRunError extends Error {
@@ -19,6 +17,7 @@ export class RepairRunError extends Error {
     | 'run_already_claimed'
     | 'baseline_evidence_missing'
     | 'baseline_evidence_mismatch'
+    | 'handoff_failed'
     | 'state_persistence_failed') {
     super(code);
     this.name = 'RepairRunError';
@@ -28,7 +27,6 @@ export class RepairRunError extends Error {
 const IDEMPOTENCY_KEY = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
 type StoredRun = typeof repairRun.$inferSelect;
-type BaselineExecutor = typeof executeSelectedRepositoryBaseline;
 
 function result(value: StoredRun): RepairRunResult {
   return {
@@ -53,7 +51,7 @@ function result(value: StoredRun): RepairRunResult {
   };
 }
 
-function matchesEvidence(run: StoredRun, evidence: typeof repositoryBaseline.$inferSelect): boolean {
+export function matchesRepairRunEvidence(run: StoredRun, evidence: typeof repositoryBaseline.$inferSelect): boolean {
   return evidence.workspaceId === run.workspaceId &&
     evidence.githubRepositoryId === run.githubRepositoryId &&
     evidence.installationId === run.installationId &&
@@ -85,7 +83,7 @@ function transitionFacts(target: RepairRunState, baseline: typeof repositoryBase
   return {};
 }
 
-async function transitionRepairRun(
+export async function transitionRepairRun(
   database: VigiloDatabase,
   workspaceId: string,
   runId: string,
@@ -105,7 +103,7 @@ async function transitionRepairRun(
       const [foundBaseline] = await transaction.select().from(repositoryBaseline).where(eq(repositoryBaseline.id, options.baselineId)).limit(1);
       if (!foundBaseline) throw new RepairRunError('baseline_evidence_missing');
       baseline = foundBaseline;
-      if (!matchesEvidence(current, baseline)) throw new RepairRunError('baseline_evidence_mismatch');
+      if (!matchesRepairRunEvidence(current, baseline)) throw new RepairRunError('baseline_evidence_mismatch');
     }
     const facts = transitionFacts(target, baseline, now, options.failureCode);
     const [updated] = await transaction.update(repairRun).set({ ...facts, state: target, stateChangedAt: now, updatedAt: now }).where(and(eq(repairRun.id, runId), eq(repairRun.workspaceId, workspaceId), eq(repairRun.state, expected))).returning();
@@ -130,6 +128,7 @@ async function createRepairRun(
   idempotencyKey: string,
   now: Date,
   randomId: () => string,
+  queue: TransactionalRepairQueue,
 ) {
   if (!IDEMPOTENCY_KEY.test(idempotencyKey)) throw new RepairRunError('invalid_idempotency_key');
   for (let attempt = 0; attempt < 2; attempt += 1) {
@@ -145,6 +144,8 @@ async function createRepairRun(
       }).onConflictDoNothing().returning();
       if (inserted) {
         await transaction.insert(repairRunEvent).values({ id: randomId(), repairRunId: inserted.id, fromState: null, toState: 'created', createdAt: now });
+        const jobId = await queue.enqueue(transaction, { version: REPAIR_JOB_VERSION, repairRunId: inserted.id });
+        if (jobId !== inserted.id) throw new RepairRunError('handoff_failed');
         return { run: result(inserted), ownsExecution: true };
       }
       const [idempotent] = await transaction.select().from(repairRun).where(and(
@@ -167,19 +168,12 @@ async function createRepairRun(
   throw new RepairRunError('state_persistence_failed');
 }
 
-function safeFailureCode(error: unknown): string {
-  if (error instanceof RepairRunError) return error.code;
-  if (error && typeof error === 'object' && 'code' in error && typeof error.code === 'string' && /^[a-z_]{1,64}$/.test(error.code)) return error.code;
-  return 'baseline_execution_failed';
-}
-
 export async function startRepairRun(
   database: VigiloDatabase,
   context: AuthenticatedWorkspace,
-  gateway: GitHubBaselineGateway,
-  configuration: GitHubAppConfiguration,
   idempotencyKey: string,
-  options: { cancellation?: AbortSignal; clock?: () => Date; baselineExecutor?: BaselineExecutor; randomId?: () => string } = {},
+  queue: TransactionalRepairQueue,
+  options: { clock?: () => Date; randomId?: () => string } = {},
 ): Promise<RepairRunResult> {
   const authority = await resolveBaselineAuthority(database, context);
   const identity: RepairRunIdentity = {
@@ -191,23 +185,11 @@ export async function startRepairRun(
   };
   const clock = options.clock ?? (() => new Date());
   const randomId = options.randomId ?? randomUUID;
-  const created = await createRepairRun(database, identity, idempotencyKey, clock(), randomId);
-  if (!created.ownsExecution) return created.run;
-  if (options.cancellation?.aborted) {
-    return transitionRepairRun(database, identity.workspaceId, created.run.id, 'created', 'cancelled', clock(), { eventId: randomId(), failureCode: 'cancelled_before_execution' });
-  }
-
-  const running = await transitionRepairRun(database, identity.workspaceId, created.run.id, 'created', 'baseline_running', clock(), { eventId: randomId() });
   try {
-    const evidence: BaselineEvidence = await (options.baselineExecutor ?? executeSelectedRepositoryBaseline)(database, context, gateway, configuration, {
-      ...(options.cancellation ? { cancellation: options.cancellation } : {}),
-      expectedAuthority: identity,
-    });
-    const target = classifyBaselineOutcome(evidence.overallOutcome);
-    return await transitionRepairRun(database, identity.workspaceId, running.id, 'baseline_running', target, clock(), { baselineId: evidence.runId, eventId: randomId() });
+    return (await createRepairRun(database, identity, idempotencyKey, clock(), randomId, queue)).run;
   } catch (error) {
-    const target = options.cancellation?.aborted ? 'cancelled' : 'infrastructure_failed';
-    return transitionRepairRun(database, identity.workspaceId, running.id, 'baseline_running', target, clock(), { eventId: randomId(), failureCode: options.cancellation?.aborted ? 'cancelled_during_execution' : safeFailureCode(error) });
+    if (error instanceof RepairRunError) throw error;
+    throw new RepairRunError('handoff_failed');
   }
 }
 

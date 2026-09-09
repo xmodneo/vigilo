@@ -2,7 +2,7 @@ import { APIError, type Sandbox } from '@vercel/sandbox';
 import { createHash } from 'node:crypto';
 
 import { commandEvidence, fixtureExecutor, ROOT, ExecutionFailure } from '../../src/fixture-execution.ts';
-import { ExecutionCancelled, requireNode24, SandboxBoundary } from '../../src/sandbox-boundary.ts';
+import { ExecutionCancelled, requireNode24, SandboxBoundary, type SandboxLifecycleObserver } from '../../src/sandbox-boundary.ts';
 import { ARCHIVE_LIMITS, SAFE_ARCHIVE_EXTRACTION_SCRIPT } from './archive.ts';
 import { BASELINE_EVIDENCE_VERSION, type BaselineEvidence, type BaselineOutcome, type FrozenBaselineInput } from './types.ts';
 
@@ -96,8 +96,9 @@ export async function runFrozenRepositoryBaseline(
   input: FrozenBaselineInput,
   cancellation?: AbortSignal,
   clock: () => Date = () => new Date(),
+  observer?: SandboxLifecycleObserver,
 ): Promise<BaselineEvidence> {
-  const boundary = new SandboxBoundary('vigilo-repository-baseline', INSTALL_POLICY, 600_000);
+  const boundary = new SandboxBoundary('vigilo-repository-baseline', INSTALL_POLICY, 600_000, observer);
   const typecheck = input.profile.typecheckScript ? commandEvidence(['--ignore-scripts', 'run', 'typecheck'], 90_000) : null;
   const build = input.profile.buildScript ? commandEvidence(['--ignore-scripts', 'run', 'build'], 180_000) : null;
   const report: BaselineEvidence = {

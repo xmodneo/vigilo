@@ -5,17 +5,23 @@
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
     "noEmit": false,
-    "outDir": ".web-test-dist",
+    "outDir": ".worker-dist",
     "rewriteRelativeImportExtensions": true,
     "rootDir": ".",
     "types": ["node"]
   },
   "include": [
-    "next.config.ts",
-    "app/page.tsx",
-    "app/api/health/route.ts",
-    "web-test/**/*.ts",
-    "web-test/**/*.tsx"
+    "worker/**/*.ts",
+    "db/**/*.ts",
+    "lib/**/*.ts",
+    "src/**/*.ts"
   ],
-  "exclude": ["node_modules", "dist", ".next", ".web-test-dist"]
+  "exclude": [
+    "node_modules",
+    "dist",
+    ".next",
+    ".web-test-dist",
+    ".auth-test-dist",
+    ".worker-dist"
+  ]
 }

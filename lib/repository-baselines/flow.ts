@@ -10,6 +10,7 @@ import type { GitHubAppConfiguration } from '../github-app/types.ts';
 import { resolveBaselineAuthority } from './authority.ts';
 import { runFrozenRepositoryBaseline } from './runner.ts';
 import type { BaselineEvidence, GitHubBaselineGateway } from './types.ts';
+import type { SandboxLifecycleObserver } from '../../src/sandbox-boundary.ts';
 
 export class RepositoryBaselineError extends Error {
   constructor(public readonly code: 'authority_changed' | 'installation_unavailable' | 'repository_access_changed' | 'source_unavailable' | 'persistence_failed') {
@@ -81,9 +82,12 @@ export async function executeSelectedRepositoryBaseline(
   options: {
     cancellation?: AbortSignal;
     clock?: () => Date;
+    evidenceId?: string;
     expectedAuthority?: { workspaceId: string; githubRepositoryId: number; installationId: number; profileIdentity: string; baseCommitSha: string };
+    authorizePersistence?: (evidence: BaselineEvidence) => Promise<void>;
     randomId?: () => string;
     runner?: typeof runFrozenRepositoryBaseline;
+    sandboxObserver?: SandboxLifecycleObserver;
   } = {},
 ) {
   const authority = await resolveBaselineAuthority(database, context);
@@ -124,9 +128,10 @@ export async function executeSelectedRepositoryBaseline(
     ...authority,
     archive,
     archiveSha256: createHash('sha256').update(archive).digest('hex'),
-    runId: options.randomId?.() ?? randomUUID(),
+    runId: options.evidenceId ?? options.randomId?.() ?? randomUUID(),
     startedAt: clock(),
-  }, options.cancellation, clock);
+  }, options.cancellation, clock, options.sandboxObserver);
+  await options.authorizePersistence?.(report);
   await persistBaseline(database, report);
   return report;
 }

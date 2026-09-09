@@ -1,3 +1,5 @@
+import { RepairRunStatus, type RepairRunSummary } from './repair-run-status.tsx';
+
 interface InstallationSummary {
   accountLogin: string;
   accountType: string;
@@ -43,20 +45,6 @@ interface BaselineSummary {
   outcome: string;
   test: string;
   typecheck: string | null;
-}
-
-interface RepairRunSummary {
-  id: string;
-  state: 'created' | 'baseline_running' | 'ready_for_investigation' | 'baseline_failed' | 'infrastructure_failed' | 'cancelled';
-  repositoryId: number;
-  revision: string;
-  profileIdentity: string;
-  baseline: { evidenceId: string; outcome: string | null } | null;
-  failure: { classification: string; code: string | null } | null;
-  createdAt: string;
-  baselineStartedAt: string | null;
-  completedAt: string | null;
-  stateChangedAt: string;
 }
 
 const unsupportedReasons: Record<string, string> = {
@@ -178,22 +166,13 @@ export function GitHubConnectionView({
                       <div><dt>Test</dt><dd>{npmEntrypoint(executionProfile.test.script)}</dd></div>
                       <div><dt>Test runner</dt><dd>{executionProfile.testRunner === 'node-test' ? 'Node built-in test runner' : executionProfile.testRunner}</dd></div>
                     </dl>
-                    <form action="/api/repair-runs" method="post">
-                      <input type="hidden" name="idempotencyKey" value={repairRequestId} />
-                      <button className="primary-action" type="submit">Start repair</button>
-                    </form>
-                    {repairRun && (
-                      <section className="repository-panel" aria-labelledby="repair-run-title">
-                        <p className="eyebrow">Durable workflow</p>
-                        <h3 id="repair-run-title">Repair Run</h3>
-                        <dl>
-                          <div><dt>Run</dt><dd><code>{repairRun.id}</code></dd></div>
-                          <div><dt>Revision</dt><dd><code>{repairRun.revision.slice(0, 12)}</code></dd></div>
-                          <div><dt>Baseline</dt><dd>{repairRun.baseline?.outcome === 'baseline_passed' ? 'Passed' : repairRun.baseline ? 'Failed' : 'Pending'}</dd></div>
-                          <div><dt>Status</dt><dd>{repairRun.state.replaceAll('_', ' ')}</dd></div>
-                        </dl>
-                      </section>
+                    {(!repairRun || !['created', 'baseline_running'].includes(repairRun.state)) && (
+                      <form action="/api/repair-runs" method="post">
+                        <input type="hidden" name="idempotencyKey" value={repairRequestId} />
+                        <button className="primary-action" type="submit">Start repair</button>
+                      </form>
                     )}
+                    {repairRun && <RepairRunStatus initialRun={repairRun} />}
                     {baseline && (
                       <section className="repository-panel" aria-labelledby="baseline-title">
                         <p className="eyebrow">Execution evidence</p>

@@ -3,6 +3,7 @@ dist/
 .next/
 .web-test-dist/
 .auth-test-dist/
+.worker-dist/
 next-env.d.ts
 *.tsbuildinfo
 .env*

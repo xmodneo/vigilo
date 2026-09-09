@@ -22,6 +22,12 @@ type CleanupTarget = {
   delete(options: { signal: AbortSignal; deleteOrphanSnapshots: boolean }): Promise<unknown>;
 };
 
+export interface SandboxLifecycleObserver {
+  requested?(evidence: { name: string }): Promise<void>;
+  created?(evidence: { name: string; sessionId: string }): Promise<void>;
+  cleaned?(evidence: { name: string; sessionId: string | null; stop: string; delete: string; lookup: string }): Promise<void>;
+}
+
 export type CleanupError = { operation: "stop" | "delete" | "lookup"; code: string };
 export function providerErrorCode(error: unknown) {
   return error instanceof APIError ? `provider_http_${error.response.status}` : "provider_operation_failed";
@@ -47,6 +53,41 @@ export async function cleanupSandbox(sandbox: CleanupTarget, errors: CleanupErro
   return result;
 }
 
+function readSandboxCredentials() {
+  const { VERCEL_TOKEN: token, VERCEL_TEAM_ID: teamId, VERCEL_PROJECT_ID: projectId } = process.env;
+  if ((token || teamId || projectId) && !(token && teamId && projectId)) throw new Error("incomplete_credentials");
+  if (!(token && teamId && projectId) && !process.env.VERCEL_OIDC_TOKEN) throw new Error("credentials_missing");
+  return token && teamId && projectId ? { token, teamId, projectId } : {};
+}
+
+export async function recoverSandbox(
+  identity: { name: string; sessionId: string | null },
+): Promise<{ stop: string; delete: string; lookup: string; errors: CleanupError[] }> {
+  const errors: CleanupError[] = [];
+  const result = { stop: "not_needed", delete: "not_needed", lookup: "unconfirmed", errors };
+  let sandbox: Sandbox;
+  try {
+    sandbox = await Sandbox.get({ ...readSandboxCredentials(), name: identity.name, resume: false, signal: AbortSignal.timeout(10_000) });
+  } catch (error) {
+    if (error instanceof APIError && error.response.status === 404) return { ...result, lookup: "absent" };
+    errors.push({ operation: "lookup", code: providerErrorCode(error) });
+    return result;
+  }
+  if (identity.sessionId && sandbox.currentSession().sessionId !== identity.sessionId) {
+    errors.push({ operation: "lookup", code: "provider_operation_failed" });
+    return result;
+  }
+  Object.assign(result, await cleanupSandbox(sandbox, errors));
+  try {
+    await Sandbox.get({ ...readSandboxCredentials(), name: identity.name, resume: false, signal: AbortSignal.timeout(10_000) });
+    result.lookup = "still_present";
+  } catch (error) {
+    result.lookup = error instanceof APIError && error.response.status === 404 ? "absent" : "unconfirmed";
+    if (result.lookup === "unconfirmed") errors.push({ operation: "lookup", code: providerErrorCode(error) });
+  }
+  return result;
+}
+
 // Shared Task 1.1 boundary. No host environment is passed to sandbox commands.
 // https://vercel.com/docs/sandbox/sdk-reference
 export class SandboxBoundary {
@@ -58,7 +99,7 @@ export class SandboxBoundary {
   private createAttempted = false;
   private credentials: { token: string; teamId: string; projectId: string } | Record<string, never> = {};
 
-  constructor(prefix: string, private policy: NetworkPolicy, private timeoutMs: number) {
+  constructor(prefix: string, private policy: NetworkPolicy, private timeoutMs: number, private observer?: SandboxLifecycleObserver) {
     this.evidence = {
       name: `${prefix}-${randomUUID()}`, sessionId: null as string | null, created: false,
       image: "vercel/sandbox/node:24", timeoutMs, persistent: false,
@@ -91,10 +132,8 @@ export class SandboxBoundary {
     try {
       signal.throwIfAborted();
       requireNode24(process.version);
-      const { VERCEL_TOKEN: token, VERCEL_TEAM_ID: teamId, VERCEL_PROJECT_ID: projectId } = process.env;
-      if ((token || teamId || projectId) && !(token && teamId && projectId)) throw new Error("incomplete_credentials");
-      if (!(token && teamId && projectId) && !process.env.VERCEL_OIDC_TOKEN) throw new Error("credentials_missing");
-      this.credentials = token && teamId && projectId ? { token, teamId, projectId } : {};
+      this.credentials = readSandboxCredentials();
+      await this.observer?.requested?.({ name: this.evidence.name });
       this.createAttempted = true;
       console.log(JSON.stringify({ event: "sandbox_requested", name: this.evidence.name }));
       this.sandbox = await Sandbox.create({
@@ -107,6 +146,7 @@ export class SandboxBoundary {
       }
       this.evidence.settingsConfirmed = true;
       this.evidence.sessionId = this.sandbox.currentSession().sessionId;
+      await this.observer?.created?.({ name: this.evidence.name, sessionId: this.evidence.sessionId });
       await work(this.sandbox, signal);
       signal.throwIfAborted();
     } catch (error) {
@@ -141,5 +181,6 @@ export class SandboxBoundary {
         if (this.cleanup.lookup === "unconfirmed") this.cleanupErrors.push({ operation: "lookup", code: providerErrorCode(error) });
       }
     }
+    await this.observer?.cleaned?.({ name: this.evidence.name, sessionId: this.evidence.sessionId, ...this.cleanup });
   }
 }

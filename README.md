@@ -5,7 +5,8 @@ isolated repair boundary: reproduce a failure, freeze exact candidate bytes,
 verify those bytes in a fresh sandbox, produce structured evidence, and clean up.
 Task 2 adds GitHub identity, workspace ownership, verified GitHub App repository
 selection, frozen execution-profile detection, and safe baseline execution.
-Task 3.1 turns that baseline into the first durable Repair Run stage.
+Task 3 moves that baseline into a durable Repair Run executed by a separate
+PostgreSQL-backed worker.
 
 ## Durable Repair Runs
 
@@ -16,13 +17,35 @@ identity. PostgreSQL records every allowed transition and links the run to its
 existing sanitized baseline evidence. Reloading the page reads that state back
 from PostgreSQL.
 
-Task 3.1 executes synchronously through the existing Task 2.6 sandbox path. An
-abort observed by that path is persisted as cancellation and retains its cleanup
-guarantees. An unexpected web-process loss can leave a run in `created` or
-`baseline_running`; automatic recovery and stale-run sweeping are intentionally
-deferred until durable background execution is introduced. No AI investigation,
-source modification, candidate, verification, or pull-request behavior exists
-in this task.
+Task 3.2 keeps the web/API and worker as two process roles in the same modular
+monolith. Starting a run commits its immutable record and a minimal
+`repair-baseline-v1` pg-boss job in the same PostgreSQL transaction, then returns
+without opening a sandbox. The browser reads PostgreSQL-backed state and polls
+every three seconds while the run is waiting or active.
+
+Start both local process roles in separate terminals after applying migrations:
+
+```sh
+npm run dev
+npm run worker:dev
+```
+
+The worker resolves all repository authority from PostgreSQL, conditionally
+claims `created → baseline_running`, and calls the existing Task 2.6 executor.
+Its bounded execution attempts use a database lease and record only safe
+operational facts. A redelivered job reconciles matching evidence written before
+a crash without rerunning repository code. When an expired attempt recorded a
+sandbox, the worker first confirms explicit provider cleanup; it will not open a
+replacement sandbox while that cleanup is unresolved. Vercel's provider expiry
+remains the final fallback.
+
+A queued run can be cancelled before a worker claims it. Cross-process
+cancellation after baseline execution starts is not implemented in Task 3.2.
+Recovery is driven by pg-boss redelivery and the worker's startup retry pass;
+there is no general monitoring or sweeper subsystem. If the worker is offline,
+the durable run and job remain waiting. No AI investigation, source
+modification, candidate, verification, or pull-request behavior exists in this
+task.
 
 ## Web/API shell
 

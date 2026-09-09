@@ -4,6 +4,7 @@ import test from 'node:test';
 import { renderToStaticMarkup } from 'react-dom/server';
 
 import { GitHubConnectionView } from '../app/app/github/github-connection-view.js';
+import { RepairRunStatus } from '../app/app/github/repair-run-status.js';
 
 test('GitHub connection page renders the disconnected installation action', () => {
   const html = renderToStaticMarkup(
@@ -203,4 +204,20 @@ test('repository page renders durable Repair Run state without exposing authorit
   );
   assert.match(html, /Repair Run/); assert.match(html, /aaaaaaaaaaaa/); assert.match(html, /Baseline.*Passed/); assert.match(html, /ready for investigation/);
   assert.doesNotMatch(html, /name="(?:state|commit|profile|repository|workspace)/);
+});
+
+test('active Repair Run renders honest worker-owned progress and queued cancellation', () => {
+  const common = {
+    id: '11111111-1111-4111-8111-111111111111', repositoryId: 8101, revision: 'a'.repeat(40), profileIdentity: 'b'.repeat(64),
+    baseline: null, failure: null, createdAt: '2026-09-09T00:00:00.000Z', completedAt: null, stateChangedAt: '2026-09-09T00:00:00.000Z',
+  } as const;
+  const queued = renderToStaticMarkup(<RepairRunStatus initialRun={{ ...common, state: 'created', baselineStartedAt: null }} />);
+  assert.match(queued, /Waiting for worker/);
+  assert.match(queued, /Cancel queued run/);
+  assert.match(queued, /action="\/api\/repair-runs\/11111111-1111-4111-8111-111111111111\/cancel"/);
+  assert.doesNotMatch(queued, /Start repair/);
+
+  const running = renderToStaticMarkup(<RepairRunStatus initialRun={{ ...common, state: 'baseline_running', baselineStartedAt: '2026-09-09T00:00:01.000Z' }} />);
+  assert.match(running, /Running baseline/);
+  assert.doesNotMatch(running, /Cancel queued run|Start repair/);
 });

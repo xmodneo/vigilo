@@ -2,14 +2,14 @@ import { AccessDeniedError, type AuthenticatedWorkspace } from '../auth/protecte
 import type { VigiloDatabase } from '../db/types.ts';
 import type { GitHubAppConfiguration } from '../github-app/types.ts';
 import { BaselineAuthorityError } from '../repository-baselines/authority.ts';
-import type { GitHubBaselineGateway } from '../repository-baselines/types.ts';
-import { getRepairRun, RepairRunError, startRepairRun } from './flow.ts';
+import { cancelCreatedRepairRun, getRepairRun, RepairRunError, startRepairRun } from './flow.ts';
+import type { TransactionalRepairQueue } from './queue.ts';
 import type { RepairRunResult } from './types.ts';
 
 interface Dependencies {
   configuration: GitHubAppConfiguration;
   database: VigiloDatabase;
-  gateway: GitHubBaselineGateway;
+  queue: TransactionalRepairQueue;
   resolveContext: (headers: Headers) => Promise<AuthenticatedWorkspace>;
   start?: typeof startRepairRun;
 }
@@ -74,11 +74,26 @@ export function createRepairRunHandlers(dependencies: Dependencies) {
       try {
         const context = await dependencies.resolveContext(request.headers);
         const idempotencyKey = await parseStartIntent(request);
-        const run = await (dependencies.start ?? startRepairRun)(dependencies.database, context, dependencies.gateway, dependencies.configuration, idempotencyKey, { cancellation: request.signal });
+        const run = await (dependencies.start ?? startRepairRun)(dependencies.database, context, idempotencyKey, dependencies.queue);
         return redirect(dependencies.configuration.baseUrl, `/app/github?repairRun=${encodeURIComponent(run.id)}`);
       } catch (error) {
         if (error instanceof AccessDeniedError) return redirect(dependencies.configuration.baseUrl, '/sign-in');
         const code = error instanceof BaselineAuthorityError || error instanceof RepairRunError ? error.code : 'repair_run_unavailable';
+        return redirect(dependencies.configuration.baseUrl, `/app/github?error=${encodeURIComponent(code)}`);
+      }
+    },
+    async cancel(request: Request, runId: string) {
+      if (request.headers.get('origin') !== dependencies.configuration.baseUrl) {
+        return Response.json({ error: 'forbidden' }, { status: 403, headers: noStore });
+      }
+      try {
+        const context = await dependencies.resolveContext(request.headers);
+        if (!RUN_ID.test(runId)) return Response.json({ error: 'not_found' }, { status: 404, headers: noStore });
+        await cancelCreatedRepairRun(dependencies.database, context, runId);
+        return redirect(dependencies.configuration.baseUrl, `/app/github?repairRun=${encodeURIComponent(runId)}`);
+      } catch (error) {
+        if (error instanceof AccessDeniedError) return redirect(dependencies.configuration.baseUrl, '/sign-in');
+        const code = error instanceof RepairRunError ? error.code : 'repair_run_unavailable';
         return redirect(dependencies.configuration.baseUrl, `/app/github?error=${encodeURIComponent(code)}`);
       }
     },

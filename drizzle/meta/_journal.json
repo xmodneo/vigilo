@@ -50,6 +50,13 @@
       "when": 1789207200000,
       "tag": "0006_repair-run",
       "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1789293600000,
+      "tag": "0007_repair-worker",
+      "breakpoints": true
     }
   ]
 }
