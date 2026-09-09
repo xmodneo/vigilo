@@ -6,6 +6,8 @@ import type { VigiloDatabase } from '../db/types.ts';
 export const REPAIR_BASELINE_QUEUE = 'repair-baseline-v1';
 export const REPAIR_JOB_VERSION = 1 as const;
 export const REPAIR_JOB_MAX_ATTEMPTS = 3;
+export const INVESTIGATION_CONTEXT_QUEUE = 'investigation-context-v1';
+export const INVESTIGATION_JOB_VERSION = 1 as const;
 
 export const REPAIR_QUEUE_OPTIONS = {
   deleteAfterSeconds: 7 * 24 * 60 * 60,
@@ -31,11 +33,21 @@ export interface RepairJobPayload {
   repairRunId: string;
 }
 
+export interface InvestigationJobPayload {
+  version: typeof INVESTIGATION_JOB_VERSION;
+  investigationId: string;
+}
+
 export type RepairQueueJob = JobWithMetadata<unknown> | Job<unknown>;
+export type InvestigationQueueJob = RepairQueueJob;
 export type VigiloTransaction = Parameters<Parameters<VigiloDatabase['transaction']>[0]>[0];
 
 export interface TransactionalRepairQueue {
   enqueue(transaction: VigiloTransaction, payload: RepairJobPayload): Promise<string>;
+}
+
+export interface TransactionalInvestigationQueue {
+  enqueueInvestigation(transaction: VigiloTransaction, payload: InvestigationJobPayload): Promise<string>;
 }
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
@@ -47,6 +59,13 @@ export function parseRepairJobPayload(value: unknown): RepairJobPayload {
     throw new Error('invalid_job_payload');
   }
   return { version: REPAIR_JOB_VERSION, repairRunId: record.repairRunId };
+}
+
+export function parseInvestigationJobPayload(value: unknown): InvestigationJobPayload {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('invalid_investigation_job_payload');
+  const record = value as Record<string, unknown>;
+  if (Object.keys(record).length !== 2 || record.version !== INVESTIGATION_JOB_VERSION || typeof record.investigationId !== 'string' || !UUID.test(record.investigationId)) throw new Error('invalid_investigation_job_payload');
+  return { version: INVESTIGATION_JOB_VERSION, investigationId: record.investigationId };
 }
 
 export class PgBossRepairQueue implements TransactionalRepairQueue {
@@ -64,9 +83,26 @@ export class PgBossRepairQueue implements TransactionalRepairQueue {
   }
 }
 
+export class PgBossInvestigationQueue implements TransactionalInvestigationQueue {
+  constructor(private readonly boss: Pick<PgBoss, 'send'>) {}
+
+  async enqueueInvestigation(transaction: VigiloTransaction, payload: InvestigationJobPayload): Promise<string> {
+    const validated = parseInvestigationJobPayload(payload);
+    const id = await this.boss.send(INVESTIGATION_CONTEXT_QUEUE, validated, {
+      ...REPAIR_QUEUE_OPTIONS,
+      db: fromDrizzle(transaction as unknown as DrizzleTransactionLike, sql),
+      id: validated.investigationId,
+    });
+    if (id !== validated.investigationId) throw new Error('investigation_job_not_persisted');
+    return id;
+  }
+}
+
 export async function configureRepairQueue(boss: Pick<PgBoss, 'createQueue' | 'updateQueue'>): Promise<void> {
   await boss.createQueue(REPAIR_BASELINE_QUEUE, { policy: 'standard', ...REPAIR_QUEUE_OPTIONS });
   await boss.updateQueue(REPAIR_BASELINE_QUEUE, REPAIR_QUEUE_OPTIONS);
+  await boss.createQueue(INVESTIGATION_CONTEXT_QUEUE, { policy: 'standard', ...REPAIR_QUEUE_OPTIONS });
+  await boss.updateQueue(INVESTIGATION_CONTEXT_QUEUE, REPAIR_QUEUE_OPTIONS);
 }
 
 export async function createRepairBoss(databaseUrl: string, role: 'publisher' | 'worker'): Promise<PgBoss> {

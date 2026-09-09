@@ -7,12 +7,15 @@ import { GitHubApiClient } from '../lib/github-app/client.ts';
 import { readGitHubAppEnvironment, readGitHubAppPrivateKey } from '../lib/github-app/environment.ts';
 import {
   createRepairBoss,
+  INVESTIGATION_CONTEXT_QUEUE,
   REPAIR_BASELINE_QUEUE,
   REPAIR_WORK_OPTIONS,
 } from '../lib/repair-runs/queue.ts';
 import { createConsoleWorkerLogger, processRepairJob } from '../lib/repair-runs/worker.ts';
 import { repairRun } from '../db/schema.ts';
+import { investigation } from '../db/schema.ts';
 import { inArray } from 'drizzle-orm';
+import { processInvestigationJob } from '../lib/investigations/worker.ts';
 
 async function main(): Promise<void> {
   const environment = readServerEnvironment();
@@ -22,7 +25,7 @@ async function main(): Promise<void> {
   const logger = createConsoleWorkerLogger();
   const shutdown = new AbortController();
   let boss: Awaited<ReturnType<typeof createRepairBoss>> | undefined;
-  let workerId: string | undefined;
+  const workerIds: Array<{ id: string; queue: string }> = [];
 
   try {
     boss = await createRepairBoss(environment.databaseUrl, 'worker');
@@ -34,9 +37,14 @@ async function main(): Promise<void> {
       try { await boss.retry(REPAIR_BASELINE_QUEUE, run.id); }
       catch { /* A non-failed canonical job remains owned by pg-boss. */ }
     }
+    const activeInvestigations = await database.select({ id: investigation.id }).from(investigation).where(inArray(investigation.state, ['created', 'context_preparing']));
+    for (const value of activeInvestigations) {
+      try { await boss.retry(INVESTIGATION_CONTEXT_QUEUE, value.id); }
+      catch { /* A non-failed canonical job remains owned by pg-boss. */ }
+    }
 
     const workOptions = { ...REPAIR_WORK_OPTIONS, perJobResults: true as const };
-    workerId = await boss.work<unknown, { code?: string }, typeof workOptions>(REPAIR_BASELINE_QUEUE, workOptions, async (jobs) => {
+    const repairWorkerId = await boss.work<unknown, { code?: string }, typeof workOptions>(REPAIR_BASELINE_QUEUE, workOptions, async (jobs) => {
       const job = jobs[0];
       if (!job) return [];
       try {
@@ -45,6 +53,17 @@ async function main(): Promise<void> {
         return [{ id: job.id, status: 'failed' as const, output: { code: 'worker_operation_failed' } }];
       }
     });
+    workerIds.push({ id: repairWorkerId, queue: REPAIR_BASELINE_QUEUE });
+    const investigationWorkerId = await boss.work<unknown, { code?: string }, typeof workOptions>(INVESTIGATION_CONTEXT_QUEUE, workOptions, async (jobs) => {
+      const job = jobs[0];
+      if (!job) return [];
+      try {
+        return [await processInvestigationJob(job, { configuration, database, gateway, logger, shutdownSignal: shutdown.signal })];
+      } catch {
+        return [{ id: job.id, status: 'failed' as const, output: { code: 'investigation_worker_failed' } }];
+      }
+    });
+    workerIds.push({ id: investigationWorkerId, queue: INVESTIGATION_CONTEXT_QUEUE });
 
     await new Promise<void>((resolve) => {
       const stop = () => resolve();
@@ -54,7 +73,7 @@ async function main(): Promise<void> {
   } finally {
     shutdown.abort();
     try {
-      if (boss && workerId) await boss.offWork(REPAIR_BASELINE_QUEUE, { id: workerId, wait: true });
+      if (boss) for (const worker of workerIds) await boss.offWork(worker.queue, { id: worker.id, wait: true });
       if (boss) await boss.stop({ graceful: true, timeout: 120_000 });
     } finally {
       await client.end();

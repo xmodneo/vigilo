@@ -5,6 +5,7 @@ import {
   index,
   integer,
   pgTable,
+  primaryKey,
   text,
   timestamp,
   uniqueIndex,
@@ -396,7 +397,7 @@ export const repairRun = pgTable(
     ) or (
       ${table.state} = 'baseline_running' and ${table.baselineStartedAt} is not null and ${table.completedAt} is null and ${table.baselineId} is null and ${table.baselineOutcome} is null
     ) or (
-      ${table.state} = 'ready_for_investigation' and ${table.baselineStartedAt} is not null and ${table.completedAt} is not null and ${table.baselineId} is not null and ${table.baselineOutcome} = 'baseline_passed' and ${table.failureClassification} is null and ${table.failureCode} is null
+      ${table.state} = 'ready_for_investigation' and ${table.baselineStartedAt} is not null and ${table.completedAt} is not null and ${table.baselineId} is not null and ((${table.baselineOutcome} = 'baseline_passed' and ${table.failureClassification} is null and ${table.failureCode} is null) or (${table.baselineOutcome} in ('baseline_failed','typecheck_failed','build_failed','test_failed') and ${table.failureClassification} = 'customer_baseline_failure' and ${table.failureCode} = ${table.baselineOutcome}))
     ) or (
       ${table.state} = 'baseline_failed' and ${table.baselineStartedAt} is not null and ${table.completedAt} is not null and ${table.baselineId} is not null and ${table.baselineOutcome} in ('baseline_failed','typecheck_failed','build_failed','test_failed') and ${table.failureClassification} = 'customer_baseline_failure'
     ) or (
@@ -469,17 +470,153 @@ export const repairRunAttempt = pgTable(
   ],
 );
 
+export const repairIntent = pgTable(
+  'repair_intent',
+  {
+    id: text('id').primaryKey(),
+    repairRunId: text('repair_run_id').notNull().unique().references(() => repairRun.id, { onDelete: 'cascade' }),
+    workspaceId: text('workspace_id').notNull().references(() => workspace.id, { onDelete: 'cascade' }),
+    objective: text('objective').notNull(),
+    objectiveHash: text('objective_hash').notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    index('repair_intent_workspace_idx').on(table.workspaceId, table.createdAt),
+    check('repair_intent_id_check', sql`${table.id} ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'`),
+    check('repair_intent_objective_check', sql`char_length(${table.objective}) between 1 and 3000 and octet_length(${table.objective}) between 1 and 3072`),
+    check('repair_intent_hash_check', sql`${table.objectiveHash} ~ '^[0-9a-f]{64}$'`),
+  ],
+);
+
+export const investigation = pgTable(
+  'investigation',
+  {
+    id: text('id').primaryKey(),
+    repairRunId: text('repair_run_id').notNull().unique().references(() => repairRun.id, { onDelete: 'cascade' }),
+    repairIntentId: text('repair_intent_id').notNull().unique().references(() => repairIntent.id, { onDelete: 'restrict' }),
+    workspaceId: text('workspace_id').notNull().references(() => workspace.id, { onDelete: 'cascade' }),
+    githubRepositoryId: bigint('github_repository_id', { mode: 'number' }).notNull(),
+    installationId: bigint('installation_id', { mode: 'number' }).notNull(),
+    baseCommitSha: text('base_commit_sha').notNull(),
+    profileIdentity: text('profile_identity').notNull(),
+    baselineId: text('baseline_id').notNull().references(() => repositoryBaseline.id, { onDelete: 'restrict' }),
+    idempotencyKey: text('idempotency_key').notNull(),
+    state: text('state').notNull(),
+    contextBudgetVersion: integer('context_budget_version').notNull(),
+    maxTreeEntries: integer('max_tree_entries').notNull(),
+    maxFileBytes: integer('max_file_bytes').notNull(),
+    maxCumulativeBytes: integer('max_cumulative_bytes').notNull(),
+    maxOperations: integer('max_operations').notNull(),
+    treeSha: text('tree_sha'),
+    indexedPathCount: integer('indexed_path_count').notNull().default(0),
+    excludedPathCount: integer('excluded_path_count').notNull().default(0),
+    treeTruncated: boolean('tree_truncated').notNull().default(false),
+    attemptNumber: integer('attempt_number').notNull().default(0),
+    ownershipToken: text('ownership_token'),
+    heartbeatAt: timestamp('heartbeat_at', { withTimezone: true }),
+    leaseExpiresAt: timestamp('lease_expires_at', { withTimezone: true }),
+    failureCode: text('failure_code'),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    preparationStartedAt: timestamp('preparation_started_at', { withTimezone: true }),
+    completedAt: timestamp('completed_at', { withTimezone: true }),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    uniqueIndex('investigation_workspace_idempotency_unique').on(table.workspaceId, table.idempotencyKey),
+    index('investigation_workspace_created_idx').on(table.workspaceId, table.createdAt),
+    index('investigation_state_lease_idx').on(table.state, table.leaseExpiresAt),
+    check('investigation_id_check', sql`${table.id} ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'`),
+    check('investigation_commit_check', sql`${table.baseCommitSha} ~ '^[0-9a-f]{40}$'`),
+    check('investigation_profile_check', sql`${table.profileIdentity} ~ '^[0-9a-f]{64}$'`),
+    check('investigation_idempotency_check', sql`${table.idempotencyKey} ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'`),
+    check('investigation_state_check', sql`${table.state} in ('created','context_preparing','ready','failed','cancelled')`),
+    check('investigation_budget_check', sql`${table.contextBudgetVersion} = 1 and ${table.maxTreeEntries} = 2000 and ${table.maxFileBytes} = 65536 and ${table.maxCumulativeBytes} = 1048576 and ${table.maxOperations} = 50`),
+    check('investigation_counts_check', sql`${table.indexedPathCount} between 0 and 2000 and ${table.excludedPathCount} >= 0 and ${table.attemptNumber} between 0 and 3`),
+    check('investigation_failure_check', sql`${table.failureCode} is null or ${table.failureCode} ~ '^[a-z_]{1,64}$'`),
+    check('investigation_state_facts_check', sql`(
+      ${table.state} = 'created' and ${table.attemptNumber} between 0 and 2 and ${table.ownershipToken} is null and ${table.heartbeatAt} is null and ${table.leaseExpiresAt} is null and ${table.completedAt} is null and ${table.treeSha} is null
+    ) or (
+      ${table.state} = 'context_preparing' and ${table.attemptNumber} between 1 and 3 and ${table.ownershipToken} ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$' and ${table.heartbeatAt} is not null and ${table.leaseExpiresAt} is not null and ${table.preparationStartedAt} is not null and ${table.completedAt} is null and ${table.treeSha} is null
+    ) or (
+      ${table.state} = 'ready' and ${table.attemptNumber} between 1 and 3 and ${table.ownershipToken} is null and ${table.leaseExpiresAt} is null and ${table.completedAt} is not null and ${table.treeSha} ~ '^[0-9a-f]{40}$' and ${table.failureCode} is null
+    ) or (
+      ${table.state} in ('failed','cancelled') and ${table.ownershipToken} is null and ${table.leaseExpiresAt} is null and ${table.completedAt} is not null and ${table.failureCode} is not null
+    )`),
+  ],
+);
+
+export const investigationContextEntry = pgTable(
+  'investigation_context_entry',
+  {
+    investigationId: text('investigation_id').notNull().references(() => investigation.id, { onDelete: 'cascade' }),
+    path: text('path').notNull(),
+    depth: integer('depth').notNull(),
+    kind: text('kind').notNull(),
+    mode: text('mode').notNull(),
+    objectSha: text('object_sha').notNull(),
+    sizeBytes: integer('size_bytes'),
+    readable: boolean('readable').notNull(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.investigationId, table.path] }),
+    index('investigation_context_entry_investigation_idx').on(table.investigationId, table.path),
+    check('investigation_context_entry_path_check', sql`char_length(${table.path}) between 1 and 240 and ${table.path} !~ '(^/|(^|/)[.][.](/|$)|[[:cntrl:]])' and ${table.depth} between 1 and 20`),
+    check('investigation_context_entry_kind_check', sql`${table.kind} in ('blob','tree','symlink','submodule')`),
+    check('investigation_context_entry_mode_check', sql`${table.mode} in ('040000','100644','100755','120000','160000')`),
+    check('investigation_context_entry_sha_check', sql`${table.objectSha} ~ '^[0-9a-f]{40}$'`),
+    check('investigation_context_entry_size_check', sql`${table.sizeBytes} is null or ${table.sizeBytes} >= 0`),
+    check('investigation_context_entry_readable_check', sql`${table.readable} is false or (${table.kind} = 'blob' and ${table.mode} in ('100644','100755') and ${table.sizeBytes} between 0 and 65536)`),
+  ],
+);
+
+export const investigationContextEvent = pgTable(
+  'investigation_context_event',
+  {
+    id: text('id').primaryKey(),
+    investigationId: text('investigation_id').notNull().references(() => investigation.id, { onDelete: 'cascade' }),
+    workspaceId: text('workspace_id').notNull().references(() => workspace.id, { onDelete: 'cascade' }),
+    operation: text('operation').notNull(),
+    status: text('status').notNull(),
+    requestPath: text('request_path'),
+    queryHash: text('query_hash'),
+    queryBytes: integer('query_bytes'),
+    resultCount: integer('result_count').notNull().default(0),
+    resultBytes: integer('result_bytes').notNull().default(0),
+    budgetBytes: integer('budget_bytes').notNull().default(0),
+    truncated: boolean('truncated').notNull().default(false),
+    budgetExhausted: boolean('budget_exhausted').notNull().default(false),
+    failureCode: text('failure_code'),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    completedAt: timestamp('completed_at', { withTimezone: true }),
+  },
+  (table) => [
+    index('investigation_context_event_budget_idx').on(table.investigationId, table.createdAt),
+    check('investigation_context_event_id_check', sql`${table.id} ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'`),
+    check('investigation_context_event_operation_check', sql`${table.operation} in ('prepare','list_paths','read_text_file','search_text','read_baseline_summary')`),
+    check('investigation_context_event_status_check', sql`${table.status} in ('started','completed','rejected','failed')`),
+    check('investigation_context_event_path_check', sql`${table.requestPath} is null or (char_length(${table.requestPath}) between 1 and 240 and ${table.requestPath} !~ '(^/|(^|/)[.][.](/|$)|[[:cntrl:]])')`),
+    check('investigation_context_event_query_check', sql`(${table.queryHash} is null and ${table.queryBytes} is null) or (${table.queryHash} ~ '^[0-9a-f]{64}$' and ${table.queryBytes} between 1 and 128)`),
+    check('investigation_context_event_counts_check', sql`${table.resultCount} >= 0 and ${table.resultBytes} >= 0 and ${table.budgetBytes} between 0 and 1048576`),
+    check('investigation_context_event_failure_check', sql`${table.failureCode} is null or ${table.failureCode} ~ '^[a-z_]{1,64}$'`),
+    check('investigation_context_event_state_check', sql`(${table.status} = 'started' and ${table.completedAt} is null and ${table.failureCode} is null) or (${table.status} = 'completed' and ${table.completedAt} is not null and ${table.failureCode} is null) or (${table.status} in ('rejected','failed') and ${table.completedAt} is not null and ${table.failureCode} is not null)`),
+  ],
+);
+
 export const authSchema = {
   account,
   executionProfile,
   githubInstallation,
   githubInstallationAttempt,
   githubRepositoryAccessAttempt,
+  investigation,
+  investigationContextEntry,
+  investigationContextEvent,
   repository,
   repositoryBaseline,
   repairRun,
   repairRunAttempt,
   repairRunEvent,
+  repairIntent,
   session,
   user,
   verification,

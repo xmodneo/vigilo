@@ -1,4 +1,5 @@
 import { RepairRunStatus, type RepairRunSummary } from './repair-run-status.tsx';
+import { InvestigationStatus, type InvestigationSummary } from './investigation-status.tsx';
 
 interface InstallationSummary {
   accountLogin: string;
@@ -70,6 +71,8 @@ export interface GitHubConnectionViewProps {
   baseline?: BaselineSummary | null;
   executionProfile?: ExecutionProfileSummary | null;
   installation: InstallationSummary | null;
+  investigation?: InvestigationSummary | null;
+  investigationRequestId?: string;
   repositories?: RepositorySummary[];
   repairRequestId: string;
   repairRun?: RepairRunSummary | null;
@@ -82,6 +85,8 @@ export function GitHubConnectionView({
   baseline = null,
   executionProfile = null,
   installation,
+  investigation = null,
+  investigationRequestId,
   repositories,
   repairRequestId,
   repairRun = null,
@@ -167,12 +172,21 @@ export function GitHubConnectionView({
                       <div><dt>Test runner</dt><dd>{executionProfile.testRunner === 'node-test' ? 'Node built-in test runner' : executionProfile.testRunner}</dd></div>
                     </dl>
                     {(!repairRun || !['created', 'baseline_running'].includes(repairRun.state)) && (
-                      <form action="/api/repair-runs" method="post">
+                      <form className="repair-intent-form" action="/api/repair-runs" method="post">
                         <input type="hidden" name="idempotencyKey" value={repairRequestId} />
+                        <label htmlFor="repair-objective">Repair objective</label>
+                        <textarea id="repair-objective" name="objective" required maxLength={3000} rows={4} placeholder="Describe the software behavior that needs investigation." />
                         <button className="primary-action" type="submit">Start repair</button>
                       </form>
                     )}
                     {repairRun && <RepairRunStatus initialRun={repairRun} />}
+                    {repairRun?.repairObjective && investigationRequestId && ['ready_for_investigation', 'baseline_failed'].includes(repairRun.state) && !investigation && (
+                      <form action={`/api/repair-runs/${encodeURIComponent(repairRun.id)}/investigation`} method="post">
+                        <input type="hidden" name="idempotencyKey" value={investigationRequestId} />
+                        <button className="primary-action" type="submit">Prepare investigation</button>
+                      </form>
+                    )}
+                    {investigation && <InvestigationStatus initialInvestigation={investigation} />}
                     {baseline && (
                       <section className="repository-panel" aria-labelledby="baseline-title">
                         <p className="eyebrow">Execution evidence</p>

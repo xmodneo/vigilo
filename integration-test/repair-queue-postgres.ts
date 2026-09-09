@@ -13,10 +13,11 @@ const committedId = randomUUID();
 const rolledBackId = randomUUID();
 const client = postgres(databaseUrl, { max: 2, prepare: false });
 const database = drizzle(client);
-const boss = new PgBoss({ application_name: 'vigilo-transaction-probe', connectionString: databaseUrl, schedule: false, supervise: false, useListenNotify: false });
+let boss = new PgBoss({ application_name: 'vigilo-transaction-probe', connectionString: databaseUrl, schedule: false, supervise: false, useListenNotify: false });
 
 let committed = false;
 let rolledBack = false;
+let survivedPublisherRestart = false;
 
 try {
   await boss.start();
@@ -43,8 +44,12 @@ try {
     if (!(error instanceof Error) || error.message !== 'intentional_transaction_rollback') throw error;
   }
   rolledBack = await boss.getJobById(queueName, rolledBackId) === null;
-  if (!committed || !rolledBack) throw new Error('transaction_probe_failed');
-  process.stdout.write(`${JSON.stringify({ pgBossVersion: '12.30.0', committedJobVisible: committed, rolledBackJobAbsent: rolledBack, result: 'passed' })}\n`);
+  await boss.stop({ graceful: false });
+  boss = new PgBoss({ application_name: 'vigilo-transaction-restart-probe', connectionString: databaseUrl, schedule: false, supervise: false, useListenNotify: false });
+  await boss.start();
+  survivedPublisherRestart = (await boss.getJobById(queueName, committedId))?.id === committedId;
+  if (!committed || !rolledBack || !survivedPublisherRestart) throw new Error('transaction_probe_failed');
+  process.stdout.write(`${JSON.stringify({ pgBossVersion: '12.30.0', committedJobVisible: committed, rolledBackJobAbsent: rolledBack, survivedPublisherRestart, result: 'passed' })}\n`);
 } finally {
   try { await boss.deleteAllJobs(queueName); } catch { /* Queue may not have been created. */ }
   try { await boss.deleteQueue(queueName); } catch { /* Queue may not have been created. */ }

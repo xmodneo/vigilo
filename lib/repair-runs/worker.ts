@@ -33,6 +33,7 @@ const BASELINE_OUTCOMES = new Set<BaselineOutcome>([
   'baseline_passed', 'baseline_failed', 'installation_failed', 'typecheck_failed', 'build_failed',
   'test_failed', 'timed_out', 'cancelled', 'infrastructure_failed', 'cleanup_failed',
 ]);
+const CUSTOMER_FAILURE_OUTCOMES = new Set<BaselineOutcome>(['baseline_failed', 'typecheck_failed', 'build_failed', 'test_failed']);
 
 type StoredRun = typeof repairRun.$inferSelect;
 type StoredAttempt = typeof repairRunAttempt.$inferSelect;
@@ -41,8 +42,9 @@ type Recovery = typeof recoverSandbox;
 
 export interface WorkerLogger {
   write(event: {
-    event: 'job_accepted' | 'job_rejected' | 'run_claimed' | 'attempt_started' | 'baseline_classified' | 'retry_classified' | 'run_finalized' | 'cleanup_observed';
+    event: 'job_accepted' | 'job_rejected' | 'run_claimed' | 'attempt_started' | 'baseline_classified' | 'retry_classified' | 'run_finalized' | 'cleanup_observed' | 'investigation_claimed' | 'investigation_ready' | 'investigation_retry';
     runId?: string;
+    investigationId?: string;
     attemptId?: string;
     outcome?: string;
     code?: string;
@@ -254,12 +256,13 @@ async function finalizeFromEvidence(
   const target = classifyBaselineOutcome(outcome);
   const cleanup = { stop: evidence.cleanupStop, delete: evidence.cleanupDelete, lookup: evidence.cleanupLookup };
   if (target === 'ready_for_investigation' || target === 'baseline_failed') {
-    const state = target === 'ready_for_investigation' ? 'succeeded' : 'customer_failed';
+    const customerFailure = CUSTOMER_FAILURE_OUTCOMES.has(outcome);
+    const state = customerFailure ? 'customer_failed' : 'succeeded';
     const owned = await finishAttempt(dependencies.database, attempt, now, {
       state,
       baselineId: evidence.id,
-      failureClassification: target === 'baseline_failed' ? 'customer_baseline_failure' : null,
-      failureCode: target === 'baseline_failed' ? evidence.overallOutcome : null,
+      failureClassification: customerFailure ? 'customer_baseline_failure' : null,
+      failureCode: customerFailure ? evidence.overallOutcome : null,
       cleanup,
     });
     if (!owned) return { id: attempt.queueJobId, status: 'failed', output: { code: 'attempt_ownership_lost' } };
@@ -312,8 +315,9 @@ async function reconcileCompletedAttempt(dependencies: RepairWorkerDependencies,
     return { id: claim.attempt.queueJobId, status: 'completed' };
   }
   const target = classifyBaselineOutcome(baselineOutcome(evidence.overallOutcome));
-  if ((claim.attempt.state === 'succeeded' && target !== 'ready_for_investigation') ||
-    (claim.attempt.state === 'customer_failed' && target !== 'baseline_failed')) {
+  const customerFailure = CUSTOMER_FAILURE_OUTCOMES.has(baselineOutcome(evidence.overallOutcome));
+  if ((claim.attempt.state === 'succeeded' && (target !== 'ready_for_investigation' || customerFailure)) ||
+    (claim.attempt.state === 'customer_failed' && (target !== 'ready_for_investigation' || !customerFailure))) {
     await transitionRepairRun(dependencies.database, claim.run.workspaceId, claim.run.id, 'baseline_running', 'infrastructure_failed', (dependencies.clock ?? (() => new Date()))(), {
       eventId: (dependencies.randomId ?? randomUUID)(), failureCode: 'baseline_evidence_mismatch',
     });

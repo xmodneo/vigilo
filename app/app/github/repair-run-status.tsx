@@ -10,6 +10,7 @@ export interface RepairRunSummary {
   profileIdentity: string;
   baseline: { evidenceId: string; outcome: string | null } | null;
   failure: { classification: string; code: string | null } | null;
+  repairObjective?: string | null;
   createdAt: string;
   baselineStartedAt: string | null;
   completedAt: string | null;
@@ -48,6 +49,7 @@ export function RepairRunStatus({ initialRun }: { initialRun: RepairRunSummary }
       <h3 id="repair-run-title">Repair Run</h3>
       <dl>
         <div><dt>Run</dt><dd><code>{run.id}</code></dd></div>
+        <div><dt>Repair objective</dt><dd>{run.repairObjective ?? 'Unavailable for historical run'}</dd></div>
         <div><dt>Revision</dt><dd><code>{run.revision.slice(0, 12)}</code></dd></div>
         <div><dt>Baseline</dt><dd>{run.baseline?.outcome === 'baseline_passed' ? 'Passed' : run.baseline ? 'Failed' : 'Pending'}</dd></div>
         <div><dt>Status</dt><dd>{statusLabel(run)}</dd></div>

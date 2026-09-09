@@ -25,11 +25,11 @@ export function validateTransition(from: RepairRunState, to: RepairRunState): vo
 
 export function classifyBaselineOutcome(outcome: BaselineOutcome): RepairRunTerminalState {
   switch (outcome) {
-    case 'baseline_passed': return 'ready_for_investigation';
+    case 'baseline_passed':
     case 'baseline_failed':
     case 'typecheck_failed':
     case 'build_failed':
-    case 'test_failed': return 'baseline_failed';
+    case 'test_failed': return 'ready_for_investigation';
     case 'cancelled': return 'cancelled';
     case 'installation_failed':
     case 'timed_out':

@@ -6,9 +6,10 @@ verify those bytes in a fresh sandbox, produce structured evidence, and clean up
 Task 2 adds GitHub identity, workspace ownership, verified GitHub App repository
 selection, frozen execution-profile detection, and safe baseline execution.
 Task 3 moves that baseline into a durable Repair Run executed by a separate
-PostgreSQL-backed worker.
+PostgreSQL-backed worker and prepares bounded, exact-revision investigation
+context without calling a model.
 
-## Durable Repair Runs
+## Durable Repair Runs and investigation context
 
 An authenticated user can start a Repair Run from the selected repository page.
 The server binds the run permanently to the workspace, stable GitHub repository
@@ -43,9 +44,26 @@ A queued run can be cancelled before a worker claims it. Cross-process
 cancellation after baseline execution starts is not implemented in Task 3.2.
 Recovery is driven by pg-boss redelivery and the worker's startup retry pass;
 there is no general monitoring or sweeper subsystem. If the worker is offline,
-the durable run and job remain waiting. No AI investigation, source
-modification, candidate, verification, or pull-request behavior exists in this
-task.
+the durable run and job remain waiting.
+
+Task 3.3 adds an immutable repair objective of at most 3,000 characters and
+3,072 UTF-8 bytes. A trustworthy passing baseline or customer-code baseline
+failure can proceed to investigation; infrastructure failures remain blocking.
+Investigation preparation runs through a second pg-boss queue and indexes only
+bounded Git tree metadata for the Repair Run's exact commit. GitHub access uses
+a temporary token restricted to the selected repository with Contents read and
+Metadata read, and Vigilo revokes it before persisting the prepared result.
+
+The protected context boundary supports bounded path listing, exact Git blob
+text reads, literal search, and sanitized baseline summaries. V1 indexes at most
+2,000 paths, reads at most 64 KiB per file, allows 1 MiB across 50 audited
+operations, and scans at most 50 files or 256 KiB per search with 25 matches.
+It excludes links, submodules, build output, dependency trees, obvious binary
+formats, archives, `.env` variants, private keys, and common credential files.
+The database stores paths, object hashes, sizes, counts, query hashes, and safe
+outcomes; it does not store file contents, search results, or GitHub tokens.
+No AI/model call, source modification, candidate, verification, or pull-request
+behavior exists in Task 3.3.
 
 ## Web/API shell
 

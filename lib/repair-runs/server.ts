@@ -1,29 +1,13 @@
 import type { AuthenticatedWorkspace } from '../auth/protected-context.ts';
 import { resolveRequestWorkspace } from '../auth/resolve-request.ts';
-import { getAuthDatabase } from '../auth/server.ts';
-import { readServerEnvironment } from '../auth/environment.ts';
-import { readGitHubAppEnvironment } from '../github-app/environment.ts';
+import { getJobPublisherInfrastructure } from '../jobs/server.ts';
 import { getLatestRepairRun } from './flow.ts';
 import { createRepairRunHandlers } from './handlers.ts';
-import { createRepairBoss, PgBossRepairQueue } from './queue.ts';
-
-let dependencies: Promise<{
-  configuration: ReturnType<typeof readGitHubAppEnvironment>;
-  database: ReturnType<typeof getAuthDatabase>;
-  queue: PgBossRepairQueue;
-}> | undefined;
+import { PgBossRepairQueue } from './queue.ts';
 
 async function getDependencies() {
-  if (!dependencies) dependencies = (async () => {
-    const configuration = readGitHubAppEnvironment();
-    const boss = await createRepairBoss(readServerEnvironment().databaseUrl, 'publisher');
-    return {
-      configuration,
-      database: getAuthDatabase(),
-      queue: new PgBossRepairQueue(boss),
-    };
-  })();
-  return dependencies;
+  const infrastructure = await getJobPublisherInfrastructure();
+  return { ...infrastructure, queue: new PgBossRepairQueue(infrastructure.boss) };
 }
 
 export async function getRepairRunHandlers() {

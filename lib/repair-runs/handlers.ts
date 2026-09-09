@@ -3,6 +3,7 @@ import type { VigiloDatabase } from '../db/types.ts';
 import type { GitHubAppConfiguration } from '../github-app/types.ts';
 import { BaselineAuthorityError } from '../repository-baselines/authority.ts';
 import { cancelCreatedRepairRun, getRepairRun, RepairRunError, startRepairRun } from './flow.ts';
+import { RepairIntentValidationError } from './intent.ts';
 import type { TransactionalRepairQueue } from './queue.ts';
 import type { RepairRunResult } from './types.ts';
 
@@ -38,6 +39,7 @@ export function publicRepairRun(value: RepairRunResult | null) {
       classification: value.failureClassification,
       code: value.failureCode,
     } : null,
+    repairObjective: value.repairObjective,
     createdAt: value.createdAt.toISOString(),
     baselineStartedAt: value.baselineStartedAt?.toISOString() ?? null,
     completedAt: value.completedAt?.toISOString() ?? null,
@@ -45,10 +47,10 @@ export function publicRepairRun(value: RepairRunResult | null) {
   };
 }
 
-async function parseStartIntent(request: Request): Promise<string> {
+async function parseStartIntent(request: Request): Promise<{ idempotencyKey: string; objective: string }> {
   const contentType = request.headers.get('content-type') ?? '';
   const contentLength = Number(request.headers.get('content-length') ?? '0');
-  if (!contentType.startsWith('application/x-www-form-urlencoded') || !Number.isSafeInteger(contentLength) || contentLength > 2_048) {
+  if (!contentType.startsWith('application/x-www-form-urlencoded') || !Number.isSafeInteger(contentLength) || contentLength > 4_096) {
     throw new RepairRunError('invalid_idempotency_key');
   }
   let form: FormData;
@@ -57,12 +59,13 @@ async function parseStartIntent(request: Request): Promise<string> {
   } catch {
     throw new RepairRunError('invalid_idempotency_key');
   }
-  if ([...form.keys()].some((key) => key !== 'idempotencyKey') || form.getAll('idempotencyKey').length !== 1) {
+  if ([...form.keys()].some((key) => !['idempotencyKey', 'objective'].includes(key)) || form.getAll('idempotencyKey').length !== 1 || form.getAll('objective').length !== 1) {
     throw new RepairRunError('invalid_idempotency_key');
   }
   const value = form.get('idempotencyKey');
-  if (typeof value !== 'string' || !IDEMPOTENCY_KEY.test(value)) throw new RepairRunError('invalid_idempotency_key');
-  return value;
+  const objective = form.get('objective');
+  if (typeof value !== 'string' || !IDEMPOTENCY_KEY.test(value) || typeof objective !== 'string') throw new RepairRunError('invalid_idempotency_key');
+  return { idempotencyKey: value, objective };
 }
 
 export function createRepairRunHandlers(dependencies: Dependencies) {
@@ -73,12 +76,12 @@ export function createRepairRunHandlers(dependencies: Dependencies) {
       }
       try {
         const context = await dependencies.resolveContext(request.headers);
-        const idempotencyKey = await parseStartIntent(request);
-        const run = await (dependencies.start ?? startRepairRun)(dependencies.database, context, idempotencyKey, dependencies.queue);
+        const intent = await parseStartIntent(request);
+        const run = await (dependencies.start ?? startRepairRun)(dependencies.database, context, intent.idempotencyKey, intent.objective, dependencies.queue);
         return redirect(dependencies.configuration.baseUrl, `/app/github?repairRun=${encodeURIComponent(run.id)}`);
       } catch (error) {
         if (error instanceof AccessDeniedError) return redirect(dependencies.configuration.baseUrl, '/sign-in');
-        const code = error instanceof BaselineAuthorityError || error instanceof RepairRunError ? error.code : 'repair_run_unavailable';
+        const code = error instanceof BaselineAuthorityError || error instanceof RepairRunError || error instanceof RepairIntentValidationError ? error.code : 'repair_run_unavailable';
         return redirect(dependencies.configuration.baseUrl, `/app/github?error=${encodeURIComponent(code)}`);
       }
     },

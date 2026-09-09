@@ -29,6 +29,8 @@ export interface RepairRunResult {
   baselineOutcome: BaselineOutcome | null;
   failureClassification: string | null;
   failureCode: string | null;
+  repairObjective: string | null;
+  repairObjectiveHash: string | null;
   createdAt: Date;
   baselineStartedAt: Date | null;
   completedAt: Date | null;

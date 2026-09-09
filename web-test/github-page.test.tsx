@@ -221,3 +221,34 @@ test('active Repair Run renders honest worker-owned progress and queued cancella
   assert.match(running, /Running baseline/);
   assert.doesNotMatch(running, /Cancel queued run|Start repair/);
 });
+
+test('eligible Repair Run renders its objective and bounded investigation status', () => {
+  const repairRun = {
+    id: '11111111-1111-4111-8111-111111111111', state: 'ready_for_investigation' as const, repositoryId: 8101,
+    revision: 'a'.repeat(40), profileIdentity: 'b'.repeat(64), repairObjective: 'Inspect durable Repair Runs.',
+    baseline: { evidenceId: 'baseline-1', outcome: 'baseline_passed' }, failure: null,
+    createdAt: '2026-09-09T00:00:00.000Z', baselineStartedAt: '2026-09-09T00:00:01.000Z', completedAt: '2026-09-09T00:01:00.000Z', stateChangedAt: '2026-09-09T00:01:00.000Z',
+  };
+  const common = {
+    executionProfile: {
+      baseRevision: 'a'.repeat(40), build: null, install: { operation: 'ci' as const, tool: 'npm' as const }, nodeMajor: 24,
+      packageManager: 'npm', profileIdentity: 'b'.repeat(64), profileVersion: 2 as const, runtimeFamily: 'node', status: 'ready' as const,
+      test: { script: 'test' as const, tool: 'npm' as const }, testRunner: 'node-test', typecheck: null,
+    },
+    installation: { accountLogin: 'xmodneo', accountType: 'User', installationId: 7001, status: 'active' },
+    investigationRequestId: '22222222-2222-4222-8222-222222222222', repairRequestId: '11111111-1111-4111-8111-111111111111', repairRun,
+    selectedRepository: { defaultBranch: 'main', fullName: 'xmodneo/vigilo', id: 8101, isPrivate: false }, workspaceId: 'workspace-1',
+  };
+  const eligible = renderToStaticMarkup(<GitHubConnectionView {...common} />);
+  assert.match(eligible, /Inspect durable Repair Runs/); assert.match(eligible, /Prepare investigation/);
+  assert.match(eligible, /action="\/api\/repair-runs\/11111111-1111-4111-8111-111111111111\/investigation"/);
+  const prepared = renderToStaticMarkup(<GitHubConnectionView {...common} investigation={{
+    id: '33333333-3333-4333-8333-333333333333', repairRunId: repairRun.id, repairObjective: repairRun.repairObjective,
+    state: 'ready', revision: repairRun.revision, profileIdentity: repairRun.profileIdentity, baselineAvailable: true,
+    treeSha: 'c'.repeat(40), indexedPathCount: 42, excludedPathCount: 3, treeTruncated: false,
+    contextBudget: { version: 1, maxTreeEntries: 2000, maxFileBytes: 65536, maxCumulativeBytes: 1048576, maxOperations: 50 },
+    failureCode: null, createdAt: repairRun.createdAt, completedAt: repairRun.completedAt, updatedAt: repairRun.completedAt!,
+  }} />);
+  assert.match(prepared, /Bounded repository context/); assert.match(prepared, /Paths indexed.*42/); assert.match(prepared, /Baseline evidence.*Available/);
+  assert.doesNotMatch(prepared, /Prepare investigation/);
+});

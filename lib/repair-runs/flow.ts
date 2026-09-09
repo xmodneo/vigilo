@@ -2,10 +2,11 @@ import { randomUUID } from 'node:crypto';
 
 import { and, desc, eq, inArray } from 'drizzle-orm';
 
-import { repairRun, repairRunEvent, repositoryBaseline } from '../../db/schema.ts';
+import { repairIntent, repairRun, repairRunEvent, repositoryBaseline } from '../../db/schema.ts';
 import type { AuthenticatedWorkspace } from '../auth/protected-context.ts';
 import type { VigiloDatabase } from '../db/types.ts';
 import { resolveBaselineAuthority } from '../repository-baselines/authority.ts';
+import { normalizeRepairObjective, RepairIntentValidationError } from './intent.ts';
 import { REPAIR_JOB_VERSION, type TransactionalRepairQueue } from './queue.ts';
 import { validateTransition } from './state-machine.ts';
 import type { RepairRunIdentity, RepairRunResult, RepairRunState } from './types.ts';
@@ -18,6 +19,7 @@ export class RepairRunError extends Error {
     | 'baseline_evidence_missing'
     | 'baseline_evidence_mismatch'
     | 'handoff_failed'
+    | 'repair_intent_conflict'
     | 'state_persistence_failed') {
     super(code);
     this.name = 'RepairRunError';
@@ -43,6 +45,8 @@ function result(value: StoredRun): RepairRunResult {
     baselineOutcome: value.baselineOutcome as RepairRunResult['baselineOutcome'],
     failureClassification: value.failureClassification,
     failureCode: value.failureCode,
+    repairObjective: null,
+    repairObjectiveHash: null,
     createdAt: value.createdAt,
     baselineStartedAt: value.baselineStartedAt,
     completedAt: value.completedAt,
@@ -62,8 +66,15 @@ export function matchesRepairRunEvidence(run: StoredRun, evidence: typeof reposi
 function transitionFacts(target: RepairRunState, baseline: typeof repositoryBaseline.$inferSelect | null, now: Date, failureCode?: string) {
   const baselineOutcome = baseline?.overallOutcome ?? null;
   if (target === 'ready_for_investigation') {
-    if (!baseline || baselineOutcome !== 'baseline_passed') throw new RepairRunError('baseline_evidence_missing');
-    return { baselineId: baseline.id, baselineOutcome, completedAt: now, failureClassification: null, failureCode: null };
+    if (!baseline || !['baseline_passed', 'baseline_failed', 'typecheck_failed', 'build_failed', 'test_failed'].includes(baselineOutcome ?? '')) throw new RepairRunError('baseline_evidence_missing');
+    const customerFailure = baselineOutcome !== 'baseline_passed';
+    return {
+      baselineId: baseline.id,
+      baselineOutcome,
+      completedAt: now,
+      failureClassification: customerFailure ? 'customer_baseline_failure' : null,
+      failureCode: customerFailure ? baselineOutcome : null,
+    };
   }
   if (target === 'baseline_failed') {
     if (!baseline || !['baseline_failed', 'typecheck_failed', 'build_failed', 'test_failed'].includes(baselineOutcome ?? '')) {
@@ -126,11 +137,13 @@ async function createRepairRun(
   database: VigiloDatabase,
   identity: RepairRunIdentity,
   idempotencyKey: string,
+  objectiveInput: unknown,
   now: Date,
   randomId: () => string,
   queue: TransactionalRepairQueue,
 ) {
   if (!IDEMPOTENCY_KEY.test(idempotencyKey)) throw new RepairRunError('invalid_idempotency_key');
+  const intent = normalizeRepairObjective(objectiveInput);
   for (let attempt = 0; attempt < 2; attempt += 1) {
     const claimed = await database.transaction(async (transaction) => {
       const [inserted] = await transaction.insert(repairRun).values({
@@ -143,16 +156,24 @@ async function createRepairRun(
         updatedAt: now,
       }).onConflictDoNothing().returning();
       if (inserted) {
+        await transaction.insert(repairIntent).values({
+          id: randomId(), repairRunId: inserted.id, workspaceId: identity.workspaceId,
+          objective: intent.objective, objectiveHash: intent.objectiveHash, createdAt: now,
+        });
         await transaction.insert(repairRunEvent).values({ id: randomId(), repairRunId: inserted.id, fromState: null, toState: 'created', createdAt: now });
         const jobId = await queue.enqueue(transaction, { version: REPAIR_JOB_VERSION, repairRunId: inserted.id });
         if (jobId !== inserted.id) throw new RepairRunError('handoff_failed');
-        return { run: result(inserted), ownsExecution: true };
+        return { run: { ...result(inserted), repairObjective: intent.objective, repairObjectiveHash: intent.objectiveHash }, ownsExecution: true };
       }
       const [idempotent] = await transaction.select().from(repairRun).where(and(
         eq(repairRun.workspaceId, identity.workspaceId),
         eq(repairRun.idempotencyKey, idempotencyKey),
       )).limit(1);
-      if (idempotent) return { run: result(idempotent), ownsExecution: false };
+      if (idempotent) {
+        const [storedIntent] = await transaction.select().from(repairIntent).where(eq(repairIntent.repairRunId, idempotent.id)).limit(1);
+        if (!storedIntent || storedIntent.objectiveHash !== intent.objectiveHash || storedIntent.objective !== intent.objective) throw new RepairRunError('repair_intent_conflict');
+        return { run: { ...result(idempotent), repairObjective: storedIntent.objective, repairObjectiveHash: storedIntent.objectiveHash }, ownsExecution: false };
+      }
       const [active] = await transaction.select().from(repairRun).where(and(
         eq(repairRun.workspaceId, identity.workspaceId),
         eq(repairRun.githubRepositoryId, identity.githubRepositoryId),
@@ -161,7 +182,10 @@ async function createRepairRun(
         eq(repairRun.baseCommitSha, identity.baseCommitSha),
         inArray(repairRun.state, ['created', 'baseline_running']),
       )).limit(1);
-      return active ? { run: result(active), ownsExecution: false } : null;
+      if (!active) return null;
+      const [storedIntent] = await transaction.select().from(repairIntent).where(eq(repairIntent.repairRunId, active.id)).limit(1);
+      if (!storedIntent || storedIntent.objectiveHash !== intent.objectiveHash || storedIntent.objective !== intent.objective) throw new RepairRunError('repair_intent_conflict');
+      return { run: { ...result(active), repairObjective: storedIntent.objective, repairObjectiveHash: storedIntent.objectiveHash }, ownsExecution: false };
     });
     if (claimed) return claimed;
   }
@@ -172,6 +196,7 @@ export async function startRepairRun(
   database: VigiloDatabase,
   context: AuthenticatedWorkspace,
   idempotencyKey: string,
+  objective: unknown,
   queue: TransactionalRepairQueue,
   options: { clock?: () => Date; randomId?: () => string } = {},
 ): Promise<RepairRunResult> {
@@ -186,21 +211,25 @@ export async function startRepairRun(
   const clock = options.clock ?? (() => new Date());
   const randomId = options.randomId ?? randomUUID;
   try {
-    return (await createRepairRun(database, identity, idempotencyKey, clock(), randomId, queue)).run;
+    return (await createRepairRun(database, identity, idempotencyKey, objective, clock(), randomId, queue)).run;
   } catch (error) {
-    if (error instanceof RepairRunError) throw error;
+    if (error instanceof RepairRunError || error instanceof RepairIntentValidationError) throw error;
     throw new RepairRunError('handoff_failed');
   }
 }
 
 export async function getRepairRun(database: VigiloDatabase, context: AuthenticatedWorkspace, runId: string): Promise<RepairRunResult | null> {
   const [value] = await database.select().from(repairRun).where(and(eq(repairRun.id, runId), eq(repairRun.workspaceId, context.workspace.id))).limit(1);
-  return value ? result(value) : null;
+  if (!value) return null;
+  const [intent] = await database.select().from(repairIntent).where(eq(repairIntent.repairRunId, value.id)).limit(1);
+  return { ...result(value), repairObjective: intent?.objective ?? null, repairObjectiveHash: intent?.objectiveHash ?? null };
 }
 
 export async function getLatestRepairRun(database: VigiloDatabase, context: AuthenticatedWorkspace, githubRepositoryId: number): Promise<RepairRunResult | null> {
   const [value] = await database.select().from(repairRun).where(and(eq(repairRun.workspaceId, context.workspace.id), eq(repairRun.githubRepositoryId, githubRepositoryId))).orderBy(desc(repairRun.createdAt)).limit(1);
-  return value ? result(value) : null;
+  if (!value) return null;
+  const [intent] = await database.select().from(repairIntent).where(eq(repairIntent.repairRunId, value.id)).limit(1);
+  return { ...result(value), repairObjective: intent?.objective ?? null, repairObjectiveHash: intent?.objectiveHash ?? null };
 }
 
 export async function cancelCreatedRepairRun(database: VigiloDatabase, context: AuthenticatedWorkspace, runId: string, now = new Date()): Promise<RepairRunResult> {

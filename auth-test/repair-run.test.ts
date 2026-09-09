@@ -49,6 +49,7 @@ const INSTALLATION_ID = 9001;
 const CONFIGURATION: GitHubAppConfiguration = { appId: 991, appSlug: 'vigilo-test', baseUrl: 'http://localhost:3000', clientId: 'Iv1.test' };
 const PACKAGE = '{"name":"app"}';
 const LOCK = '{"lockfileVersion":3,"packages":{"":{"name":"app"}}}';
+const OBJECTIVE = 'Investigate the deterministic customer-visible failure.';
 const sha256 = (value: string) => createHash('sha256').update(value).digest('hex');
 
 async function authenticated(context: Awaited<ReturnType<typeof createTestContext>>, githubId = 'repair-user'): Promise<AuthenticatedWorkspace> {
@@ -213,9 +214,9 @@ function workerDependencies(database: VigiloDatabase, baselineExecutor: Baseline
   };
 }
 
-async function queuedRun(context: Awaited<ReturnType<typeof createTestContext>>, owner: AuthenticatedWorkspace, key = randomUUID()) {
+async function queuedRun(context: Awaited<ReturnType<typeof createTestContext>>, owner: AuthenticatedWorkspace, key = randomUUID(), objective = OBJECTIVE) {
   const queue = new MemoryQueue();
-  const run = await startRepairRun(context.database, owner, key, queue, { clock: () => NOW });
+  const run = await startRepairRun(context.database, owner, key, objective, queue, { clock: () => NOW });
   return { queue, run };
 }
 
@@ -230,7 +231,7 @@ test('Repair Run state and baseline classification remain fail-closed', () => {
     ['baseline_failed', 'baseline_running'], ['infrastructure_failed', 'baseline_running'], ['cancelled', 'baseline_running'],
   ] as const) assert.throws(() => validateTransition(from, to), RepairRunTransitionError);
   assert.equal(classifyBaselineOutcome('baseline_passed'), 'ready_for_investigation');
-  for (const value of ['baseline_failed', 'typecheck_failed', 'build_failed', 'test_failed'] as const) assert.equal(classifyBaselineOutcome(value), 'baseline_failed');
+  for (const value of ['baseline_failed', 'typecheck_failed', 'build_failed', 'test_failed'] as const) assert.equal(classifyBaselineOutcome(value), 'ready_for_investigation');
   for (const value of ['installation_failed', 'timed_out', 'infrastructure_failed', 'cleanup_failed'] as const) assert.equal(classifyBaselineOutcome(value), 'infrastructure_failed');
 });
 
@@ -238,7 +239,7 @@ test('web start atomically creates immutable run, event, and minimal durable res
   const context = await createTestContext(); t.after(() => context.client.close());
   const owner = await authenticated(context); await seed(context, owner);
   const queue = new MemoryQueue();
-  const run = await startRepairRun(context.database, owner, randomUUID(), queue, { clock: () => NOW });
+  const run = await startRepairRun(context.database, owner, randomUUID(), OBJECTIVE, queue, { clock: () => NOW });
   assert.equal(run.state, 'created');
   assert.deepEqual(run.identity, { workspaceId: owner.workspace.id, githubRepositoryId: REPOSITORY_ID, installationId: INSTALLATION_ID, baseCommitSha: COMMIT, profileIdentity: profileValues(owner.workspace.id).profileIdentity });
   assert.deepEqual(queue.payloads, [{ version: 1, repairRunId: run.id }]);
@@ -251,7 +252,7 @@ test('failed handoff rolls back the Repair Run and its event', async (t) => {
   const context = await createTestContext(); t.after(() => context.client.close());
   const owner = await authenticated(context); await seed(context, owner);
   const queue = new MemoryQueue(); queue.fail = true;
-  await assert.rejects(startRepairRun(context.database, owner, randomUUID(), queue), /handoff_failed/);
+  await assert.rejects(startRepairRun(context.database, owner, randomUUID(), OBJECTIVE, queue), /handoff_failed/);
   assert.equal((await context.database.select().from(repairRun)).length, 0);
   assert.equal((await context.database.select().from(repairRunEvent)).length, 0);
 });
@@ -262,10 +263,10 @@ test('repeated and concurrent starts reuse one queued run', async (t) => {
   const queue = new MemoryQueue();
   const key = randomUUID();
   const [first, duplicate] = await Promise.all([
-    startRepairRun(context.database, owner, key, queue),
-    startRepairRun(context.database, owner, key, queue),
+    startRepairRun(context.database, owner, key, OBJECTIVE, queue),
+    startRepairRun(context.database, owner, key, OBJECTIVE, queue),
   ]);
-  const reloaded = await startRepairRun(context.database, owner, randomUUID(), queue);
+  const reloaded = await startRepairRun(context.database, owner, randomUUID(), OBJECTIVE, queue);
   assert.equal(first.id, duplicate.id); assert.equal(first.id, reloaded.id);
   assert.equal(queue.payloads.length, 1);
   assert.equal((await context.database.select().from(repairRun)).length, 1);
@@ -358,7 +359,7 @@ test('terminal and cancelled runs make later delivery harmless', async (t) => {
   assert.equal(calls.count, 0);
 });
 
-test('customer test, build, and typecheck failures are terminal without retry', async (t) => {
+test('customer test, build, and typecheck failures remain investigable without retry', async (t) => {
   for (const outcome of ['test_failed', 'build_failed', 'typecheck_failed'] as const) {
     const context = await createTestContext(); t.after(() => context.client.close());
     const owner = await authenticated(context, `customer-${outcome}`); await seed(context, owner);
@@ -366,7 +367,7 @@ test('customer test, build, and typecheck failures are terminal without retry', 
     const result = await processRepairJob(job(run.id), workerDependencies(context.database, executorFor(outcome)));
     assert.equal(result.status, 'completed');
     const stored = await getRepairRun(context.database, owner, run.id);
-    assert.equal(stored?.state, 'baseline_failed'); assert.equal(stored?.failureClassification, 'customer_baseline_failure');
+    assert.equal(stored?.state, 'ready_for_investigation'); assert.equal(stored?.failureClassification, 'customer_baseline_failure');
     assert.equal((await context.database.select().from(repairRunAttempt)).length, 1);
   }
 });
@@ -511,14 +512,14 @@ test('protected async API accepts only idempotent intent and remains workspace s
   const queue = new MemoryQueue();
   const handlers = createRepairRunHandlers({ configuration: CONFIGURATION, database: context.database, queue, resolveContext: async () => owner });
   const key = randomUUID();
-  const response = await handlers.start(new Request('http://localhost:3000/api/repair-runs', { method: 'POST', headers: { origin: CONFIGURATION.baseUrl }, body: new URLSearchParams({ idempotencyKey: key }) }));
+  const response = await handlers.start(new Request('http://localhost:3000/api/repair-runs', { method: 'POST', headers: { origin: CONFIGURATION.baseUrl }, body: new URLSearchParams({ idempotencyKey: key, objective: OBJECTIVE }) }));
   assert.equal(response.status, 303); assert.equal(queue.payloads.length, 1);
   const runId = queue.payloads[0]?.repairRunId; assert.ok(runId);
   const read = await handlers.read(new Request(`http://localhost:3000/api/repair-runs/${runId}`), runId);
   assert.equal(read.status, 200); assert.equal((await read.json()).repairRun.state, 'created');
   const outsiderHandlers = createRepairRunHandlers({ configuration: CONFIGURATION, database: context.database, queue, resolveContext: async () => outsider });
   assert.equal((await outsiderHandlers.read(new Request(`http://localhost:3000/api/repair-runs/${runId}`), runId)).status, 404);
-  const forged = await handlers.start(new Request('http://localhost:3000/api/repair-runs', { method: 'POST', headers: { origin: CONFIGURATION.baseUrl }, body: new URLSearchParams({ idempotencyKey: randomUUID(), repositoryId: '999', state: 'ready_for_investigation' }) }));
+  const forged = await handlers.start(new Request('http://localhost:3000/api/repair-runs', { method: 'POST', headers: { origin: CONFIGURATION.baseUrl }, body: new URLSearchParams({ idempotencyKey: randomUUID(), objective: OBJECTIVE, repositoryId: '999', state: 'ready_for_investigation' }) }));
   assert.match(forged.headers.get('location') ?? '', /invalid_idempotency_key/);
 });
 
@@ -540,7 +541,7 @@ test('unauthenticated start/read are rejected and historical identity survives r
   const owner = await authenticated(context); await seed(context, owner);
   const { run, queue } = await queuedRun(context, owner);
   const denied = createRepairRunHandlers({ configuration: CONFIGURATION, database: context.database, queue, resolveContext: async () => { throw new AccessDeniedError('unauthorized'); } });
-  assert.equal((await denied.start(new Request('http://localhost:3000/api/repair-runs', { method: 'POST', headers: { origin: CONFIGURATION.baseUrl }, body: new URLSearchParams({ idempotencyKey: randomUUID() }) }))).status, 303);
+  assert.equal((await denied.start(new Request('http://localhost:3000/api/repair-runs', { method: 'POST', headers: { origin: CONFIGURATION.baseUrl }, body: new URLSearchParams({ idempotencyKey: randomUUID(), objective: OBJECTIVE }) }))).status, 303);
   assert.equal((await denied.read(new Request(`http://localhost:3000/api/repair-runs/${run.id}`), run.id)).status, 401);
   await context.database.delete(repository).where(eq(repository.workspaceId, owner.workspace.id));
   assert.equal((await getRepairRun(context.database, owner, run.id))?.identity.githubRepositoryId, REPOSITORY_ID);
@@ -550,9 +551,9 @@ test('missing and corrupted profiles prevent queue handoff', async (t) => {
   const context = await createTestContext(); t.after(() => context.client.close());
   const owner = await authenticated(context); await seed(context, owner, false);
   const queue = new MemoryQueue();
-  await assert.rejects(startRepairRun(context.database, owner, randomUUID(), queue), BaselineAuthorityError);
+  await assert.rejects(startRepairRun(context.database, owner, randomUUID(), OBJECTIVE, queue), BaselineAuthorityError);
   await context.database.insert(executionProfile).values({ ...profileValues(owner.workspace.id), profileIdentity: 'f'.repeat(64) });
-  await assert.rejects(startRepairRun(context.database, owner, randomUUID(), queue), (error: unknown) => error instanceof BaselineAuthorityError && error.code === 'profile_corrupt');
+  await assert.rejects(startRepairRun(context.database, owner, randomUUID(), OBJECTIVE, queue), (error: unknown) => error instanceof BaselineAuthorityError && error.code === 'profile_corrupt');
   assert.equal(queue.payloads.length, 0);
 });
 

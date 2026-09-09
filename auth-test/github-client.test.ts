@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { generateKeyPairSync, verify } from 'node:crypto';
+import { createHash, generateKeyPairSync, verify } from 'node:crypto';
 import test from 'node:test';
 
 import {
@@ -375,4 +375,35 @@ test('GitHub client rejects malformed, unavailable, and oversized provider respo
         !error.message.includes('provider private error'),
     );
   }
+});
+
+test('investigation source reads exact Git commit, recursive tree, and bounded blob objects', async () => {
+  const keys = keyPair();
+  const commit = 'a'.repeat(40); const tree = 'b'.repeat(40); const bytes = Buffer.from('bounded text');
+  const blob = createHash('sha1').update(`blob ${bytes.byteLength}\0`).update(bytes).digest('hex');
+  const requests: Array<{ headers: Headers; url: string }> = [];
+  const responses = [
+    Response.json({ sha: commit, tree: { sha: tree } }),
+    Response.json({ sha: tree, truncated: false, tree: [{ path: 'README.md', mode: '100644', type: 'blob', sha: blob, size: bytes.byteLength }] }),
+    Response.json({ sha: blob, encoding: 'base64', content: bytes.toString('base64'), size: bytes.byteLength }),
+  ];
+  const client = new GitHubApiClient(CONFIGURATION, keys.privateKey, async (input, init) => {
+    requests.push({ headers: new Headers(init?.headers), url: String(input) }); return responses.shift()!;
+  }, () => NOW);
+  assert.deepEqual(await client.getCommitTree({ accessToken: 'ghs_context-token', owner: 'xmodneo', repository: 'vigilo', commitSha: commit }), { commitSha: commit, treeSha: tree });
+  assert.deepEqual(await client.getTree({ accessToken: 'ghs_context-token', owner: 'xmodneo', repository: 'vigilo', treeSha: tree }), { entries: [{ path: 'README.md', mode: '100644', type: 'blob', sha: blob, size: bytes.byteLength }], truncated: false });
+  assert.deepEqual(await client.getBlob({ accessToken: 'ghs_context-token', owner: 'xmodneo', repository: 'vigilo', blobSha: blob }), { bytes, sha: blob });
+  assert.match(requests[0]?.url ?? '', new RegExp(`/git/commits/${commit}$`));
+  assert.match(requests[1]?.url ?? '', new RegExp(`/git/trees/${tree}\\?recursive=1$`));
+  assert.match(requests[2]?.url ?? '', new RegExp(`/git/blobs/${blob}$`));
+  assert.ok(requests.every((request) => request.headers.get('authorization') === 'Bearer ghs_context-token'));
+  assert.ok(requests.every((request) => request.headers.get('x-github-api-version') === '2026-03-10'));
+});
+
+test('investigation source rejects mismatched identities and blobs above the V1 file limit', async () => {
+  const keys = keyPair(); const commit = 'a'.repeat(40); const tree = 'b'.repeat(40);
+  const mismatched = new GitHubApiClient(CONFIGURATION, keys.privateKey, async () => Response.json({ sha: 'f'.repeat(40), tree: { sha: tree } }), () => NOW);
+  await assert.rejects(mismatched.getCommitTree({ accessToken: 'token', owner: 'x', repository: 'y', commitSha: commit }), /github_api_error/);
+  const oversized = new GitHubApiClient(CONFIGURATION, keys.privateKey, async () => Response.json({ sha: 'c'.repeat(40), encoding: 'base64', content: '', size: 65_537 }), () => NOW);
+  await assert.rejects(oversized.getBlob({ accessToken: 'token', owner: 'x', repository: 'y', blobSha: 'c'.repeat(40) }), /github_api_error/);
 });

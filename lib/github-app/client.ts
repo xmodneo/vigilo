@@ -19,11 +19,13 @@ import type {
   InstallationRepositoryMetadata,
   RepositoryRootEntry,
 } from '../execution-profiles/types.ts';
+import type { GitTreeEntry, InvestigationSourceGateway } from '../investigations/types.ts';
 
 const API_BASE_URL = 'https://api.github.com';
 const API_VERSION = '2026-03-10';
 const GITHUB_BASE_URL = 'https://github.com';
 const MAX_RESPONSE_BYTES = 1_000_000;
+const MAX_TREE_RESPONSE_BYTES = 8 * 1024 * 1024;
 const MAX_ARCHIVE_BYTES = 50 * 1024 * 1024;
 const REQUEST_TIMEOUT_MS = 10_000;
 
@@ -61,7 +63,7 @@ export function createGitHubAppJwt(
   }
 }
 
-async function readBoundedJson(response: Response): Promise<unknown> {
+async function readBoundedJson(response: Response, maximumBytes = MAX_RESPONSE_BYTES): Promise<unknown> {
   if (!response.ok || !response.body) {
     throw new GitHubProviderError();
   }
@@ -74,7 +76,7 @@ async function readBoundedJson(response: Response): Promise<unknown> {
       const { done, value } = await reader.read();
       if (done) break;
       length += value.byteLength;
-      if (length > MAX_RESPONSE_BYTES) {
+      if (length > maximumBytes) {
         await reader.cancel();
         throw new GitHubProviderError();
       }
@@ -282,7 +284,37 @@ function parseRepositoryFile(value: unknown): InspectedRepositoryFile {
   return { content: bytes.toString('utf8'), sha: gitSha(record.sha) };
 }
 
-export class GitHubApiClient implements GitHubInstallationGateway, GitHubRepositoryAccessGateway, GitHubExecutionProfileGateway {
+function parseGitTree(value: unknown): { entries: GitTreeEntry[]; truncated: boolean } {
+  const record = objectValue(value);
+  if (typeof record.truncated !== 'boolean' || !Array.isArray(record.tree) || record.tree.length > 100_000) throw new GitHubProviderError();
+  const seen = new Set<string>();
+  const entries = record.tree.map((candidate): GitTreeEntry => {
+    const entry = objectValue(candidate);
+    const path = nonemptyString(entry.path, 512);
+    const mode = nonemptyString(entry.mode);
+    const type = nonemptyString(entry.type);
+    if (!['040000', '100644', '100755', '120000', '160000'].includes(mode) || !['blob', 'tree', 'commit'].includes(type) || seen.has(path)) throw new GitHubProviderError();
+    const size = entry.size === undefined ? null : entry.size;
+    if (size !== null && (typeof size !== 'number' || !Number.isSafeInteger(size) || size < 0)) throw new GitHubProviderError();
+    seen.add(path);
+    return { mode: mode as GitTreeEntry['mode'], path, sha: gitSha(entry.sha), size, type: type as GitTreeEntry['type'] };
+  });
+  return { entries, truncated: record.truncated };
+}
+
+function parseGitBlob(value: unknown): { bytes: Buffer; sha: string } {
+  const record = objectValue(value);
+  if (record.encoding !== 'base64' || typeof record.content !== 'string') throw new GitHubProviderError();
+  const size = record.size;
+  if (typeof size !== 'number' || !Number.isSafeInteger(size) || size < 0 || size > 65_536) throw new GitHubProviderError();
+  const encoded = record.content.replace(/\s/g, '');
+  if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(encoded)) throw new GitHubProviderError();
+  const bytes = Buffer.from(encoded, 'base64');
+  if (bytes.byteLength !== size) throw new GitHubProviderError();
+  return { bytes, sha: gitSha(record.sha) };
+}
+
+export class GitHubApiClient implements GitHubInstallationGateway, GitHubRepositoryAccessGateway, GitHubExecutionProfileGateway, InvestigationSourceGateway {
   private readonly privateKey: KeyObject;
 
   constructor(
@@ -484,6 +516,36 @@ export class GitHubApiClient implements GitHubInstallationGateway, GitHubReposit
     if (response.status !== 204) throw new GitHubProviderError();
   }
 
+  async getCommitTree(input: { accessToken: string; owner: string; repository: string; commitSha: string }): Promise<{ commitSha: string; treeSha: string }> {
+    const result = objectValue(await this.apiJson(
+      `/repos/${encodeURIComponent(input.owner)}/${encodeURIComponent(input.repository)}/git/commits/${encodeURIComponent(input.commitSha)}`,
+      { headers: { Authorization: `Bearer ${input.accessToken}` } },
+    ));
+    const commitSha = gitSha(result.sha);
+    const treeSha = gitSha(objectValue(result.tree).sha);
+    if (commitSha !== input.commitSha) throw new GitHubProviderError();
+    return { commitSha, treeSha };
+  }
+
+  async getTree(input: { accessToken: string; owner: string; repository: string; treeSha: string }): Promise<{ entries: GitTreeEntry[]; truncated: boolean }> {
+    const result = objectValue(await this.apiJson(
+      `/repos/${encodeURIComponent(input.owner)}/${encodeURIComponent(input.repository)}/git/trees/${encodeURIComponent(input.treeSha)}?recursive=1`,
+      { headers: { Authorization: `Bearer ${input.accessToken}` } },
+      MAX_TREE_RESPONSE_BYTES,
+    ));
+    if (gitSha(result.sha) !== input.treeSha) throw new GitHubProviderError();
+    return parseGitTree(result);
+  }
+
+  async getBlob(input: { accessToken: string; owner: string; repository: string; blobSha: string }): Promise<{ bytes: Buffer; sha: string }> {
+    const result = parseGitBlob(await this.apiJson(
+      `/repos/${encodeURIComponent(input.owner)}/${encodeURIComponent(input.repository)}/git/blobs/${encodeURIComponent(input.blobSha)}`,
+      { headers: { Authorization: `Bearer ${input.accessToken}` } },
+    ));
+    if (result.sha !== input.blobSha) throw new GitHubProviderError();
+    return result;
+  }
+
   async downloadRepositoryArchive(input: {
     accessToken: string;
     owner: string;
@@ -587,7 +649,7 @@ export class GitHubApiClient implements GitHubInstallationGateway, GitHubReposit
     }
   }
 
-  private apiJson(path: string, init: RequestInit): Promise<unknown> {
+  private apiJson(path: string, init: RequestInit, maximumBytes = MAX_RESPONSE_BYTES): Promise<unknown> {
     return this.requestJson(`${API_BASE_URL}${path}`, {
       ...init,
       headers: {
@@ -595,11 +657,11 @@ export class GitHubApiClient implements GitHubInstallationGateway, GitHubReposit
         'X-GitHub-Api-Version': API_VERSION,
         ...init.headers,
       },
-    });
+    }, maximumBytes);
   }
 
-  private async requestJson(url: string, init: RequestInit): Promise<unknown> {
-    return readBoundedJson(await this.request(url, init));
+  private async requestJson(url: string, init: RequestInit, maximumBytes = MAX_RESPONSE_BYTES): Promise<unknown> {
+    return readBoundedJson(await this.request(url, init), maximumBytes);
   }
 
   private async request(
