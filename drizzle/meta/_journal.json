@@ -43,6 +43,13 @@
       "when": 1789120800000,
       "tag": "0005_repository-baseline",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1789207200000,
+      "tag": "0006_repair-run",
+      "breakpoints": true
     }
   ]
 }

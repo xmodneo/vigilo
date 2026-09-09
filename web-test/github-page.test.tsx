@@ -7,7 +7,7 @@ import { GitHubConnectionView } from '../app/app/github/github-connection-view.j
 
 test('GitHub connection page renders the disconnected installation action', () => {
   const html = renderToStaticMarkup(
-    <GitHubConnectionView installation={null} workspaceId="workspace-1" />,
+    <GitHubConnectionView installation={null} repairRequestId="11111111-1111-4111-8111-111111111111" workspaceId="workspace-1" />,
   );
 
   assert.match(html, /GitHub connection/);
@@ -34,6 +34,7 @@ test('GitHub connection page renders only stable connected installation facts', 
           isPrivate: true,
         },
       ]}
+      repairRequestId="11111111-1111-4111-8111-111111111111"
       workspaceId="workspace-1"
     />,
   );
@@ -57,6 +58,7 @@ test('connected installation requires temporary GitHub App authorization before 
         installationId: 7001,
         status: 'active',
       }}
+      repairRequestId="11111111-1111-4111-8111-111111111111"
       workspaceId="workspace-1"
     />,
   );
@@ -81,6 +83,7 @@ test('GitHub connection page shows selected repository and unconfigured executio
         id: 8101,
         isPrivate: false,
       }}
+      repairRequestId="11111111-1111-4111-8111-111111111111"
       workspaceId="workspace-1"
     />,
   );
@@ -127,6 +130,7 @@ test('selected repository renders a Ready allowlisted execution profile', () => 
         id: 8101,
         isPrivate: false,
       }}
+      repairRequestId="11111111-1111-4111-8111-111111111111"
       workspaceId="workspace-1"
     />,
   );
@@ -138,7 +142,8 @@ test('selected repository renders a Ready allowlisted execution profile', () => 
   assert.match(html, /npm run build/);
   assert.match(html, /npm test/);
   assert.match(html, /Node built-in test runner/);
-  assert.match(html, /Run baseline/);
+  assert.match(html, /Start repair/);
+  assert.match(html, /action="\/api\/repair-runs"/);
   assert.match(html, /Execution evidence/);
   assert.match(html, /baseline_passed/);
   assert.match(html, /Network isolation.*confirmed/);
@@ -168,10 +173,34 @@ test('unsupported profile renders only its safe classification reason', () => {
         id: 8101,
         isPrivate: false,
       }}
+      repairRequestId="11111111-1111-4111-8111-111111111111"
       workspaceId="workspace-1"
     />,
   );
   assert.match(html, /Unsupported/);
   assert.match(html, /Competing package-manager lockfiles were found/);
   assert.match(html, /Recompute execution profile/);
+});
+
+test('repository page renders durable Repair Run state without exposing authority controls', () => {
+  const html = renderToStaticMarkup(
+    <GitHubConnectionView
+      executionProfile={{
+        baseRevision: 'a'.repeat(40), build: null, install: { operation: 'ci', tool: 'npm' }, nodeMajor: 24,
+        packageManager: 'npm', profileIdentity: 'b'.repeat(64), profileVersion: 2, runtimeFamily: 'node', status: 'ready',
+        test: { script: 'test', tool: 'npm' }, testRunner: 'node-test', typecheck: null,
+      }}
+      installation={{ accountLogin: 'xmodneo', accountType: 'User', installationId: 7001, status: 'active' }}
+      repairRequestId="11111111-1111-4111-8111-111111111111"
+      repairRun={{
+        id: 'run-1', state: 'ready_for_investigation', repositoryId: 8101, revision: 'a'.repeat(40), profileIdentity: 'b'.repeat(64),
+        baseline: { evidenceId: 'baseline-1', outcome: 'baseline_passed' }, failure: null,
+        createdAt: '2026-09-09T00:00:00.000Z', baselineStartedAt: '2026-09-09T00:00:01.000Z', completedAt: '2026-09-09T00:01:00.000Z', stateChangedAt: '2026-09-09T00:01:00.000Z',
+      }}
+      selectedRepository={{ defaultBranch: 'main', fullName: 'xmodneo/vigilo', id: 8101, isPrivate: false }}
+      workspaceId="workspace-1"
+    />,
+  );
+  assert.match(html, /Repair Run/); assert.match(html, /aaaaaaaaaaaa/); assert.match(html, /Baseline.*Passed/); assert.match(html, /ready for investigation/);
+  assert.doesNotMatch(html, /name="(?:state|commit|profile|repository|workspace)/);
 });

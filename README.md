@@ -3,11 +3,26 @@
 Vigilo is a sandbox-first software maintenance platform. Milestone 1 proves its
 isolated repair boundary: reproduce a failure, freeze exact candidate bytes,
 verify those bytes in a fresh sandbox, produce structured evidence, and clean up.
-Task 2.2 adds GitHub identity sign-in, database-backed sessions, and one private
-workspace per user. Task 2.3 associates a separately authorized GitHub App
-installation with that workspace. Task 2.4 lists and selects repositories only
-when both the installation and the signed-in user currently have sufficient
-access. Repository operations remain future work.
+Task 2 adds GitHub identity, workspace ownership, verified GitHub App repository
+selection, frozen execution-profile detection, and safe baseline execution.
+Task 3.1 turns that baseline into the first durable Repair Run stage.
+
+## Durable Repair Runs
+
+An authenticated user can start a Repair Run from the selected repository page.
+The server binds the run permanently to the workspace, stable GitHub repository
+ID, verified installation, exact commit SHA, and frozen execution-profile
+identity. PostgreSQL records every allowed transition and links the run to its
+existing sanitized baseline evidence. Reloading the page reads that state back
+from PostgreSQL.
+
+Task 3.1 executes synchronously through the existing Task 2.6 sandbox path. An
+abort observed by that path is persisted as cancellation and retains its cleanup
+guarantees. An unexpected web-process loss can leave a run in `created` or
+`baseline_running`; automatic recovery and stale-run sweeping are intentionally
+deferred until durable background execution is introduced. No AI investigation,
+source modification, candidate, verification, or pull-request behavior exists
+in this task.
 
 ## Web/API shell
 

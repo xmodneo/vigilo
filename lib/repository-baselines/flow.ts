@@ -12,7 +12,7 @@ import { runFrozenRepositoryBaseline } from './runner.ts';
 import type { BaselineEvidence, GitHubBaselineGateway } from './types.ts';
 
 export class RepositoryBaselineError extends Error {
-  constructor(public readonly code: 'installation_unavailable' | 'repository_access_changed' | 'source_unavailable' | 'persistence_failed') {
+  constructor(public readonly code: 'authority_changed' | 'installation_unavailable' | 'repository_access_changed' | 'source_unavailable' | 'persistence_failed') {
     super(code);
     this.name = 'RepositoryBaselineError';
   }
@@ -78,9 +78,22 @@ export async function executeSelectedRepositoryBaseline(
   context: AuthenticatedWorkspace,
   gateway: GitHubBaselineGateway,
   configuration: GitHubAppConfiguration,
-  options: { cancellation?: AbortSignal; clock?: () => Date; randomId?: () => string; runner?: typeof runFrozenRepositoryBaseline } = {},
+  options: {
+    cancellation?: AbortSignal;
+    clock?: () => Date;
+    expectedAuthority?: { workspaceId: string; githubRepositoryId: number; installationId: number; profileIdentity: string; baseCommitSha: string };
+    randomId?: () => string;
+    runner?: typeof runFrozenRepositoryBaseline;
+  } = {},
 ) {
   const authority = await resolveBaselineAuthority(database, context);
+  if (options.expectedAuthority && (
+    authority.profile.workspaceId !== options.expectedAuthority.workspaceId ||
+    authority.profile.githubRepositoryId !== options.expectedAuthority.githubRepositoryId ||
+    authority.profile.installationId !== options.expectedAuthority.installationId ||
+    authority.profile.profileIdentity !== options.expectedAuthority.profileIdentity ||
+    authority.profile.baseCommitSha !== options.expectedAuthority.baseCommitSha
+  )) throw new RepositoryBaselineError('authority_changed');
   let token: string | undefined;
   let archive: Buffer | undefined;
   try {

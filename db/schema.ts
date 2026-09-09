@@ -306,8 +306,8 @@ export const repositoryBaseline = pgTable(
   {
     id: text('id').primaryKey(),
     workspaceId: text('workspace_id').notNull().references(() => workspace.id, { onDelete: 'cascade' }),
-    githubRepositoryId: bigint('github_repository_id', { mode: 'number' }).notNull().references(() => repository.githubRepositoryId, { onDelete: 'cascade' }),
-    installationId: bigint('installation_id', { mode: 'number' }).notNull().references(() => githubInstallation.installationId, { onDelete: 'cascade' }),
+    githubRepositoryId: bigint('github_repository_id', { mode: 'number' }).notNull(),
+    installationId: bigint('installation_id', { mode: 'number' }).notNull(),
     evidenceVersion: integer('evidence_version').notNull(),
     profileIdentity: text('profile_identity').notNull(),
     baseCommitSha: text('base_commit_sha').notNull(),
@@ -357,6 +357,78 @@ export const repositoryBaseline = pgTable(
   ],
 );
 
+export const repairRun = pgTable(
+  'repair_run',
+  {
+    id: text('id').primaryKey(),
+    workspaceId: text('workspace_id').notNull().references(() => workspace.id, { onDelete: 'cascade' }),
+    githubRepositoryId: bigint('github_repository_id', { mode: 'number' }).notNull(),
+    installationId: bigint('installation_id', { mode: 'number' }).notNull(),
+    profileIdentity: text('profile_identity').notNull(),
+    baseCommitSha: text('base_commit_sha').notNull(),
+    idempotencyKey: text('idempotency_key').notNull(),
+    state: text('state').notNull(),
+    baselineId: text('baseline_id').unique().references(() => repositoryBaseline.id, { onDelete: 'restrict' }),
+    baselineOutcome: text('baseline_outcome'),
+    failureClassification: text('failure_classification'),
+    failureCode: text('failure_code'),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    baselineStartedAt: timestamp('baseline_started_at', { withTimezone: true }),
+    completedAt: timestamp('completed_at', { withTimezone: true }),
+    stateChangedAt: timestamp('state_changed_at', { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    uniqueIndex('repair_run_workspace_idempotency_unique').on(table.workspaceId, table.idempotencyKey),
+    uniqueIndex('repair_run_active_identity_unique')
+      .on(table.workspaceId, table.githubRepositoryId, table.installationId, table.profileIdentity, table.baseCommitSha)
+      .where(sql`${table.state} in ('created','baseline_running')`),
+    index('repair_run_workspace_created_idx').on(table.workspaceId, table.createdAt),
+    index('repair_run_repository_idx').on(table.githubRepositoryId),
+    check('repair_run_commit_check', sql`${table.baseCommitSha} ~ '^[0-9a-f]{40}$'`),
+    check('repair_run_profile_identity_check', sql`${table.profileIdentity} ~ '^[0-9a-f]{64}$'`),
+    check('repair_run_idempotency_check', sql`${table.idempotencyKey} ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'`),
+    check('repair_run_state_check', sql`${table.state} in ('created','baseline_running','ready_for_investigation','baseline_failed','infrastructure_failed','cancelled')`),
+    check('repair_run_baseline_outcome_check', sql`${table.baselineOutcome} is null or ${table.baselineOutcome} in ('baseline_passed','baseline_failed','installation_failed','typecheck_failed','build_failed','test_failed','timed_out','cancelled','infrastructure_failed','cleanup_failed')`),
+    check('repair_run_failure_facts_check', sql`(${table.failureClassification} is null or ${table.failureClassification} in ('customer_baseline_failure','infrastructure_failure','cancelled')) and (${table.failureCode} is null or ${table.failureCode} ~ '^[a-z_]{1,64}$')`),
+    check('repair_run_state_facts_check', sql`(
+      ${table.state} = 'created' and ${table.baselineStartedAt} is null and ${table.completedAt} is null and ${table.baselineId} is null and ${table.baselineOutcome} is null
+    ) or (
+      ${table.state} = 'baseline_running' and ${table.baselineStartedAt} is not null and ${table.completedAt} is null and ${table.baselineId} is null and ${table.baselineOutcome} is null
+    ) or (
+      ${table.state} = 'ready_for_investigation' and ${table.baselineStartedAt} is not null and ${table.completedAt} is not null and ${table.baselineId} is not null and ${table.baselineOutcome} = 'baseline_passed' and ${table.failureClassification} is null and ${table.failureCode} is null
+    ) or (
+      ${table.state} = 'baseline_failed' and ${table.baselineStartedAt} is not null and ${table.completedAt} is not null and ${table.baselineId} is not null and ${table.baselineOutcome} in ('baseline_failed','typecheck_failed','build_failed','test_failed') and ${table.failureClassification} = 'customer_baseline_failure'
+    ) or (
+      ${table.state} = 'infrastructure_failed' and ${table.baselineStartedAt} is not null and ${table.completedAt} is not null and ${table.failureClassification} = 'infrastructure_failure' and ${table.failureCode} is not null
+    ) or (
+      ${table.state} = 'cancelled' and ${table.completedAt} is not null and ${table.failureClassification} = 'cancelled'
+    )`),
+  ],
+);
+
+export const repairRunEvent = pgTable(
+  'repair_run_event',
+  {
+    id: text('id').primaryKey(),
+    repairRunId: text('repair_run_id').notNull().references(() => repairRun.id, { onDelete: 'cascade' }),
+    fromState: text('from_state'),
+    toState: text('to_state').notNull(),
+    baselineOutcome: text('baseline_outcome'),
+    failureClassification: text('failure_classification'),
+    failureCode: text('failure_code'),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    index('repair_run_event_run_created_idx').on(table.repairRunId, table.createdAt),
+    check('repair_run_event_from_state_check', sql`${table.fromState} is null or ${table.fromState} in ('created','baseline_running','ready_for_investigation','baseline_failed','infrastructure_failed','cancelled')`),
+    check('repair_run_event_to_state_check', sql`${table.toState} in ('created','baseline_running','ready_for_investigation','baseline_failed','infrastructure_failed','cancelled')`),
+    check('repair_run_event_transition_check', sql`(${table.fromState} is null and ${table.toState} = 'created') or (${table.fromState} = 'created' and ${table.toState} in ('baseline_running','cancelled')) or (${table.fromState} = 'baseline_running' and ${table.toState} in ('ready_for_investigation','baseline_failed','infrastructure_failed','cancelled'))`),
+    check('repair_run_event_outcome_check', sql`${table.baselineOutcome} is null or ${table.baselineOutcome} in ('baseline_passed','baseline_failed','installation_failed','typecheck_failed','build_failed','test_failed','timed_out','cancelled','infrastructure_failed','cleanup_failed')`),
+    check('repair_run_event_failure_facts_check', sql`(${table.failureClassification} is null or ${table.failureClassification} in ('customer_baseline_failure','infrastructure_failure','cancelled')) and (${table.failureCode} is null or ${table.failureCode} ~ '^[a-z_]{1,64}$')`),
+  ],
+);
+
 export const authSchema = {
   account,
   executionProfile,
@@ -365,6 +437,8 @@ export const authSchema = {
   githubRepositoryAccessAttempt,
   repository,
   repositoryBaseline,
+  repairRun,
+  repairRunEvent,
   session,
   user,
   verification,

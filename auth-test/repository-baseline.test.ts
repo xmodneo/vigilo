@@ -199,3 +199,20 @@ test('database constraints reject malformed baseline evidence', async (t) => {
     startedAt: NOW, testStatus: 'completed', testTimedOut: false, workspaceId: auth.workspace.id,
   }));
 });
+
+test('baseline execution rejects authority drift before acquiring repository source', async (t) => {
+  const ctx = await createTestContext(); t.after(() => ctx.client.close());
+  const auth = await context(ctx); await seed(ctx, auth);
+  const gateway = new Gateway();
+  await assert.rejects(executeSelectedRepositoryBaseline(ctx.database, auth, gateway, CONFIG, {
+    expectedAuthority: {
+      workspaceId: auth.workspace.id,
+      githubRepositoryId: REPO.id,
+      installationId: 9001,
+      profileIdentity: readyValues(auth.workspace.id).profileIdentity,
+      baseCommitSha: 'f'.repeat(40),
+    },
+  }), (error: unknown) => error instanceof RepositoryBaselineError && error.code === 'authority_changed');
+  assert.deepEqual(gateway.calls, []);
+  assert.equal((await ctx.database.select().from(repositoryBaseline)).length, 0);
+});

@@ -1,3 +1,5 @@
+import { randomUUID } from 'node:crypto';
+
 import { headers } from 'next/headers';
 import { redirect } from 'next/navigation';
 
@@ -10,6 +12,8 @@ import { getExecutionProfileForContext } from '../../../lib/execution-profiles/s
 import { getRepositoryOverviewForContext } from '../../../lib/github-repositories/server';
 import { publicBaseline } from '../../../lib/repository-baselines/handlers';
 import { getRepositoryBaselineForContext } from '../../../lib/repository-baselines/server';
+import { publicRepairRun } from '../../../lib/repair-runs/handlers';
+import { getLatestRepairRunForContext } from '../../../lib/repair-runs/server';
 import { GitHubConnectionView } from './github-connection-view';
 
 export default async function GitHubConnectionPage() {
@@ -25,6 +29,7 @@ export default async function GitHubConnectionPage() {
     let selectedRepository = undefined;
     let executionProfile = undefined;
     let baseline = undefined;
+    let repairRun = undefined;
     if (installation) {
       try {
         const overview = await getRepositoryOverviewForContext(context);
@@ -43,6 +48,9 @@ export default async function GitHubConnectionPage() {
         baseline = overview.selected
           ? publicBaseline(await getRepositoryBaselineForContext(context))
           : null;
+        repairRun = overview.selected
+          ? publicRepairRun(await getLatestRepairRunForContext(context, overview.selected.githubRepositoryId))
+          : null;
       } catch {
         repositoryError = 'unavailable';
       }
@@ -54,6 +62,8 @@ export default async function GitHubConnectionPage() {
         {...(baseline !== undefined ? { baseline } : {})}
         {...(executionProfile !== undefined ? { executionProfile } : {})}
         {...(repositories ? { repositories } : {})}
+        repairRequestId={randomUUID()}
+        {...(repairRun !== undefined ? { repairRun } : {})}
         {...(repositoryError ? { repositoryError } : {})}
         {...(selectedRepository !== undefined ? { selectedRepository } : {})}
         workspaceId={context.workspace.id}
