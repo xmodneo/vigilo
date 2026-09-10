@@ -64,6 +64,13 @@
       "when": 1789466400000,
       "tag": "0008_investigation-context",
       "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "7",
+      "when": 1789552800000,
+      "tag": "0009_repair-candidate",
+      "breakpoints": true
     }
   ]
 }

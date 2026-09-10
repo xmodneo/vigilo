@@ -65,6 +65,23 @@ outcomes; it does not store file contents, search results, or GitHub tokens.
 No AI/model call, source modification, candidate, verification, or pull-request
 behavior exists in Task 3.3.
 
+Task 3.4 adds durable, immutable Repair Candidates without executing proposed
+code. An internal proposer may request at most 16 text-file additions,
+modifications, or deletions. Vigilo derives repository authority from the ready
+Investigation, validates every base path and Git blob against the exact frozen
+commit with a repository-scoped read-only GitHub token, revokes that token, and
+then stores only the changed resulting text and bounded identity metadata.
+
+Candidate files are limited to 128 KiB each and 512 KiB in total. Environment
+files, credentials, links, submodules, executable files, generated paths,
+package manifests, and package-manager lockfiles are rejected. Candidate
+identity is a deterministic SHA-256 over the immutable repository revision,
+execution profile, and canonical path-sorted file operations. A persisted
+artifact self-check recomputes content and candidate identities before later
+consumers may trust it. The web UI shows read-only candidate metadata; there is
+no browser source-edit endpoint. Freezing does not run npm, tests, builds,
+sandboxes, or models and does not claim that a candidate repairs the problem.
+
 ## Web/API shell
 
 Install the pinned dependencies and start local development:

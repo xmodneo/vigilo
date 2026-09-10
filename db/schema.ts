@@ -602,6 +602,91 @@ export const investigationContextEvent = pgTable(
   ],
 );
 
+export const repairCandidate = pgTable(
+  'repair_candidate',
+  {
+    id: text('id').primaryKey(),
+    investigationId: text('investigation_id').notNull().references(() => investigation.id, { onDelete: 'restrict' }),
+    repairRunId: text('repair_run_id').notNull().references(() => repairRun.id, { onDelete: 'restrict' }),
+    workspaceId: text('workspace_id').notNull().references(() => workspace.id, { onDelete: 'restrict' }),
+    githubRepositoryId: bigint('github_repository_id', { mode: 'number' }).notNull(),
+    installationId: bigint('installation_id', { mode: 'number' }).notNull(),
+    baseCommitSha: text('base_commit_sha').notNull(),
+    profileIdentity: text('profile_identity').notNull(),
+    formatVersion: integer('format_version').notNull(),
+    ordinal: integer('ordinal').notNull(),
+    proposalKey: text('proposal_key').notNull(),
+    proposalIdentity: text('proposal_identity').notNull(),
+    state: text('state').notNull(),
+    candidateIdentity: text('candidate_identity'),
+    changedFileCount: integer('changed_file_count').notNull(),
+    totalResultBytes: integer('total_result_bytes').notNull(),
+    rejectionCode: text('rejection_code'),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    freezingStartedAt: timestamp('freezing_started_at', { withTimezone: true }).notNull(),
+    completedAt: timestamp('completed_at', { withTimezone: true }),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    uniqueIndex('repair_candidate_investigation_ordinal_unique').on(table.investigationId, table.ordinal),
+    uniqueIndex('repair_candidate_investigation_proposal_unique').on(table.investigationId, table.proposalKey),
+    uniqueIndex('repair_candidate_active_unique').on(table.investigationId).where(sql`${table.state} = 'freezing'`),
+    index('repair_candidate_workspace_created_idx').on(table.workspaceId, table.createdAt),
+    check('repair_candidate_id_check', sql`${table.id} ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'`),
+    check('repair_candidate_commit_check', sql`${table.baseCommitSha} ~ '^[0-9a-f]{40}$'`),
+    check('repair_candidate_profile_check', sql`${table.profileIdentity} ~ '^[0-9a-f]{64}$'`),
+    check('repair_candidate_proposal_check', sql`${table.proposalKey} ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$' and ${table.proposalIdentity} ~ '^[0-9a-f]{64}$'`),
+    check('repair_candidate_version_check', sql`${table.formatVersion} = 1`),
+    check('repair_candidate_state_check', sql`${table.state} in ('freezing','frozen','rejected')`),
+    check('repair_candidate_counts_check', sql`${table.ordinal} >= 1 and ${table.changedFileCount} between 1 and 16 and ${table.totalResultBytes} between 0 and 524288`),
+    check('repair_candidate_rejection_check', sql`${table.rejectionCode} is null or ${table.rejectionCode} ~ '^[a-z_]{1,64}$'`),
+    check('repair_candidate_state_facts_check', sql`(${table.state} = 'freezing' and ${table.candidateIdentity} is null and ${table.rejectionCode} is null and ${table.completedAt} is null) or (${table.state} = 'frozen' and ${table.candidateIdentity} ~ '^[0-9a-f]{64}$' and ${table.rejectionCode} is null and ${table.completedAt} is not null) or (${table.state} = 'rejected' and ${table.candidateIdentity} is null and ${table.rejectionCode} is not null and ${table.completedAt} is not null)`),
+  ],
+);
+
+export const repairCandidateFile = pgTable(
+  'repair_candidate_file',
+  {
+    candidateId: text('candidate_id').notNull().references(() => repairCandidate.id, { onDelete: 'restrict' }),
+    path: text('path').notNull(),
+    operation: text('operation').notNull(),
+    baseBlobSha: text('base_blob_sha'),
+    baseContentSha256: text('base_content_sha256'),
+    resultContentSha256: text('result_content_sha256'),
+    resultByteLength: integer('result_byte_length').notNull(),
+    resultingContent: text('resulting_content'),
+  },
+  (table) => [
+    primaryKey({ columns: [table.candidateId, table.path] }),
+    check('repair_candidate_file_path_check', sql`char_length(${table.path}) between 1 and 240 and position(chr(92) in ${table.path}) = 0 and ${table.path} !~ '(^/|(^|/)[.][.](/|$)|[[:cntrl:]])'`),
+    check('repair_candidate_file_operation_check', sql`${table.operation} in ('add','modify','delete')`),
+    check('repair_candidate_file_facts_check', sql`(${table.operation} = 'add' and ${table.baseBlobSha} is null and ${table.baseContentSha256} is null and ${table.resultContentSha256} ~ '^[0-9a-f]{64}$' and ${table.resultByteLength} between 1 and 131072 and ${table.resultingContent} is not null and octet_length(${table.resultingContent}) = ${table.resultByteLength}) or (${table.operation} = 'modify' and ${table.baseBlobSha} ~ '^[0-9a-f]{40}$' and ${table.baseContentSha256} ~ '^[0-9a-f]{64}$' and ${table.resultContentSha256} ~ '^[0-9a-f]{64}$' and ${table.resultByteLength} between 1 and 131072 and ${table.resultingContent} is not null and octet_length(${table.resultingContent}) = ${table.resultByteLength}) or (${table.operation} = 'delete' and ${table.baseBlobSha} ~ '^[0-9a-f]{40}$' and ${table.baseContentSha256} ~ '^[0-9a-f]{64}$' and ${table.resultContentSha256} is null and ${table.resultByteLength} = 0 and ${table.resultingContent} is null)`),
+  ],
+);
+
+export const repairCandidateEvent = pgTable(
+  'repair_candidate_event',
+  {
+    id: text('id').primaryKey(),
+    candidateId: text('candidate_id').notNull().references(() => repairCandidate.id, { onDelete: 'restrict' }),
+    workspaceId: text('workspace_id').notNull().references(() => workspace.id, { onDelete: 'restrict' }),
+    eventType: text('event_type').notNull(),
+    candidateOrdinal: integer('candidate_ordinal').notNull(),
+    changedFileCount: integer('changed_file_count').notNull(),
+    totalResultBytes: integer('total_result_bytes').notNull(),
+    candidateIdentity: text('candidate_identity'),
+    rejectionCode: text('rejection_code'),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    index('repair_candidate_event_candidate_created_idx').on(table.candidateId, table.createdAt),
+    check('repair_candidate_event_id_check', sql`${table.id} ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'`),
+    check('repair_candidate_event_type_check', sql`${table.eventType} in ('created','freeze_started','frozen','rejected')`),
+    check('repair_candidate_event_counts_check', sql`${table.candidateOrdinal} >= 1 and ${table.changedFileCount} between 1 and 16 and ${table.totalResultBytes} between 0 and 524288`),
+    check('repair_candidate_event_facts_check', sql`(${table.eventType} in ('created','freeze_started') and ${table.candidateIdentity} is null and ${table.rejectionCode} is null) or (${table.eventType} = 'frozen' and ${table.candidateIdentity} ~ '^[0-9a-f]{64}$' and ${table.rejectionCode} is null) or (${table.eventType} = 'rejected' and ${table.candidateIdentity} is null and ${table.rejectionCode} ~ '^[a-z_]{1,64}$')`),
+  ],
+);
+
 export const authSchema = {
   account,
   executionProfile,
@@ -617,6 +702,9 @@ export const authSchema = {
   repairRunAttempt,
   repairRunEvent,
   repairIntent,
+  repairCandidate,
+  repairCandidateFile,
+  repairCandidateEvent,
   session,
   user,
   verification,

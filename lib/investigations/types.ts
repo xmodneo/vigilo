@@ -16,7 +16,7 @@ export interface InvestigationSourceGateway {
   }>;
   getCommitTree(input: { accessToken: string; owner: string; repository: string; commitSha: string }): Promise<{ commitSha: string; treeSha: string }>;
   getTree(input: { accessToken: string; owner: string; repository: string; treeSha: string }): Promise<{ entries: GitTreeEntry[]; truncated: boolean }>;
-  getBlob(input: { accessToken: string; owner: string; repository: string; blobSha: string }): Promise<{ bytes: Buffer; sha: string }>;
+  getBlob(input: { accessToken: string; owner: string; repository: string; blobSha: string; maxBytes?: number }): Promise<{ bytes: Buffer; sha: string }>;
   getInstallation(installationId: number): Promise<{ appId: number; appSlug: string; id: number; suspendedAt: string | null }>;
   revokeInstallationAccessToken(accessToken: string): Promise<void>;
 }

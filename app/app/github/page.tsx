@@ -16,6 +16,7 @@ import { publicRepairRun } from '../../../lib/repair-runs/handlers';
 import { getLatestRepairRunForContext } from '../../../lib/repair-runs/server';
 import { publicInvestigation } from '../../../lib/investigations/handlers';
 import { getInvestigationForContext } from '../../../lib/investigations/server';
+import { getLatestRepairCandidateForContext, publicRepairCandidate } from '../../../lib/repair-candidates/server';
 import { GitHubConnectionView } from './github-connection-view';
 
 export default async function GitHubConnectionPage() {
@@ -33,6 +34,7 @@ export default async function GitHubConnectionPage() {
     let baseline = undefined;
     let repairRun = undefined;
     let investigation = undefined;
+    let repairCandidate = undefined;
     if (installation) {
       try {
         const overview = await getRepositoryOverviewForContext(context);
@@ -57,6 +59,9 @@ export default async function GitHubConnectionPage() {
         investigation = repairRun
           ? publicInvestigation(await getInvestigationForContext(context, repairRun.id))
           : null;
+        repairCandidate = investigation
+          ? publicRepairCandidate(await getLatestRepairCandidateForContext(context, investigation.id))
+          : null;
       } catch {
         repositoryError = 'unavailable';
       }
@@ -67,6 +72,7 @@ export default async function GitHubConnectionPage() {
         installation={installation}
         investigationRequestId={randomUUID()}
         {...(investigation !== undefined ? { investigation } : {})}
+        {...(repairCandidate !== undefined ? { repairCandidate } : {})}
         {...(baseline !== undefined ? { baseline } : {})}
         {...(executionProfile !== undefined ? { executionProfile } : {})}
         {...(repositories ? { repositories } : {})}

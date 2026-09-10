@@ -1,5 +1,6 @@
 import { RepairRunStatus, type RepairRunSummary } from './repair-run-status.tsx';
 import { InvestigationStatus, type InvestigationSummary } from './investigation-status.tsx';
+import { RepairCandidateStatus, type RepairCandidateSummary } from './repair-candidate-status.tsx';
 
 interface InstallationSummary {
   accountLogin: string;
@@ -73,6 +74,7 @@ export interface GitHubConnectionViewProps {
   installation: InstallationSummary | null;
   investigation?: InvestigationSummary | null;
   investigationRequestId?: string;
+  repairCandidate?: RepairCandidateSummary | null;
   repositories?: RepositorySummary[];
   repairRequestId: string;
   repairRun?: RepairRunSummary | null;
@@ -87,6 +89,7 @@ export function GitHubConnectionView({
   installation,
   investigation = null,
   investigationRequestId,
+  repairCandidate = null,
   repositories,
   repairRequestId,
   repairRun = null,
@@ -187,6 +190,7 @@ export function GitHubConnectionView({
                       </form>
                     )}
                     {investigation && <InvestigationStatus initialInvestigation={investigation} />}
+                    {investigation?.state === 'ready' && <RepairCandidateStatus candidate={repairCandidate} />}
                     {baseline && (
                       <section className="repository-panel" aria-labelledby="baseline-title">
                         <p className="eyebrow">Execution evidence</p>

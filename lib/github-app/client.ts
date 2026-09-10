@@ -302,11 +302,11 @@ function parseGitTree(value: unknown): { entries: GitTreeEntry[]; truncated: boo
   return { entries, truncated: record.truncated };
 }
 
-function parseGitBlob(value: unknown): { bytes: Buffer; sha: string } {
+function parseGitBlob(value: unknown, maxBytes: number): { bytes: Buffer; sha: string } {
   const record = objectValue(value);
   if (record.encoding !== 'base64' || typeof record.content !== 'string') throw new GitHubProviderError();
   const size = record.size;
-  if (typeof size !== 'number' || !Number.isSafeInteger(size) || size < 0 || size > 65_536) throw new GitHubProviderError();
+  if (typeof size !== 'number' || !Number.isSafeInteger(size) || size < 0 || size > maxBytes) throw new GitHubProviderError();
   const encoded = record.content.replace(/\s/g, '');
   if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(encoded)) throw new GitHubProviderError();
   const bytes = Buffer.from(encoded, 'base64');
@@ -537,11 +537,13 @@ export class GitHubApiClient implements GitHubInstallationGateway, GitHubReposit
     return parseGitTree(result);
   }
 
-  async getBlob(input: { accessToken: string; owner: string; repository: string; blobSha: string }): Promise<{ bytes: Buffer; sha: string }> {
+  async getBlob(input: { accessToken: string; owner: string; repository: string; blobSha: string; maxBytes?: number }): Promise<{ bytes: Buffer; sha: string }> {
+    const maxBytes = input.maxBytes ?? 65_536;
+    if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > 131_072) throw new GitHubProviderError();
     const result = parseGitBlob(await this.apiJson(
       `/repos/${encodeURIComponent(input.owner)}/${encodeURIComponent(input.repository)}/git/blobs/${encodeURIComponent(input.blobSha)}`,
       { headers: { Authorization: `Bearer ${input.accessToken}` } },
-    ));
+    ), maxBytes);
     if (result.sha !== input.blobSha) throw new GitHubProviderError();
     return result;
   }
