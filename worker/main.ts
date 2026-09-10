@@ -7,6 +7,7 @@ import { GitHubApiClient } from '../lib/github-app/client.ts';
 import { readGitHubAppEnvironment, readGitHubAppPrivateKey } from '../lib/github-app/environment.ts';
 import {
   createRepairBoss,
+  CANDIDATE_VERIFICATION_QUEUE,
   INVESTIGATION_CONTEXT_QUEUE,
   REPAIR_BASELINE_QUEUE,
   REPAIR_WORK_OPTIONS,
@@ -14,8 +15,10 @@ import {
 import { createConsoleWorkerLogger, processRepairJob } from '../lib/repair-runs/worker.ts';
 import { repairRun } from '../db/schema.ts';
 import { investigation } from '../db/schema.ts';
+import { candidateVerification } from '../db/schema.ts';
 import { inArray } from 'drizzle-orm';
 import { processInvestigationJob } from '../lib/investigations/worker.ts';
+import { processCandidateVerificationJob } from '../lib/candidate-verifications/worker.ts';
 
 async function main(): Promise<void> {
   const environment = readServerEnvironment();
@@ -42,6 +45,11 @@ async function main(): Promise<void> {
       try { await boss.retry(INVESTIGATION_CONTEXT_QUEUE, value.id); }
       catch { /* A non-failed canonical job remains owned by pg-boss. */ }
     }
+    const activeVerifications = await database.select({ id: candidateVerification.id }).from(candidateVerification).where(inArray(candidateVerification.state, ['created', 'queued', 'verifying']));
+    for (const value of activeVerifications) {
+      try { await boss.retry(CANDIDATE_VERIFICATION_QUEUE, value.id); }
+      catch { /* A non-failed canonical job remains owned by pg-boss. */ }
+    }
 
     const workOptions = { ...REPAIR_WORK_OPTIONS, perJobResults: true as const };
     const repairWorkerId = await boss.work<unknown, { code?: string }, typeof workOptions>(REPAIR_BASELINE_QUEUE, workOptions, async (jobs) => {
@@ -64,6 +72,16 @@ async function main(): Promise<void> {
       }
     });
     workerIds.push({ id: investigationWorkerId, queue: INVESTIGATION_CONTEXT_QUEUE });
+    const verificationWorkerId = await boss.work<unknown, { code?: string }, typeof workOptions>(CANDIDATE_VERIFICATION_QUEUE, workOptions, async (jobs) => {
+      const job = jobs[0];
+      if (!job) return [];
+      try {
+        return [await processCandidateVerificationJob(job, { configuration, database, gateway, logger, shutdownSignal: shutdown.signal })];
+      } catch {
+        return [{ id: job.id, status: 'failed' as const, output: { code: 'candidate_verification_worker_failed' } }];
+      }
+    });
+    workerIds.push({ id: verificationWorkerId, queue: CANDIDATE_VERIFICATION_QUEUE });
 
     await new Promise<void>((resolve) => {
       const stop = () => resolve();

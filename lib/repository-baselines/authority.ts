@@ -17,7 +17,7 @@ export class BaselineAuthorityError extends Error {
   }
 }
 
-function readyProfile(value: typeof executionProfile.$inferSelect): FrozenBaselineProfile {
+export function frozenBaselineProfile(value: typeof executionProfile.$inferSelect): FrozenBaselineProfile {
   if (
     value.status !== 'ready' || value.profileVersion !== 2 ||
     !value.profileIdentity || !value.packageJsonBlobSha || !value.packageJsonContentSha256 ||
@@ -89,7 +89,7 @@ export async function resolveBaselineAuthority(
     ))
     .limit(1);
   if (!value) throw new BaselineAuthorityError('repository_not_selected');
-  const profile = readyProfile(value.profile);
+  const profile = frozenBaselineProfile(value.profile);
   if (
     profile.githubRepositoryId !== value.repository.githubRepositoryId ||
     profile.installationId !== value.repository.installationId ||

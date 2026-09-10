@@ -42,9 +42,10 @@ type Recovery = typeof recoverSandbox;
 
 export interface WorkerLogger {
   write(event: {
-    event: 'job_accepted' | 'job_rejected' | 'run_claimed' | 'attempt_started' | 'baseline_classified' | 'retry_classified' | 'run_finalized' | 'cleanup_observed' | 'investigation_claimed' | 'investigation_ready' | 'investigation_retry';
+    event: 'job_accepted' | 'job_rejected' | 'run_claimed' | 'attempt_started' | 'baseline_classified' | 'retry_classified' | 'run_finalized' | 'cleanup_observed' | 'investigation_claimed' | 'investigation_ready' | 'investigation_retry' | 'verification_finalized' | 'verification_retry';
     runId?: string;
     investigationId?: string;
+    verificationId?: string;
     attemptId?: string;
     outcome?: string;
     code?: string;

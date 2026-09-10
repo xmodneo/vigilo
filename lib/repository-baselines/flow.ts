@@ -23,6 +23,29 @@ function sameRepository(first: { id: number; ownerId: number; ownerLogin: string
   return first.id === second.id && first.ownerId === second.ownerId && first.ownerLogin === second.ownerLogin && first.name === second.name;
 }
 
+export async function acquireExactRepositoryArchive(
+  gateway: GitHubBaselineGateway,
+  configuration: GitHubAppConfiguration,
+  identity: { installationId: number; githubRepositoryId: number; baseCommitSha: string },
+): Promise<Buffer> {
+  let token: string | undefined;
+  let archive: Buffer | undefined;
+  try {
+    const installation = await gateway.getInstallation(identity.installationId);
+    if (!validExecutionInstallation(installation, identity.installationId, configuration)) throw new RepositoryBaselineError('installation_unavailable');
+    const scoped = await gateway.createInstallationAccessToken({ installationId: identity.installationId, repositoryId: identity.githubRepositoryId });
+    token = scoped.accessToken;
+    if (scoped.repository.id !== identity.githubRepositoryId) throw new RepositoryBaselineError('repository_access_changed');
+    const current = await gateway.getRepositoryMetadata(token, scoped.repository.ownerLogin, scoped.repository.name);
+    if (!sameRepository(scoped.repository, current)) throw new RepositoryBaselineError('repository_access_changed');
+    archive = await gateway.downloadRepositoryArchive({ accessToken: token, owner: current.ownerLogin, ref: identity.baseCommitSha, repository: current.name });
+  } finally {
+    if (token) await gateway.revokeInstallationAccessToken(token);
+  }
+  if (!archive || archive.byteLength === 0) throw new RepositoryBaselineError('source_unavailable');
+  return archive;
+}
+
 function commandValues(command: BaselineEvidence['install']) {
   return { exitCode: command.exitCode, status: command.status, timedOut: command.timedOut };
 }
@@ -98,31 +121,7 @@ export async function executeSelectedRepositoryBaseline(
     authority.profile.profileIdentity !== options.expectedAuthority.profileIdentity ||
     authority.profile.baseCommitSha !== options.expectedAuthority.baseCommitSha
   )) throw new RepositoryBaselineError('authority_changed');
-  let token: string | undefined;
-  let archive: Buffer | undefined;
-  try {
-    const installation = await gateway.getInstallation(authority.profile.installationId);
-    if (!validExecutionInstallation(installation, authority.profile.installationId, configuration)) {
-      throw new RepositoryBaselineError('installation_unavailable');
-    }
-    const scoped = await gateway.createInstallationAccessToken({
-      installationId: authority.profile.installationId,
-      repositoryId: authority.profile.githubRepositoryId,
-    });
-    token = scoped.accessToken;
-    if (scoped.repository.id !== authority.profile.githubRepositoryId) throw new RepositoryBaselineError('repository_access_changed');
-    const current = await gateway.getRepositoryMetadata(token, scoped.repository.ownerLogin, scoped.repository.name);
-    if (!sameRepository(scoped.repository, current)) throw new RepositoryBaselineError('repository_access_changed');
-    archive = await gateway.downloadRepositoryArchive({
-      accessToken: token,
-      owner: current.ownerLogin,
-      ref: authority.profile.baseCommitSha,
-      repository: current.name,
-    });
-  } finally {
-    if (token) await gateway.revokeInstallationAccessToken(token);
-  }
-  if (!archive || archive.byteLength === 0) throw new RepositoryBaselineError('source_unavailable');
+  const archive = await acquireExactRepositoryArchive(gateway, configuration, authority.profile);
   const clock = options.clock ?? (() => new Date());
   const report = await (options.runner ?? runFrozenRepositoryBaseline)({
     ...authority,

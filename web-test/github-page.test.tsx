@@ -265,5 +265,29 @@ test('eligible Repair Run renders its objective and bounded investigation status
     createdAt: repairRun.createdAt, completedAt: repairRun.completedAt,
   }} />);
   assert.match(frozen, /Attempt.*1/); assert.match(frozen, /Status.*frozen/); assert.match(frozen, /Files changed.*1/); assert.match(frozen, /dddddddddddd/);
-  assert.doesNotMatch(frozen, /api\/repair-candidates|Approve candidate|Verify candidate|Publish candidate|Edit candidate/);
+  assert.match(frozen, /action="\/api\/candidate-verifications"/); assert.match(frozen, /Verify candidate/);
+  assert.doesNotMatch(frozen, /api\/repair-candidates|Approve candidate|Publish candidate|Edit candidate/);
+
+  const verified = renderToStaticMarkup(<GitHubConnectionView {...common} investigation={{
+    id: '33333333-3333-4333-8333-333333333333', repairRunId: repairRun.id, repairObjective: repairRun.repairObjective,
+    state: 'ready', revision: repairRun.revision, profileIdentity: repairRun.profileIdentity, baselineAvailable: true,
+    treeSha: 'c'.repeat(40), indexedPathCount: 42, excludedPathCount: 3, treeTruncated: false,
+    contextBudget: { version: 1, maxTreeEntries: 2000, maxFileBytes: 65536, maxCumulativeBytes: 1048576, maxOperations: 50 },
+    failureCode: null, createdAt: repairRun.createdAt, completedAt: repairRun.completedAt, updatedAt: repairRun.completedAt!,
+  }} repairCandidate={{
+    id: '44444444-4444-4444-8444-444444444444', investigationId: '33333333-3333-4333-8333-333333333333', ordinal: 1,
+    state: 'frozen', candidateIdentity: 'd'.repeat(64), changedFileCount: 1, totalResultBytes: 48, rejectionCode: null,
+    createdAt: repairRun.createdAt, completedAt: repairRun.completedAt,
+  }} candidateVerification={{
+    id: '55555555-5555-4555-8555-555555555555', candidateId: '44444444-4444-4444-8444-444444444444', state: 'completed',
+    revision: repairRun.revision, candidateIdentity: 'd'.repeat(64), artifactIntegrity: 'valid', regressionChecks: 'checks_failed',
+    baselineComparison: 'regression_detected', repairObjectiveEvidence: 'not_measured', evidenceId: '66666666-6666-4666-8666-666666666666',
+    executionOutcome: 'test_failed', failingPhase: 'test', networkIsolation: 'confirmed', cleanup: 'confirmed', failureCode: null,
+    createdAt: repairRun.createdAt, completedAt: repairRun.completedAt,
+  }} />);
+  assert.match(verified, /Candidate verification/); assert.match(verified, /Artifact integrity.*Passed/); assert.match(verified, /Regression checks.*Failed/);
+  assert.match(verified, /Baseline comparison.*regression detected/); assert.match(verified, /Repair objective proof.*Not measured/);
+  assert.match(verified, /Execution outcome.*test failed/); assert.match(verified, /Failing phase.*Tests/);
+  assert.match(verified, /Network isolation.*confirmed/); assert.match(verified, /Cleanup.*confirmed/); assert.match(verified, /Verify candidate again/);
+  assert.doesNotMatch(verified, /Approve|Publish|Create PR/);
 });

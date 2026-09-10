@@ -6,9 +6,9 @@ import { ExecutionCancelled, requireNode24, SandboxBoundary, type SandboxLifecyc
 import { ARCHIVE_LIMITS, SAFE_ARCHIVE_EXTRACTION_SCRIPT } from './archive.ts';
 import { BASELINE_EVIDENCE_VERSION, type BaselineEvidence, type BaselineOutcome, type FrozenBaselineInput } from './types.ts';
 
-const INSTALL_POLICY = { allow: ['registry.npmjs.org'] };
-const INSTALL_ARGS = ['ci', '--ignore-scripts', '--no-audit', '--no-fund', '--registry=https://registry.npmjs.org', '--fetch-retries=0', '--fetch-timeout=15000'];
-const ARCHIVE_PATH = '/vercel/sandbox/vigilo-input/source.tar.gz';
+export const REPOSITORY_INSTALL_POLICY = { allow: ['registry.npmjs.org'] };
+export const REPOSITORY_INSTALL_ARGS = ['ci', '--ignore-scripts', '--no-audit', '--no-fund', '--registry=https://registry.npmjs.org', '--fetch-retries=0', '--fetch-timeout=15000'];
+export const REPOSITORY_ARCHIVE_PATH = '/vercel/sandbox/vigilo-input/source.tar.gz';
 const MAX_MANIFEST_BYTES = 512 * 1024;
 
 const MANIFEST_SCRIPT = `
@@ -59,9 +59,9 @@ if (Buffer.byteLength(output) > ${MAX_MANIFEST_BYTES}) throw new Error('manifest
 console.log(output);
 `;
 
-type SourceManifest = { entries: Array<{ path: string; type: string; mode: number; sha256: string; blobSha: string | null }>; identity: string };
+export type SourceManifest = { entries: Array<{ path: string; type: string; mode: number; sha256: string; blobSha: string | null }>; identity: string };
 
-function parseManifest(raw: string): SourceManifest {
+export function parseRepositoryManifest(raw: string): SourceManifest {
   if (Buffer.byteLength(raw, 'utf8') > MAX_MANIFEST_BYTES) throw new Error('manifest_too_large');
   const value = JSON.parse(raw) as SourceManifest;
   if (!value || !Array.isArray(value.entries) || value.entries.length > 5000 || !/^[a-f0-9]{64}$/.test(value.identity)) throw new Error('manifest_invalid');
@@ -75,6 +75,30 @@ function parseManifest(raw: string): SourceManifest {
   const identity = createHash('sha256').update(JSON.stringify(value.entries)).digest('hex');
   if (identity !== value.identity) throw new Error('manifest_invalid');
   return value;
+}
+
+type RepositoryExecutor = ReturnType<typeof fixtureExecutor>;
+
+export async function captureRepositoryManifest(execution: RepositoryExecutor, expected?: SourceManifest): Promise<SourceManifest> {
+  const argument = expected ? Buffer.from(JSON.stringify(expected.entries), 'utf8').toString('base64') : undefined;
+  const args = ['-e', MANIFEST_SCRIPT, ...(argument ? [argument] : [])];
+  return parseRepositoryManifest(await execution.trustedNode(args));
+}
+
+export async function materializeRepositoryArchive(
+  sandbox: Sandbox,
+  execution: RepositoryExecutor,
+  input: { archive: Buffer; baseCommitSha: string },
+  signal: AbortSignal,
+): Promise<SourceManifest> {
+  await sandbox.writeFiles([{ path: REPOSITORY_ARCHIVE_PATH, content: input.archive, mode: 0o600 }], { signal });
+  await execution.trustedNode(['-e', SAFE_ARCHIVE_EXTRACTION_SCRIPT, JSON.stringify({
+    archivePath: REPOSITORY_ARCHIVE_PATH,
+    expectedCommitSha: input.baseCommitSha,
+    limits: ARCHIVE_LIMITS,
+    root: ROOT,
+  })], 60_000);
+  return captureRepositoryManifest(execution);
 }
 
 function safeError(error: unknown): { phase: string; code: string; outcome: BaselineOutcome } {
@@ -98,7 +122,7 @@ export async function runFrozenRepositoryBaseline(
   clock: () => Date = () => new Date(),
   observer?: SandboxLifecycleObserver,
 ): Promise<BaselineEvidence> {
-  const boundary = new SandboxBoundary('vigilo-repository-baseline', INSTALL_POLICY, 600_000, observer);
+  const boundary = new SandboxBoundary('vigilo-repository-baseline', REPOSITORY_INSTALL_POLICY, 600_000, observer);
   const typecheck = input.profile.typecheckScript ? commandEvidence(['--ignore-scripts', 'run', 'typecheck'], 90_000) : null;
   const build = input.profile.buildScript ? commandEvidence(['--ignore-scripts', 'run', 'build'], 180_000) : null;
   const report: BaselineEvidence = {
@@ -114,7 +138,7 @@ export async function runFrozenRepositoryBaseline(
     source: { materialized: false, identityBeforeExecution: null, identityAfterExecution: null, unchangedAfterExecution: null },
     credentialsExposure: 'not_checked',
     networkPolicyBeforeRepositoryExecution: 'unconfirmed',
-    install: commandEvidence(INSTALL_ARGS, 180_000),
+    install: commandEvidence(REPOSITORY_INSTALL_ARGS, 180_000),
     typecheck,
     build,
     test: commandEvidence(['--ignore-scripts', 'test'], 180_000),
@@ -130,23 +154,10 @@ export async function runFrozenRepositoryBaseline(
   try {
     await boundary.run(async (sandbox, signal) => {
       const execution = fixtureExecutor(sandbox, boundary, signal);
-      const captureManifest = async (expected?: SourceManifest) => {
-        const argument = expected ? Buffer.from(JSON.stringify(expected.entries), 'utf8').toString('base64') : undefined;
-        const args = ['-e', MANIFEST_SCRIPT, ...(argument ? [argument] : [])];
-        return parseManifest(await execution.trustedNode(args));
-      };
-
       phase = 'runtime';
       requireNode24(await execution.trustedNode(['--version']));
-      await sandbox.writeFiles([{ path: ARCHIVE_PATH, content: input.archive, mode: 0o600 }], { signal });
-      await execution.trustedNode(['-e', SAFE_ARCHIVE_EXTRACTION_SCRIPT, JSON.stringify({
-        archivePath: ARCHIVE_PATH,
-        expectedCommitSha: input.profile.baseCommitSha,
-        limits: ARCHIVE_LIMITS,
-        root: ROOT,
-      })], 60_000);
       phase = 'source_integrity';
-      const initial = await captureManifest();
+      const initial = await materializeRepositoryArchive(sandbox, execution, { archive: input.archive, baseCommitSha: input.profile.baseCommitSha }, signal);
       const packageJson = initial.entries.find((entry) => entry.path === 'package.json' && entry.type === 'file');
       const packageLock = initial.entries.find((entry) => entry.path === 'package-lock.json' && entry.type === 'file');
       if (packageJson?.sha256 !== input.profile.packageJsonContentSha256 || packageJson.blobSha !== input.profile.packageJsonBlobSha ||
@@ -177,7 +188,7 @@ export async function runFrozenRepositoryBaseline(
       await execution.npm(report.test, 'test_failure');
 
       phase = 'source_integrity_after_execution';
-      const final = await captureManifest(initial);
+      const final = await captureRepositoryManifest(execution, initial);
       report.source.identityAfterExecution = final.identity;
       report.source.unchangedAfterExecution = final.identity === initial.identity;
       if (!report.source.unchangedAfterExecution) throw new ExecutionFailure('baseline_failure', 'source_mutated');

@@ -252,7 +252,11 @@ export async function getLatestRepairCandidate(database: VigiloDatabase, context
 }
 
 export async function selfCheckRepairCandidate(database: VigiloDatabase, context: AuthenticatedWorkspace, candidateId: string): Promise<{ candidateIdentity: string; files: FrozenCandidateFile[] }> {
-  const [row] = await database.select().from(repairCandidate).where(and(eq(repairCandidate.id, candidateId), eq(repairCandidate.workspaceId, context.workspace.id))).limit(1);
+  return selfCheckRepairCandidateForWorkspace(database, context.workspace.id, candidateId);
+}
+
+export async function selfCheckRepairCandidateForWorkspace(database: VigiloDatabase, workspaceId: string, candidateId: string): Promise<{ candidateIdentity: string; files: FrozenCandidateFile[] }> {
+  const [row] = await database.select().from(repairCandidate).where(and(eq(repairCandidate.id, candidateId), eq(repairCandidate.workspaceId, workspaceId))).limit(1);
   if (!row) throw new RepairCandidateError('candidate_not_found');
   if (row.state !== 'frozen' || !row.candidateIdentity) throw new RepairCandidateError('candidate_artifact_invalid');
   const stored = await database.select().from(repairCandidateFile).where(eq(repairCandidateFile.candidateId, row.id));
