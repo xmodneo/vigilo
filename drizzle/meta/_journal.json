@@ -78,6 +78,20 @@
       "when": 1789639200000,
       "tag": "0010_candidate-verification",
       "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "7",
+      "when": 1789725600000,
+      "tag": "0011_ai-investigation",
+      "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "7",
+      "when": 1789812000000,
+      "tag": "0012_ai-investigation-rerun",
+      "breakpoints": true
     }
   ]
 }

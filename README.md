@@ -65,6 +65,52 @@ outcomes; it does not store file contents, search results, or GitHub tokens.
 No AI/model call, source modification, candidate, verification, or pull-request
 behavior exists in Task 3.3.
 
+## Bounded AI investigation
+
+Task 4.1 adds a durable AI investigator for a ready Investigation. The web
+process commits a minimal `ai-investigation-v1` pg-boss job and returns; the
+worker alone loads `GEMINI_API_KEY` and calls the pinned Google GenAI SDK through a
+small provider-neutral interface. The key is never sent to the browser,
+database, GitHub, a sandbox, an audit event, or a model prompt.
+
+The model can call only `listPaths`, `readTextFile`, `searchText`, and
+`readBaselineSummary`. Each call resolves the exact workspace, repository,
+installation, commit, profile, and baseline from PostgreSQL and uses the
+existing context policy and audit trail. Repository and objective text are
+explicitly delimited as untrusted data. There is no shell, network, sandbox,
+write, candidate, or GitHub API tool.
+
+One investigation permits at most eight model turns and 20 total tool calls.
+At most six tool-bearing investigation rounds are permitted; one separate,
+tool-free request is reserved for finalization, so a bounded run consumes at
+most seven provider requests. The finalization request can use only the current
+AI execution's already observed context. Each AI execution also has a 128 KiB
+context-result budget inside (and stricter than) the parent Investigation's
+unchanged 1 MiB budget.
+Per-tool caps remain 2 path listings, 10 file reads, 5 searches, and 2
+baseline reads. Existing context limits of 50 operations and 1 MiB remain the
+outer authority. A model run has a 180-second deadline and a 2,500-token output
+limit per provider response. Budget exhaustion produces a low-confidence `insufficient_evidence`
+conclusion; it never expands a limit or claims a diagnosis. Provider failures
+retry through the durable worker at most three times. Valid low-confidence or
+not-reproduced conclusions complete without retry.
+
+Task 4.1 uses Google Gemini Developer API model `gemini-3.1-flash-lite` as its
+current development and live-acceptance model, with explicit medium thinking
+and stateless interactions (`store: false`). This does not establish it as
+Vigilo's final production model. The Gemini Free Tier is used only for
+development and live acceptance against the public Vigilo repository. Google's
+current Free Tier terms state that submitted content may be used to improve Google products.
+This configuration is not approved for future private customer
+repository processing without a separate provider, privacy, quality, and cost
+decision.
+
+For local model-backed use, set `GEMINI_API_KEY` in ignored `.env.local` and
+restart `npm run worker:dev`. Do not paste the value into chat or commit it.
+The UI polls durable state and renders React-escaped structured fields only.
+Task 4.1 does not modify source, create a Repair Candidate, run a sandbox, or
+write to GitHub.
+
 Task 3.4 adds durable, immutable Repair Candidates without executing proposed
 code. An internal proposer may request at most 16 text-file additions,
 modifications, or deletions. Vigilo derives repository authority from the ready

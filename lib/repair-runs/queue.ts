@@ -10,6 +10,8 @@ export const INVESTIGATION_CONTEXT_QUEUE = 'investigation-context-v1';
 export const INVESTIGATION_JOB_VERSION = 1 as const;
 export const CANDIDATE_VERIFICATION_QUEUE = 'candidate-verification-v1';
 export const CANDIDATE_VERIFICATION_JOB_VERSION = 1 as const;
+export const AI_INVESTIGATION_QUEUE = 'ai-investigation-v1';
+export const AI_INVESTIGATION_JOB_VERSION = 1 as const;
 
 export const REPAIR_QUEUE_OPTIONS = {
   deleteAfterSeconds: 7 * 24 * 60 * 60,
@@ -45,6 +47,11 @@ export interface CandidateVerificationJobPayload {
   verificationId: string;
 }
 
+export interface AiInvestigationJobPayload {
+  version: typeof AI_INVESTIGATION_JOB_VERSION;
+  aiInvestigationId: string;
+}
+
 export type RepairQueueJob = JobWithMetadata<unknown> | Job<unknown>;
 export type InvestigationQueueJob = RepairQueueJob;
 export type VigiloTransaction = Parameters<Parameters<VigiloDatabase['transaction']>[0]>[0];
@@ -59,6 +66,10 @@ export interface TransactionalInvestigationQueue {
 
 export interface TransactionalCandidateVerificationQueue {
   enqueueVerification(transaction: VigiloTransaction, payload: CandidateVerificationJobPayload): Promise<string>;
+}
+
+export interface TransactionalAiInvestigationQueue {
+  enqueueAiInvestigation(transaction: VigiloTransaction, payload: AiInvestigationJobPayload): Promise<string>;
 }
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
@@ -84,6 +95,13 @@ export function parseCandidateVerificationJobPayload(value: unknown): CandidateV
   const record = value as Record<string, unknown>;
   if (Object.keys(record).length !== 2 || record.version !== CANDIDATE_VERIFICATION_JOB_VERSION || typeof record.verificationId !== 'string' || !UUID.test(record.verificationId)) throw new Error('invalid_candidate_verification_job_payload');
   return { version: CANDIDATE_VERIFICATION_JOB_VERSION, verificationId: record.verificationId };
+}
+
+export function parseAiInvestigationJobPayload(value: unknown): AiInvestigationJobPayload {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('invalid_ai_investigation_job_payload');
+  const record = value as Record<string, unknown>;
+  if (Object.keys(record).length !== 2 || record.version !== AI_INVESTIGATION_JOB_VERSION || typeof record.aiInvestigationId !== 'string' || !UUID.test(record.aiInvestigationId)) throw new Error('invalid_ai_investigation_job_payload');
+  return { version: AI_INVESTIGATION_JOB_VERSION, aiInvestigationId: record.aiInvestigationId };
 }
 
 export class PgBossRepairQueue implements TransactionalRepairQueue {
@@ -131,6 +149,16 @@ export class PgBossCandidateVerificationQueue implements TransactionalCandidateV
   }
 }
 
+export class PgBossAiInvestigationQueue implements TransactionalAiInvestigationQueue {
+  constructor(private readonly boss: Pick<PgBoss, 'send'>) {}
+  async enqueueAiInvestigation(transaction: VigiloTransaction, payload: AiInvestigationJobPayload): Promise<string> {
+    const validated = parseAiInvestigationJobPayload(payload);
+    const id = await this.boss.send(AI_INVESTIGATION_QUEUE, validated, { ...REPAIR_QUEUE_OPTIONS, db: fromDrizzle(transaction as unknown as DrizzleTransactionLike, sql), id: validated.aiInvestigationId });
+    if (id !== validated.aiInvestigationId) throw new Error('ai_investigation_job_not_persisted');
+    return id;
+  }
+}
+
 export async function configureRepairQueue(boss: Pick<PgBoss, 'createQueue' | 'updateQueue'>): Promise<void> {
   await boss.createQueue(REPAIR_BASELINE_QUEUE, { policy: 'standard', ...REPAIR_QUEUE_OPTIONS });
   await boss.updateQueue(REPAIR_BASELINE_QUEUE, REPAIR_QUEUE_OPTIONS);
@@ -138,6 +166,8 @@ export async function configureRepairQueue(boss: Pick<PgBoss, 'createQueue' | 'u
   await boss.updateQueue(INVESTIGATION_CONTEXT_QUEUE, REPAIR_QUEUE_OPTIONS);
   await boss.createQueue(CANDIDATE_VERIFICATION_QUEUE, { policy: 'standard', ...REPAIR_QUEUE_OPTIONS });
   await boss.updateQueue(CANDIDATE_VERIFICATION_QUEUE, REPAIR_QUEUE_OPTIONS);
+  await boss.createQueue(AI_INVESTIGATION_QUEUE, { policy: 'standard', ...REPAIR_QUEUE_OPTIONS });
+  await boss.updateQueue(AI_INVESTIGATION_QUEUE, REPAIR_QUEUE_OPTIONS);
 }
 
 export async function createRepairBoss(databaseUrl: string, role: 'publisher' | 'worker'): Promise<PgBoss> {

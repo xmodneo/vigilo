@@ -5,6 +5,7 @@ import { renderToStaticMarkup } from 'react-dom/server';
 
 import { GitHubConnectionView } from '../app/app/github/github-connection-view.js';
 import { RepairRunStatus } from '../app/app/github/repair-run-status.js';
+import { AiInvestigationStatus } from '../app/app/github/ai-investigation-status.js';
 
 test('GitHub connection page renders the disconnected installation action', () => {
   const html = renderToStaticMarkup(
@@ -220,6 +221,30 @@ test('active Repair Run renders honest worker-owned progress and queued cancella
   const running = renderToStaticMarkup(<RepairRunStatus initialRun={{ ...common, state: 'baseline_running', baselineStartedAt: '2026-09-09T00:00:01.000Z' }} />);
   assert.match(running, /Running baseline/);
   assert.doesNotMatch(running, /Cancel queued run|Start repair/);
+});
+
+test('ready investigation exposes only the bounded AI investigation start intent', () => {
+  const html = renderToStaticMarkup(<AiInvestigationStatus investigationId="11111111-1111-4111-8111-111111111111" initialAiInvestigation={null} startRequestId="44444444-4444-4444-8444-444444444444" />);
+  assert.match(html, /AI Investigation/); assert.match(html, /Start AI investigation/); assert.match(html, /action="\/api\/ai-investigations"/); assert.match(html, /name="investigationId"/); assert.match(html, /name="idempotencyKey" value="44444444-4444-4444-8444-444444444444"/);
+  assert.doesNotMatch(html, /shell|write file|apply fix|create candidate|api key/i);
+});
+
+test('failed AI investigation offers a new execution while completed results do not', () => {
+  const base = { id: '22222222-2222-4222-8222-222222222222', investigationId: '11111111-1111-4111-8111-111111111111', executionOrdinal: 1, revision: 'a'.repeat(40), provider: 'google', model: 'gemini-3.1-flash-lite', completionReason: null, conclusion: null, usage: { inputTokens: 0, outputTokens: 0, toolCallCount: 0, modelTurnCount: 0 } } as const;
+  const failed = renderToStaticMarkup(<AiInvestigationStatus investigationId={base.investigationId} initialAiInvestigation={{ ...base, state: 'failed', failureCode: 'provider_quota_exhausted' }} startRequestId="44444444-4444-4444-8444-444444444444" />);
+  assert.match(failed, /Previous execution 1/); assert.match(failed, /Provider quota exhausted/); assert.match(failed, /Retry AI investigation/); assert.match(failed, /name="idempotencyKey"/);
+  const completed = renderToStaticMarkup(<AiInvestigationStatus investigationId={base.investigationId} initialAiInvestigation={{ ...base, state: 'completed', completionReason: 'budget_exhausted', conclusion: { status: 'insufficient_evidence', summary: 'Bounded.', suspectedFiles: [], evidence: [], proposedApproach: 'Review.', confidence: 'low' }, failureCode: null }} startRequestId="55555555-5555-4555-8555-555555555555" />);
+  assert.doesNotMatch(completed, /Retry AI investigation|Start AI investigation/);
+});
+
+test('completed AI investigation renders structured text safely without authority controls', () => {
+  const html = renderToStaticMarkup(<AiInvestigationStatus investigationId="11111111-1111-4111-8111-111111111111" startRequestId="44444444-4444-4444-8444-444444444444" initialAiInvestigation={{
+    id: '22222222-2222-4222-8222-222222222222', investigationId: '11111111-1111-4111-8111-111111111111', executionOrdinal: 1, state: 'completed', revision: 'a'.repeat(40), provider: 'google', model: 'gemini-3.1-flash-lite', completionReason: 'model_conclusion',
+    conclusion: { status: 'diagnosis_found', summary: '<script>unsafe()</script>', suspectedFiles: [{ path: 'src/shipping.ts', reason: 'Threshold check.' }], evidence: [{ kind: 'file', reference: '33333333-3333-4333-8333-333333333333' }], proposedApproach: 'Review the comparison.', confidence: 'high' },
+    usage: { inputTokens: 10, outputTokens: 5, toolCallCount: 1, modelTurnCount: 2 }, failureCode: null,
+  }} />);
+  assert.match(html, /Diagnosis/); assert.match(html, /Suspected files/); assert.match(html, /Evidence consulted/); assert.match(html, /Proposed approach/); assert.match(html, /Confidence/); assert.match(html, /&lt;script&gt;unsafe\(\)&lt;\/script&gt;/);
+  assert.doesNotMatch(html, /<script>|Apply fix|Verify|Approve|Publish|name="(?:workspace|commit|repository|state)"/);
 });
 
 test('eligible Repair Run renders its objective and bounded investigation status', () => {

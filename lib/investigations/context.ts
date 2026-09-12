@@ -1,9 +1,9 @@
 import { createHash } from 'node:crypto';
 
-import { and, asc, eq, sql } from 'drizzle-orm';
+import { and, asc, eq, gt, sql } from 'drizzle-orm';
 
-import { investigation, investigationContextEntry, investigationContextEvent, repositoryBaseline } from '../../db/schema.ts';
-import type { AuthenticatedWorkspace } from '../auth/protected-context.ts';
+import { aiInvestigation, aiInvestigationAttempt, investigation, investigationContextEntry, investigationContextEvent, repositoryBaseline } from '../../db/schema.ts';
+import { AI_LIMITS } from '../ai-investigations/types.ts';
 import type { VigiloDatabase } from '../db/types.ts';
 import type { GitHubAppConfiguration } from '../github-app/types.ts';
 import { CONTEXT_BUDGET, ContextPolicyError, normalizeContextPath, normalizeSearchQuery, pathDenied, searchablePath, strictUtf8 } from './policy.ts';
@@ -31,6 +31,46 @@ export class InvestigationContextError extends Error {
 }
 
 type Operation = 'list_paths' | 'read_text_file' | 'search_text' | 'read_baseline_summary';
+type WorkspaceAuthority = { workspace: { id: string } };
+type AiAudit = {
+  aiInvestigationId?: string;
+  aiInvestigationAttemptId?: string;
+  ownershipToken?: string;
+};
+
+type OperationInput = {
+  id: string;
+  operation: Operation;
+  requestPath?: string;
+  queryHash?: string;
+  queryBytes?: number;
+  budgetBytes: number;
+  allowTruncation?: boolean;
+} & AiAudit;
+
+function hasValidAiAudit(input: AiAudit): input is Required<AiAudit> {
+  const fields = [input.aiInvestigationId, input.aiInvestigationAttemptId, input.ownershipToken];
+  if (fields.every((field) => field === undefined)) return false;
+  if (!fields.every((field) => typeof field === 'string' && UUID.test(field))) throw new InvestigationContextError('invalid_context_request');
+  return true;
+}
+
+async function assertActiveAiAttempt(database: VigiloDatabase, value: typeof investigation.$inferSelect, input: AiAudit) {
+  if (!hasValidAiAudit(input)) return;
+  const [modelRun] = await database.select({ id: aiInvestigation.id }).from(aiInvestigation).where(and(
+    eq(aiInvestigation.id, input.aiInvestigationId), eq(aiInvestigation.investigationId, value.id),
+    eq(aiInvestigation.workspaceId, value.workspaceId), eq(aiInvestigation.state, 'investigating'),
+  )).limit(1);
+  if (!modelRun) throw new InvestigationContextError('invalid_context_request');
+  const [attempt] = await database.select({ id: aiInvestigationAttempt.id }).from(aiInvestigationAttempt).where(and(
+    eq(aiInvestigationAttempt.id, input.aiInvestigationAttemptId),
+    eq(aiInvestigationAttempt.aiInvestigationId, input.aiInvestigationId),
+    eq(aiInvestigationAttempt.ownershipToken, input.ownershipToken),
+    eq(aiInvestigationAttempt.state, 'active'),
+    gt(aiInvestigationAttempt.leaseExpiresAt, new Date()),
+  )).for('update').limit(1);
+  if (!attempt) throw new InvestigationContextError('invalid_context_request');
+}
 
 function safeContextError(error: unknown): InvestigationContextError {
   if (error instanceof InvestigationContextError) return error;
@@ -38,7 +78,7 @@ function safeContextError(error: unknown): InvestigationContextError {
   return new InvestigationContextError('context_source_unavailable');
 }
 
-async function readyInvestigation(database: VigiloDatabase, context: AuthenticatedWorkspace, investigationId: string) {
+async function readyInvestigation(database: VigiloDatabase, context: WorkspaceAuthority, investigationId: string) {
   if (!UUID.test(investigationId)) throw new InvestigationContextError('invalid_context_request');
   const [value] = await database.select().from(investigation).where(and(eq(investigation.id, investigationId), eq(investigation.workspaceId, context.workspace.id))).limit(1);
   if (!value) throw new InvestigationContextError('investigation_not_found');
@@ -49,25 +89,41 @@ async function readyInvestigation(database: VigiloDatabase, context: Authenticat
 async function reserveOperation(
   database: VigiloDatabase,
   value: typeof investigation.$inferSelect,
-  input: { id: string; operation: Operation; requestPath?: string; queryHash?: string; queryBytes?: number; budgetBytes: number },
+  input: OperationInput,
 ) {
   if (!UUID.test(input.id) || input.budgetBytes < 0 || input.budgetBytes > value.maxCumulativeBytes) throw new InvestigationContextError('invalid_context_request');
+  hasValidAiAudit(input);
   const now = new Date();
-  await database.transaction(async (transaction) => {
+  return database.transaction(async (transaction) => {
     const [locked] = await transaction.select({ id: investigation.id }).from(investigation).where(and(eq(investigation.id, value.id), eq(investigation.workspaceId, value.workspaceId))).for('update').limit(1);
     if (!locked) throw new InvestigationContextError('investigation_not_found');
+    await assertActiveAiAttempt(transaction as VigiloDatabase, value, input);
     const [existing] = await transaction.select().from(investigationContextEvent).where(eq(investigationContextEvent.id, input.id)).limit(1);
     if (existing) throw new InvestigationContextError('context_operation_replayed');
     const [usage] = await transaction.select({
       count: sql<number>`count(*)::int`,
       bytes: sql<number>`coalesce(sum(${investigationContextEvent.budgetBytes}), 0)::int`,
     }).from(investigationContextEvent).where(eq(investigationContextEvent.investigationId, value.id));
-    if (!usage || usage.count >= value.maxOperations || usage.bytes + input.budgetBytes > value.maxCumulativeBytes) throw new InvestigationContextError('context_budget_exhausted');
+    if (!usage || usage.count >= value.maxOperations) throw new InvestigationContextError('context_budget_exhausted');
+    let reservedBytes = input.budgetBytes;
+    const parentRemaining = value.maxCumulativeBytes - usage.bytes;
+    if (input.allowTruncation) reservedBytes = Math.min(reservedBytes, parentRemaining);
+    else if (reservedBytes > parentRemaining) throw new InvestigationContextError('context_budget_exhausted');
+    if (input.aiInvestigationId) {
+      const [aiUsage] = await transaction.select({ bytes: sql<number>`coalesce(sum(${investigationContextEvent.budgetBytes}), 0)::int` })
+        .from(investigationContextEvent).where(eq(investigationContextEvent.aiInvestigationId, input.aiInvestigationId));
+      if (!aiUsage) throw new InvestigationContextError('context_budget_exhausted');
+      const aiRemaining = AI_LIMITS.maxContextResultBytes - aiUsage.bytes;
+      if (input.allowTruncation) reservedBytes = Math.min(reservedBytes, aiRemaining);
+      else if (reservedBytes > aiRemaining) throw new InvestigationContextError('context_budget_exhausted');
+    }
+    if (input.budgetBytes > 0 && reservedBytes <= 0) throw new InvestigationContextError('context_budget_exhausted');
     await transaction.insert(investigationContextEvent).values({
-      id: input.id, investigationId: value.id, workspaceId: value.workspaceId, operation: input.operation,
+      id: input.id, investigationId: value.id, aiInvestigationId: input.aiInvestigationId ?? null, workspaceId: value.workspaceId, operation: input.operation,
       status: 'started', requestPath: input.requestPath ?? null, queryHash: input.queryHash ?? null,
-      queryBytes: input.queryBytes ?? null, budgetBytes: input.budgetBytes, createdAt: now,
+      queryBytes: input.queryBytes ?? null, budgetBytes: reservedBytes, createdAt: now,
     });
+    return reservedBytes;
   });
 }
 
@@ -75,39 +131,51 @@ async function completeOperation(
   database: VigiloDatabase,
   value: typeof investigation.$inferSelect,
   operationId: string,
+  audit: AiAudit,
   facts: { resultCount: number; resultBytes: number; truncated: boolean; budgetExhausted: boolean },
 ) {
-  const [updated] = await database.update(investigationContextEvent).set({
-    status: 'completed', resultCount: facts.resultCount, resultBytes: facts.resultBytes,
-    budgetBytes: facts.resultBytes, truncated: facts.truncated, budgetExhausted: facts.budgetExhausted,
-    completedAt: new Date(),
-  }).where(and(eq(investigationContextEvent.id, operationId), eq(investigationContextEvent.investigationId, value.id), eq(investigationContextEvent.workspaceId, value.workspaceId), eq(investigationContextEvent.status, 'started'))).returning({ id: investigationContextEvent.id });
-  if (!updated) throw new InvestigationContextError('context_operation_replayed');
+  await database.transaction(async (transaction) => {
+    await assertActiveAiAttempt(transaction as VigiloDatabase, value, audit);
+    const [event] = await transaction.select({ budgetBytes: investigationContextEvent.budgetBytes }).from(investigationContextEvent).where(and(eq(investigationContextEvent.id, operationId), eq(investigationContextEvent.investigationId, value.id), eq(investigationContextEvent.workspaceId, value.workspaceId), eq(investigationContextEvent.status, 'started'))).for('update').limit(1);
+    if (!event) throw new InvestigationContextError('context_operation_replayed');
+    if (facts.resultBytes < 0 || facts.resultBytes > event.budgetBytes) throw new InvestigationContextError('context_budget_exhausted');
+    const [updated] = await transaction.update(investigationContextEvent).set({
+      status: 'completed', resultCount: facts.resultCount, resultBytes: facts.resultBytes,
+      budgetBytes: facts.resultBytes, truncated: facts.truncated, budgetExhausted: facts.budgetExhausted,
+      completedAt: new Date(),
+    }).where(and(eq(investigationContextEvent.id, operationId), eq(investigationContextEvent.status, 'started'))).returning({ id: investigationContextEvent.id });
+    if (!updated) throw new InvestigationContextError('context_operation_replayed');
+  });
 }
 
-async function failOperation(database: VigiloDatabase, value: typeof investigation.$inferSelect, operationId: string, code: string) {
-  const [updated] = await database.update(investigationContextEvent).set({
-    status: 'failed', resultCount: 0, resultBytes: 0, budgetBytes: 0, failureCode: /^[a-z_]{1,64}$/.test(code) ? code : 'context_source_unavailable', completedAt: new Date(),
-  }).where(and(eq(investigationContextEvent.id, operationId), eq(investigationContextEvent.investigationId, value.id), eq(investigationContextEvent.workspaceId, value.workspaceId), eq(investigationContextEvent.status, 'started'))).returning({ id: investigationContextEvent.id });
-  if (!updated) throw new InvestigationContextError('context_operation_replayed');
+async function failOperation(database: VigiloDatabase, value: typeof investigation.$inferSelect, operationId: string, audit: AiAudit, code: string) {
+  await database.transaction(async (transaction) => {
+    await assertActiveAiAttempt(transaction as VigiloDatabase, value, audit);
+    const [updated] = await transaction.update(investigationContextEvent).set({
+      status: 'failed', resultCount: 0, resultBytes: 0, budgetBytes: 0, failureCode: /^[a-z_]{1,64}$/.test(code) ? code : 'context_source_unavailable', completedAt: new Date(),
+    }).where(and(eq(investigationContextEvent.id, operationId), eq(investigationContextEvent.investigationId, value.id), eq(investigationContextEvent.workspaceId, value.workspaceId), eq(investigationContextEvent.status, 'started'))).returning({ id: investigationContextEvent.id });
+    if (!updated) throw new InvestigationContextError('context_operation_replayed');
+  });
 }
 
 async function rejectOperation(
   database: VigiloDatabase,
   value: typeof investigation.$inferSelect,
-  input: { id: string; operation: Operation; requestPath?: string; queryHash?: string; queryBytes?: number },
+  input: Omit<OperationInput, 'budgetBytes'>,
   code: string,
 ) {
   if (!UUID.test(input.id)) return;
+  hasValidAiAudit(input);
   const safeCode = /^[a-z_]{1,64}$/.test(code) ? code : 'invalid_context_request';
   const now = new Date();
   await database.transaction(async (transaction) => {
     const [locked] = await transaction.select({ id: investigation.id }).from(investigation).where(and(eq(investigation.id, value.id), eq(investigation.workspaceId, value.workspaceId))).for('update').limit(1);
     if (!locked) throw new InvestigationContextError('investigation_not_found');
+    await assertActiveAiAttempt(transaction as VigiloDatabase, value, input);
     const [usage] = await transaction.select({ count: sql<number>`count(*)::int` }).from(investigationContextEvent).where(eq(investigationContextEvent.investigationId, value.id));
     if (!usage || usage.count >= value.maxOperations) throw new InvestigationContextError('context_budget_exhausted');
     const [inserted] = await transaction.insert(investigationContextEvent).values({
-      id: input.id, investigationId: value.id, workspaceId: value.workspaceId, operation: input.operation,
+      id: input.id, investigationId: value.id, aiInvestigationId: input.aiInvestigationId ?? null, workspaceId: value.workspaceId, operation: input.operation,
       status: 'rejected', requestPath: input.requestPath ?? null, queryHash: input.queryHash ?? null,
       queryBytes: input.queryBytes ?? null, budgetBytes: 0, failureCode: safeCode, createdAt: now, completedAt: now,
     }).onConflictDoNothing().returning({ id: investigationContextEvent.id });
@@ -119,16 +187,16 @@ async function audited<T>(
   database: VigiloDatabase,
   value: typeof investigation.$inferSelect,
   input: Parameters<typeof reserveOperation>[2],
-  operation: () => Promise<{ value: T; resultCount: number; resultBytes: number; truncated: boolean; budgetExhausted: boolean }>,
+  operation: (reservedBytes: number) => Promise<{ value: T; resultCount: number; resultBytes: number; truncated: boolean; budgetExhausted: boolean }>,
 ): Promise<T> {
-  await reserveOperation(database, value, input);
+  const reservedBytes = await reserveOperation(database, value, input);
   try {
-    const output = await operation();
-    await completeOperation(database, value, input.id, output);
+    const output = await operation(reservedBytes);
+    await completeOperation(database, value, input.id, input, output);
     return output.value;
   } catch (error) {
     const safe = safeContextError(error);
-    await failOperation(database, value, input.id, safe.code);
+    await failOperation(database, value, input.id, input, safe.code);
     throw safe;
   }
 }
@@ -137,13 +205,13 @@ function gitBlobSha(bytes: Buffer): string {
   return createHash('sha1').update(`blob ${bytes.byteLength}\0`).update(bytes).digest('hex');
 }
 
-export async function listPaths(database: VigiloDatabase, context: AuthenticatedWorkspace, investigationId: string, operationId: string, limit = CONTEXT_BUDGET.maxListPaths) {
+export async function listPaths(database: VigiloDatabase, context: WorkspaceAuthority, investigationId: string, operationId: string, limit = CONTEXT_BUDGET.maxListPaths, audit: AiAudit = {}) {
   const value = await readyInvestigation(database, context, investigationId);
   if (!Number.isSafeInteger(limit) || limit < 1 || limit > CONTEXT_BUDGET.maxListPaths) {
-    await rejectOperation(database, value, { id: operationId, operation: 'list_paths' }, 'invalid_context_request');
+    await rejectOperation(database, value, { id: operationId, operation: 'list_paths', ...audit }, 'invalid_context_request');
     throw new InvestigationContextError('invalid_context_request');
   }
-  return audited(database, value, { id: operationId, operation: 'list_paths', budgetBytes: 0 }, async () => {
+  return audited(database, value, { id: operationId, operation: 'list_paths', budgetBytes: 0, ...audit }, async () => {
     const rows = await database.select({
       path: investigationContextEntry.path, kind: investigationContextEntry.kind, sizeBytes: investigationContextEntry.sizeBytes, readable: investigationContextEntry.readable,
     }).from(investigationContextEntry).where(eq(investigationContextEntry.investigationId, value.id)).orderBy(asc(investigationContextEntry.path)).limit(limit + 1);
@@ -168,12 +236,13 @@ async function scopedBlob(
 
 export async function readTextFile(
   database: VigiloDatabase,
-  context: AuthenticatedWorkspace,
+  context: WorkspaceAuthority,
   gateway: InvestigationSourceGateway,
   configuration: GitHubAppConfiguration,
   investigationId: string,
   operationId: string,
   pathInput: unknown,
+  audit: AiAudit = {},
 ) {
   const value = await readyInvestigation(database, context, investigationId);
   let path: string;
@@ -182,19 +251,19 @@ export async function readTextFile(
     if (pathDenied(path)) throw new ContextPolicyError('path_denied');
   } catch (error) {
     const safe = safeContextError(error);
-    await rejectOperation(database, value, { id: operationId, operation: 'read_text_file' }, safe.code);
+    await rejectOperation(database, value, { id: operationId, operation: 'read_text_file', ...audit }, safe.code);
     throw safe;
   }
   const [entry] = await database.select().from(investigationContextEntry).where(and(eq(investigationContextEntry.investigationId, value.id), eq(investigationContextEntry.path, path))).limit(1);
   if (!entry) {
-    await rejectOperation(database, value, { id: operationId, operation: 'read_text_file', requestPath: path }, 'path_not_found');
+    await rejectOperation(database, value, { id: operationId, operation: 'read_text_file', requestPath: path, ...audit }, 'path_not_found');
     throw new InvestigationContextError('path_not_found');
   }
   if (!entry.readable || entry.kind !== 'blob' || entry.sizeBytes === null || entry.sizeBytes > value.maxFileBytes) {
-    await rejectOperation(database, value, { id: operationId, operation: 'read_text_file', requestPath: path }, 'path_not_readable');
+    await rejectOperation(database, value, { id: operationId, operation: 'read_text_file', requestPath: path, ...audit }, 'path_not_readable');
     throw new InvestigationContextError('path_not_readable');
   }
-  return audited(database, value, { id: operationId, operation: 'read_text_file', requestPath: path, budgetBytes: entry.sizeBytes }, async () => {
+  return audited(database, value, { id: operationId, operation: 'read_text_file', requestPath: path, budgetBytes: entry.sizeBytes, ...audit }, async () => {
     const bytes = await scopedBlob(gateway, configuration, value, entry);
     const content = strictUtf8(bytes);
     if (content === null) throw new InvestigationContextError('binary_file_rejected');
@@ -204,12 +273,13 @@ export async function readTextFile(
 
 export async function searchText(
   database: VigiloDatabase,
-  context: AuthenticatedWorkspace,
+  context: WorkspaceAuthority,
   gateway: InvestigationSourceGateway,
   configuration: GitHubAppConfiguration,
   investigationId: string,
   operationId: string,
   queryInput: unknown,
+  audit: AiAudit = {},
 ) {
   const value = await readyInvestigation(database, context, investigationId);
   let query: string;
@@ -217,7 +287,7 @@ export async function searchText(
     query = normalizeSearchQuery(queryInput);
   } catch (error) {
     const safe = safeContextError(error);
-    await rejectOperation(database, value, { id: operationId, operation: 'search_text' }, safe.code);
+    await rejectOperation(database, value, { id: operationId, operation: 'search_text', ...audit }, safe.code);
     throw safe;
   }
   const queryHash = createHash('sha256').update(query).digest('hex');
@@ -225,14 +295,14 @@ export async function searchText(
   const eligible = all.filter((entry) => searchablePath(entry.path));
   const candidates = eligible.slice(0, CONTEXT_BUDGET.maxSearchCandidateFiles);
   return audited(database, value, {
-    id: operationId, operation: 'search_text', queryHash, queryBytes: Buffer.byteLength(query, 'utf8'), budgetBytes: CONTEXT_BUDGET.maxSearchBytes,
-  }, async () => {
+    id: operationId, operation: 'search_text', queryHash, queryBytes: Buffer.byteLength(query, 'utf8'), budgetBytes: CONTEXT_BUDGET.maxSearchBytes, allowTruncation: true, ...audit,
+  }, async (reservedBytes) => {
     const matches: Array<{ path: string; line: number; text: string }> = [];
     let scannedBytes = 0;
     let truncated = value.treeTruncated || eligible.length > candidates.length;
     await withScopedRepositoryToken(gateway, configuration, value, async ({ accessToken, owner, repository }) => {
       for (const entry of candidates) {
-        if (entry.sizeBytes === null || scannedBytes + entry.sizeBytes > CONTEXT_BUDGET.maxSearchBytes) { truncated = true; break; }
+        if (entry.sizeBytes === null || scannedBytes + entry.sizeBytes > reservedBytes) { truncated = true; break; }
         const blob = await gateway.getBlob({ accessToken, owner, repository, blobSha: entry.objectSha });
         if (blob.sha !== entry.objectSha || gitBlobSha(blob.bytes) !== entry.objectSha || blob.bytes.byteLength !== entry.sizeBytes) throw new InvestigationContextError('content_identity_mismatch');
         scannedBytes += blob.bytes.byteLength;
@@ -251,9 +321,9 @@ export async function searchText(
   });
 }
 
-export async function readBaselineSummary(database: VigiloDatabase, context: AuthenticatedWorkspace, investigationId: string, operationId: string) {
+export async function readBaselineSummary(database: VigiloDatabase, context: WorkspaceAuthority, investigationId: string, operationId: string, audit: AiAudit = {}) {
   const value = await readyInvestigation(database, context, investigationId);
-  return audited(database, value, { id: operationId, operation: 'read_baseline_summary', budgetBytes: 0 }, async () => {
+  return audited(database, value, { id: operationId, operation: 'read_baseline_summary', budgetBytes: 0, ...audit }, async () => {
     const [baseline] = await database.select().from(repositoryBaseline).where(and(eq(repositoryBaseline.id, value.baselineId), eq(repositoryBaseline.workspaceId, value.workspaceId))).limit(1);
     if (!baseline || baseline.githubRepositoryId !== value.githubRepositoryId || baseline.installationId !== value.installationId || baseline.baseCommitSha !== value.baseCommitSha || baseline.profileIdentity !== value.profileIdentity) throw new InvestigationContextError('context_source_unavailable');
     const summary = {

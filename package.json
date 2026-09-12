@@ -40,6 +40,7 @@
   },
   "dependencies": {
     "@better-auth/drizzle-adapter": "1.7.2",
+    "@google/genai": "2.22.0",
     "@vercel/sandbox": "3.2.1",
     "better-auth": "1.7.2",
     "drizzle-orm": "0.45.2",

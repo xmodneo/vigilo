@@ -19,6 +19,8 @@ import { getInvestigationForContext } from '../../../lib/investigations/server';
 import { getLatestRepairCandidateForContext, publicRepairCandidate } from '../../../lib/repair-candidates/server';
 import { getCandidateVerificationForContext } from '../../../lib/candidate-verifications/server';
 import { publicCandidateVerification } from '../../../lib/candidate-verifications/handlers';
+import { getAiInvestigationForContext } from '../../../lib/ai-investigations/server';
+import { publicAiInvestigation } from '../../../lib/ai-investigations/handlers';
 import { GitHubConnectionView } from './github-connection-view';
 
 export default async function GitHubConnectionPage() {
@@ -38,6 +40,7 @@ export default async function GitHubConnectionPage() {
     let investigation = undefined;
     let repairCandidate = undefined;
     let candidateVerification = undefined;
+    let aiInvestigation = undefined;
     if (installation) {
       try {
         const overview = await getRepositoryOverviewForContext(context);
@@ -62,6 +65,9 @@ export default async function GitHubConnectionPage() {
         investigation = repairRun
           ? publicInvestigation(await getInvestigationForContext(context, repairRun.id))
           : null;
+        aiInvestigation = investigation
+          ? publicAiInvestigation(await getAiInvestigationForContext(context, investigation.id))
+          : null;
         repairCandidate = investigation
           ? publicRepairCandidate(await getLatestRepairCandidateForContext(context, investigation.id))
           : null;
@@ -76,10 +82,12 @@ export default async function GitHubConnectionPage() {
     return (
       <GitHubConnectionView
         installation={installation}
+        aiInvestigationRequestId={randomUUID()}
         investigationRequestId={randomUUID()}
         {...(investigation !== undefined ? { investigation } : {})}
         {...(repairCandidate !== undefined ? { repairCandidate } : {})}
         {...(candidateVerification !== undefined ? { candidateVerification } : {})}
+        {...(aiInvestigation !== undefined ? { aiInvestigation } : {})}
         {...(baseline !== undefined ? { baseline } : {})}
         {...(executionProfile !== undefined ? { executionProfile } : {})}
         {...(repositories ? { repositories } : {})}

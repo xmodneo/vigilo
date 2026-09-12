@@ -7,6 +7,7 @@ import { GitHubApiClient } from '../lib/github-app/client.ts';
 import { readGitHubAppEnvironment, readGitHubAppPrivateKey } from '../lib/github-app/environment.ts';
 import {
   createRepairBoss,
+  AI_INVESTIGATION_QUEUE,
   CANDIDATE_VERIFICATION_QUEUE,
   INVESTIGATION_CONTEXT_QUEUE,
   REPAIR_BASELINE_QUEUE,
@@ -19,6 +20,9 @@ import { candidateVerification } from '../db/schema.ts';
 import { inArray } from 'drizzle-orm';
 import { processInvestigationJob } from '../lib/investigations/worker.ts';
 import { processCandidateVerificationJob } from '../lib/candidate-verifications/worker.ts';
+import { aiInvestigation } from '../db/schema.ts';
+import { GeminiInvestigationProvider, readModelApiKey } from '../lib/ai-investigations/gemini-provider.ts';
+import { processAiInvestigationJob } from '../lib/ai-investigations/worker.ts';
 
 async function main(): Promise<void> {
   const environment = readServerEnvironment();
@@ -48,6 +52,11 @@ async function main(): Promise<void> {
     const activeVerifications = await database.select({ id: candidateVerification.id }).from(candidateVerification).where(inArray(candidateVerification.state, ['created', 'queued', 'verifying']));
     for (const value of activeVerifications) {
       try { await boss.retry(CANDIDATE_VERIFICATION_QUEUE, value.id); }
+      catch { /* A non-failed canonical job remains owned by pg-boss. */ }
+    }
+    const activeAiInvestigations = await database.select({ id: aiInvestigation.id }).from(aiInvestigation).where(inArray(aiInvestigation.state, ['created', 'queued', 'investigating']));
+    for (const value of activeAiInvestigations) {
+      try { await boss.retry(AI_INVESTIGATION_QUEUE, value.id); }
       catch { /* A non-failed canonical job remains owned by pg-boss. */ }
     }
 
@@ -82,6 +91,12 @@ async function main(): Promise<void> {
       }
     });
     workerIds.push({ id: verificationWorkerId, queue: CANDIDATE_VERIFICATION_QUEUE });
+    const aiWorkerId = await boss.work<unknown, { code?: string }, typeof workOptions>(AI_INVESTIGATION_QUEUE, workOptions, async (jobs) => {
+      const job = jobs[0]; if (!job) return [];
+      try { return [await processAiInvestigationJob(job, { configuration, database, gateway, shutdownSignal: shutdown.signal, createProvider: () => new GeminiInvestigationProvider(readModelApiKey()) })]; }
+      catch { return [{ id: job.id, status: 'failed' as const, output: { code: 'ai_investigation_worker_failed' } }]; }
+    });
+    workerIds.push({ id: aiWorkerId, queue: AI_INVESTIGATION_QUEUE });
 
     await new Promise<void>((resolve) => {
       const stop = () => resolve();
