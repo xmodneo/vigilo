@@ -2,8 +2,9 @@ import { createHash } from 'node:crypto';
 
 import { and, asc, eq, gt, sql } from 'drizzle-orm';
 
-import { aiInvestigation, aiInvestigationAttempt, investigation, investigationContextEntry, investigationContextEvent, repositoryBaseline } from '../../db/schema.ts';
+import { aiCandidateGeneration, aiCandidateGenerationAttempt, aiInvestigation, aiInvestigationAttempt, investigation, investigationContextEntry, investigationContextEvent, repositoryBaseline } from '../../db/schema.ts';
 import { AI_LIMITS } from '../ai-investigations/types.ts';
+import { AI_CANDIDATE_GENERATION_LIMITS } from '../ai-candidate-generations/types.ts';
 import type { VigiloDatabase } from '../db/types.ts';
 import type { GitHubAppConfiguration } from '../github-app/types.ts';
 import { CONTEXT_BUDGET, ContextPolicyError, normalizeContextPath, normalizeSearchQuery, pathDenied, searchablePath, strictUtf8 } from './policy.ts';
@@ -35,6 +36,8 @@ type WorkspaceAuthority = { workspace: { id: string } };
 type AiAudit = {
   aiInvestigationId?: string;
   aiInvestigationAttemptId?: string;
+  aiCandidateGenerationId?: string;
+  aiCandidateGenerationAttemptId?: string;
   ownershipToken?: string;
 };
 
@@ -49,14 +52,31 @@ type OperationInput = {
 } & AiAudit;
 
 function hasValidAiAudit(input: AiAudit): input is Required<AiAudit> {
-  const fields = [input.aiInvestigationId, input.aiInvestigationAttemptId, input.ownershipToken];
-  if (fields.every((field) => field === undefined)) return false;
-  if (!fields.every((field) => typeof field === 'string' && UUID.test(field))) throw new InvestigationContextError('invalid_context_request');
+  const investigationFields = [input.aiInvestigationId, input.aiInvestigationAttemptId, input.ownershipToken];
+  const generationFields = [input.aiCandidateGenerationId, input.aiCandidateGenerationAttemptId, input.ownershipToken];
+  const none = [...investigationFields, input.aiCandidateGenerationId, input.aiCandidateGenerationAttemptId].every((field) => field === undefined);
+  if (none) return false;
+  const investigationAudit = investigationFields.every((field) => typeof field === 'string' && UUID.test(field)) && input.aiCandidateGenerationId === undefined && input.aiCandidateGenerationAttemptId === undefined;
+  const generationAudit = generationFields.every((field) => typeof field === 'string' && UUID.test(field)) && input.aiInvestigationId === undefined && input.aiInvestigationAttemptId === undefined;
+  if (!investigationAudit && !generationAudit) throw new InvestigationContextError('invalid_context_request');
   return true;
 }
 
 async function assertActiveAiAttempt(database: VigiloDatabase, value: typeof investigation.$inferSelect, input: AiAudit) {
   if (!hasValidAiAudit(input)) return;
+  if (input.aiCandidateGenerationId && input.aiCandidateGenerationAttemptId) {
+    const [generation] = await database.select({ id: aiCandidateGeneration.id }).from(aiCandidateGeneration).innerJoin(aiInvestigation, eq(aiInvestigation.id, aiCandidateGeneration.aiInvestigationId)).where(and(
+      eq(aiCandidateGeneration.id, input.aiCandidateGenerationId), eq(aiCandidateGeneration.investigationId, value.id), eq(aiCandidateGeneration.workspaceId, value.workspaceId), eq(aiCandidateGeneration.state, 'generating'),
+      eq(aiInvestigation.state, 'completed'), eq(aiInvestigation.conclusionStatus, 'diagnosis_found'),
+    )).limit(1);
+    if (!generation) throw new InvestigationContextError('invalid_context_request');
+    const [attempt] = await database.select({ id: aiCandidateGenerationAttempt.id }).from(aiCandidateGenerationAttempt).where(and(
+      eq(aiCandidateGenerationAttempt.id, input.aiCandidateGenerationAttemptId), eq(aiCandidateGenerationAttempt.generationId, input.aiCandidateGenerationId),
+      eq(aiCandidateGenerationAttempt.ownershipToken, input.ownershipToken!), eq(aiCandidateGenerationAttempt.state, 'active'), gt(aiCandidateGenerationAttempt.leaseExpiresAt, new Date()),
+    )).for('update').limit(1);
+    if (!attempt) throw new InvestigationContextError('invalid_context_request');
+    return;
+  }
   const [modelRun] = await database.select({ id: aiInvestigation.id }).from(aiInvestigation).where(and(
     eq(aiInvestigation.id, input.aiInvestigationId), eq(aiInvestigation.investigationId, value.id),
     eq(aiInvestigation.workspaceId, value.workspaceId), eq(aiInvestigation.state, 'investigating'),
@@ -117,9 +137,17 @@ async function reserveOperation(
       if (input.allowTruncation) reservedBytes = Math.min(reservedBytes, aiRemaining);
       else if (reservedBytes > aiRemaining) throw new InvestigationContextError('context_budget_exhausted');
     }
+    if (input.aiCandidateGenerationId) {
+      const [generationUsage] = await transaction.select({ bytes: sql<number>`coalesce(sum(${investigationContextEvent.budgetBytes}), 0)::int` })
+        .from(investigationContextEvent).where(eq(investigationContextEvent.aiCandidateGenerationId, input.aiCandidateGenerationId));
+      if (!generationUsage) throw new InvestigationContextError('context_budget_exhausted');
+      const generationRemaining = AI_CANDIDATE_GENERATION_LIMITS.maxContextResultBytes - generationUsage.bytes;
+      if (input.allowTruncation) reservedBytes = Math.min(reservedBytes, generationRemaining);
+      else if (reservedBytes > generationRemaining) throw new InvestigationContextError('context_budget_exhausted');
+    }
     if (input.budgetBytes > 0 && reservedBytes <= 0) throw new InvestigationContextError('context_budget_exhausted');
     await transaction.insert(investigationContextEvent).values({
-      id: input.id, investigationId: value.id, aiInvestigationId: input.aiInvestigationId ?? null, workspaceId: value.workspaceId, operation: input.operation,
+      id: input.id, investigationId: value.id, aiInvestigationId: input.aiInvestigationId ?? null, aiCandidateGenerationId: input.aiCandidateGenerationId ?? null, workspaceId: value.workspaceId, operation: input.operation,
       status: 'started', requestPath: input.requestPath ?? null, queryHash: input.queryHash ?? null,
       queryBytes: input.queryBytes ?? null, budgetBytes: reservedBytes, createdAt: now,
     });
@@ -175,7 +203,7 @@ async function rejectOperation(
     const [usage] = await transaction.select({ count: sql<number>`count(*)::int` }).from(investigationContextEvent).where(eq(investigationContextEvent.investigationId, value.id));
     if (!usage || usage.count >= value.maxOperations) throw new InvestigationContextError('context_budget_exhausted');
     const [inserted] = await transaction.insert(investigationContextEvent).values({
-      id: input.id, investigationId: value.id, aiInvestigationId: input.aiInvestigationId ?? null, workspaceId: value.workspaceId, operation: input.operation,
+      id: input.id, investigationId: value.id, aiInvestigationId: input.aiInvestigationId ?? null, aiCandidateGenerationId: input.aiCandidateGenerationId ?? null, workspaceId: value.workspaceId, operation: input.operation,
       status: 'rejected', requestPath: input.requestPath ?? null, queryHash: input.queryHash ?? null,
       queryBytes: input.queryBytes ?? null, budgetBytes: 0, failureCode: safeCode, createdAt: now, completedAt: now,
     }).onConflictDoNothing().returning({ id: investigationContextEvent.id });

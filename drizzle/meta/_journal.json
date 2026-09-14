@@ -92,6 +92,41 @@
       "when": 1789812000000,
       "tag": "0012_ai-investigation-rerun",
       "breakpoints": true
+    },
+    {
+      "idx": 13,
+      "version": "7",
+      "when": 1789898400000,
+      "tag": "0013_ai-candidate-generation",
+      "breakpoints": true
+    },
+    {
+      "idx": 14,
+      "version": "7",
+      "when": 1789984800000,
+      "tag": "0014_ai-candidate-generation-finalization",
+      "breakpoints": true
+    },
+    {
+      "idx": 15,
+      "version": "7",
+      "when": 1790071200000,
+      "tag": "0015_ai-candidate-generation-rerun",
+      "breakpoints": true
+    },
+    {
+      "idx": 16,
+      "version": "7",
+      "when": 1790157600000,
+      "tag": "0016_ai-candidate-generation-protocol-v2",
+      "breakpoints": true
+    },
+    {
+      "idx": 17,
+      "version": "7",
+      "when": 1790244000000,
+      "tag": "0017_ai-candidate-generation-protocol-v3",
+      "breakpoints": true
     }
   ]
 }

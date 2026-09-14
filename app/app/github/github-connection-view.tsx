@@ -2,7 +2,7 @@ import { RepairRunStatus, type RepairRunSummary } from './repair-run-status.tsx'
 import { InvestigationStatus, type InvestigationSummary } from './investigation-status.tsx';
 import { RepairCandidateStatus, type RepairCandidateSummary } from './repair-candidate-status.tsx';
 import type { CandidateVerificationSummary } from './candidate-verification-status.tsx';
-import { AiInvestigationStatus, type AiInvestigationSummary } from './ai-investigation-status.tsx';
+import { AiInvestigationStatus, type AiCandidateGenerationSummary, type AiInvestigationSummary } from './ai-investigation-status.tsx';
 
 interface InstallationSummary {
   accountLogin: string;
@@ -73,6 +73,8 @@ function npmEntrypoint(script: string): string {
 export interface GitHubConnectionViewProps {
   aiInvestigation?: AiInvestigationSummary | null;
   aiInvestigationRequestId?: string;
+  aiCandidateGeneration?: AiCandidateGenerationSummary | null;
+  aiCandidateGenerationRequestId?: string;
   baseline?: BaselineSummary | null;
   executionProfile?: ExecutionProfileSummary | null;
   installation: InstallationSummary | null;
@@ -91,6 +93,8 @@ export interface GitHubConnectionViewProps {
 export function GitHubConnectionView({
   aiInvestigation = null,
   aiInvestigationRequestId,
+  aiCandidateGeneration = null,
+  aiCandidateGenerationRequestId,
   baseline = null,
   executionProfile = null,
   installation,
@@ -198,7 +202,7 @@ export function GitHubConnectionView({
                       </form>
                     )}
                     {investigation && <InvestigationStatus initialInvestigation={investigation} />}
-                    {investigation?.state === 'ready' && aiInvestigationRequestId && <AiInvestigationStatus investigationId={investigation.id} initialAiInvestigation={aiInvestigation} startRequestId={aiInvestigationRequestId} />}
+                    {investigation?.state === 'ready' && aiInvestigationRequestId && aiCandidateGenerationRequestId && <AiInvestigationStatus investigationId={investigation.id} initialAiInvestigation={aiInvestigation} startRequestId={aiInvestigationRequestId} initialAiCandidateGeneration={aiCandidateGeneration} candidateGenerationRequestId={aiCandidateGenerationRequestId} />}
                     {investigation?.state === 'ready' && <RepairCandidateStatus candidate={repairCandidate} verification={candidateVerification} />}
                     {baseline && (
                       <section className="repository-panel" aria-labelledby="baseline-title">

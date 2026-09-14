@@ -68,6 +68,7 @@ export interface InvestigationModelProvider {
   createSession(input: {
     instructions: string;
     initialInput: string;
+    finalizationInput?: string;
     tools: readonly ModelToolDefinition[];
     conclusionSchema: Record<string, unknown>;
     maxOutputTokens: number;

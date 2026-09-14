@@ -108,7 +108,7 @@ export class GeminiInvestigationProvider implements InvestigationModelProvider {
           if (!name) throw new Error('model_protocol_error');
           history.push({ type: 'function_result', call_id: output.callId, name, result: [{ type: 'text', text: output.output }] });
         }
-        if (finalization) history.push({ type: 'user_input', content: [{ type: 'text', text: FINALIZATION_INPUT }] });
+        if (finalization) history.push({ type: 'user_input', content: [{ type: 'text', text: configuration.finalizationInput ?? FINALIZATION_INPUT }] });
 
         let response: Interactions.Interaction;
         try {

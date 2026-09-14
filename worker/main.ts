@@ -7,6 +7,7 @@ import { GitHubApiClient } from '../lib/github-app/client.ts';
 import { readGitHubAppEnvironment, readGitHubAppPrivateKey } from '../lib/github-app/environment.ts';
 import {
   createRepairBoss,
+  AI_CANDIDATE_GENERATION_QUEUE,
   AI_INVESTIGATION_QUEUE,
   CANDIDATE_VERIFICATION_QUEUE,
   INVESTIGATION_CONTEXT_QUEUE,
@@ -23,6 +24,8 @@ import { processCandidateVerificationJob } from '../lib/candidate-verifications/
 import { aiInvestigation } from '../db/schema.ts';
 import { GeminiInvestigationProvider, readModelApiKey } from '../lib/ai-investigations/gemini-provider.ts';
 import { processAiInvestigationJob } from '../lib/ai-investigations/worker.ts';
+import { aiCandidateGeneration } from '../db/schema.ts';
+import { processAiCandidateGenerationJob } from '../lib/ai-candidate-generations/worker.ts';
 
 async function main(): Promise<void> {
   const environment = readServerEnvironment();
@@ -57,6 +60,11 @@ async function main(): Promise<void> {
     const activeAiInvestigations = await database.select({ id: aiInvestigation.id }).from(aiInvestigation).where(inArray(aiInvestigation.state, ['created', 'queued', 'investigating']));
     for (const value of activeAiInvestigations) {
       try { await boss.retry(AI_INVESTIGATION_QUEUE, value.id); }
+      catch { /* A non-failed canonical job remains owned by pg-boss. */ }
+    }
+    const activeAiCandidateGenerations = await database.select({ id: aiCandidateGeneration.id }).from(aiCandidateGeneration).where(inArray(aiCandidateGeneration.state, ['created', 'queued', 'generating']));
+    for (const value of activeAiCandidateGenerations) {
+      try { await boss.retry(AI_CANDIDATE_GENERATION_QUEUE, value.id); }
       catch { /* A non-failed canonical job remains owned by pg-boss. */ }
     }
 
@@ -97,6 +105,12 @@ async function main(): Promise<void> {
       catch { return [{ id: job.id, status: 'failed' as const, output: { code: 'ai_investigation_worker_failed' } }]; }
     });
     workerIds.push({ id: aiWorkerId, queue: AI_INVESTIGATION_QUEUE });
+    const aiCandidateGenerationWorkerId = await boss.work<unknown, { code?: string }, typeof workOptions>(AI_CANDIDATE_GENERATION_QUEUE, workOptions, async (jobs) => {
+      const job = jobs[0]; if (!job) return [];
+      try { return [await processAiCandidateGenerationJob(job, { configuration, database, gateway, shutdownSignal: shutdown.signal, createProvider: () => new GeminiInvestigationProvider(readModelApiKey()) })]; }
+      catch { return [{ id: job.id, status: 'failed' as const, output: { code: 'ai_candidate_generation_worker_failed' } }]; }
+    });
+    workerIds.push({ id: aiCandidateGenerationWorkerId, queue: AI_CANDIDATE_GENERATION_QUEUE });
 
     await new Promise<void>((resolve) => {
       const stop = () => resolve();
