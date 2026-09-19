@@ -27,7 +27,7 @@ const label = (value: string | null) => value ? value.replaceAll('_', ' ') : 'Pe
 const artifactLabel = (value: CandidateVerificationSummary['artifactIntegrity']) => value === 'valid' ? 'Passed' : value === 'invalid' ? 'Failed' : 'Pending';
 const checksLabel = (value: CandidateVerificationSummary['regressionChecks']) => value === 'checks_passed' ? 'Passed' : value === 'checks_failed' ? 'Failed' : label(value);
 
-export function CandidateVerificationStatus({ initialVerification }: { initialVerification: CandidateVerificationSummary }) {
+export function CandidateVerificationStatus({ initialVerification, allowReverify = true }: { initialVerification: CandidateVerificationSummary; allowReverify?: boolean }) {
   const [verification, setVerification] = useState(initialVerification);
   useEffect(() => {
     if (!active.has(verification.state)) return;
@@ -61,7 +61,7 @@ export function CandidateVerificationStatus({ initialVerification }: { initialVe
         <div><dt>Cleanup</dt><dd>{label(verification.cleanup)}</dd></div>
       </dl>
       {verification.failureCode && <div className="repository-notice" role="status">Verification stopped safely: {verification.failureCode}</div>}
-      {!active.has(verification.state) && (
+      {allowReverify && !active.has(verification.state) && (
         <form action="/api/candidate-verifications" method="post">
           <input type="hidden" name="candidateId" value={verification.candidateId} />
           <input type="hidden" name="intent" value="reverify" />

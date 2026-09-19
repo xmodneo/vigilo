@@ -11,8 +11,12 @@ import {
   AI_INVESTIGATION_QUEUE,
   CANDIDATE_VERIFICATION_QUEUE,
   INVESTIGATION_CONTEXT_QUEUE,
+  REPAIR_LOOP_QUEUE,
   REPAIR_BASELINE_QUEUE,
   REPAIR_WORK_OPTIONS,
+  PgBossAiCandidateGenerationQueue,
+  PgBossCandidateVerificationQueue,
+  PgBossRepairLoopQueue,
 } from '../lib/repair-runs/queue.ts';
 import { createConsoleWorkerLogger, processRepairJob } from '../lib/repair-runs/worker.ts';
 import { repairRun } from '../db/schema.ts';
@@ -26,6 +30,8 @@ import { GeminiInvestigationProvider, readModelApiKey } from '../lib/ai-investig
 import { processAiInvestigationJob } from '../lib/ai-investigations/worker.ts';
 import { aiCandidateGeneration } from '../db/schema.ts';
 import { processAiCandidateGenerationJob } from '../lib/ai-candidate-generations/worker.ts';
+import { repairLoop } from '../db/schema.ts';
+import { processRepairLoopJob } from '../lib/repair-loops/worker.ts';
 
 async function main(): Promise<void> {
   const environment = readServerEnvironment();
@@ -66,6 +72,12 @@ async function main(): Promise<void> {
     for (const value of activeAiCandidateGenerations) {
       try { await boss.retry(AI_CANDIDATE_GENERATION_QUEUE, value.id); }
       catch { /* A non-failed canonical job remains owned by pg-boss. */ }
+    }
+    const activeRepairLoops = await database.select({ wakeJobId: repairLoop.wakeJobId }).from(repairLoop).where(inArray(repairLoop.state, ['queued', 'running']));
+    for (const value of activeRepairLoops) {
+      if (!value.wakeJobId) continue;
+      try { await boss.retry(REPAIR_LOOP_QUEUE, value.wakeJobId); }
+      catch { /* A non-failed fenced wake remains owned by pg-boss. */ }
     }
 
     const workOptions = { ...REPAIR_WORK_OPTIONS, perJobResults: true as const };
@@ -111,6 +123,20 @@ async function main(): Promise<void> {
       catch { return [{ id: job.id, status: 'failed' as const, output: { code: 'ai_candidate_generation_worker_failed' } }]; }
     });
     workerIds.push({ id: aiCandidateGenerationWorkerId, queue: AI_CANDIDATE_GENERATION_QUEUE });
+    const loopQueue = new PgBossRepairLoopQueue(boss);
+    const generationQueue = new PgBossAiCandidateGenerationQueue(boss);
+    const verificationQueue = new PgBossCandidateVerificationQueue(boss);
+    const repairLoopWorkerId = await boss.work<unknown, { code?: string }, typeof workOptions>(REPAIR_LOOP_QUEUE, workOptions, async (jobs) => {
+      const job = jobs[0]; if (!job) return [];
+      try {
+        return [await processRepairLoopJob(job, { database, queues: {
+          enqueueRepairLoop: loopQueue.enqueueRepairLoop.bind(loopQueue),
+          enqueueAiCandidateGeneration: generationQueue.enqueueAiCandidateGeneration.bind(generationQueue),
+          enqueueVerification: verificationQueue.enqueueVerification.bind(verificationQueue),
+        } })];
+      } catch { return [{ id: job.id, status: 'failed' as const, output: { code: 'repair_loop_worker_failed' } }]; }
+    });
+    workerIds.push({ id: repairLoopWorkerId, queue: REPAIR_LOOP_QUEUE });
 
     await new Promise<void>((resolve) => {
       const stop = () => resolve();

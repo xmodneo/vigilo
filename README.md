@@ -128,6 +128,45 @@ consumers may trust it. The web UI shows read-only candidate metadata; there is
 no browser source-edit endpoint. Freezing does not run npm, tests, builds,
 sandboxes, or models and does not claim that a candidate repairs the problem.
 
+## Bounded autonomous repair loop
+
+Task 4.3 adds a durable RepairLoop that can coordinate at most two candidate
+generation and fresh verification iterations. Every iteration remains bound to
+the original workspace, repository, installation, commit, execution profile,
+baseline, Investigation, and AiInvestigation. A candidate can be selected only
+from exact, newly persisted verification evidence for that candidate; evidence
+from another candidate or historical run is never interchangeable. Database
+constraints and authority triggers enforce provenance, legal state transitions,
+terminal immutability, and the two-iteration ceiling across retries and worker
+restarts.
+
+The deterministic implementation and final security/concurrency review are
+complete. Six Important review findings were corrected with regression coverage.
+Historical migration SQL was restored to its originally applied bytes, the
+forward-only `0018_historical-schema-reconciliation.sql` reconciles documented
+historical schema states, and `0019_repair-loop.sql` installs the RepairLoop
+schema and authority guards. Both persistent migrations were applied
+successfully to the verified local development database without changing the
+identities or counts of historical application records.
+
+Task 4.3 live acceptance is pending. Existing RepairRuns have no trustworthy,
+measurable failing required baseline phase, and the closest controlled run can
+only reach `review_required`; it cannot prove `verified`. Deterministic tests are
+not live verification. The following live behaviors therefore remain unproven:
+
+- Real protocol-v4 generation followed by a fresh verification.
+- Real sandbox evidence reconciliation.
+- Live verified recovery.
+- A live second repair iteration.
+- Real-provider crash/restart recovery.
+
+Future live acceptance requires a genuine controlled RepairRun with a
+trustworthy, measurable failing required baseline phase; an enforced execution
+budget that covers SDK-internal retries; confirmed zero-cost execution or
+separately approved bounded financial exposure; and explicit approval before
+any Gemini, GitHub source, or Vercel Sandbox operation. No RepairLoop was started
+during Task 4.3 review or planning.
+
 ## Web/API shell
 
 Install the pinned dependencies and start local development:

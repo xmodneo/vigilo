@@ -24,6 +24,7 @@
     "test:auth": "node -e \"require('node:fs').rmSync('.auth-test-dist',{recursive:true,force:true})\" && tsc -p tsconfig.auth-test.json && node --test .auth-test-dist/auth-test/*.test.js",
     "test:queue-postgres": "node --env-file-if-exists=.env.local --import tsx integration-test/repair-queue-postgres.ts",
     "test:migrations-postgres": "node --env-file-if-exists=.env.local --import tsx integration-test/clean-migration-postgres.ts",
+    "test:migration-reconciliation-postgres": "node --env-file-if-exists=.env.local --import tsx integration-test/migration-reconciliation-postgres.ts",
     "worker:dev": "node --env-file-if-exists=.env.local --import tsx worker/main.ts",
     "worker:build": "node -e \"require('node:fs').rmSync('.worker-dist',{recursive:true,force:true})\" && tsc -p tsconfig.worker.json",
     "worker:start": "node --env-file-if-exists=.env.local .worker-dist/worker/main.js",

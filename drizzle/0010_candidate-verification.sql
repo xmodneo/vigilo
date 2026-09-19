@@ -1,6 +1,6 @@
 CREATE TABLE "candidate_verification" (
 	"id" text PRIMARY KEY NOT NULL,
-	"candidate_id" text NOT NULL,
+	"candidate_id" text NOT NULL UNIQUE,
 	"investigation_id" text NOT NULL,
 	"repair_run_id" text NOT NULL,
 	"baseline_id" text NOT NULL,

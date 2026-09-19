@@ -23,6 +23,8 @@ import { getAiInvestigationForContext } from '../../../lib/ai-investigations/ser
 import { publicAiInvestigation } from '../../../lib/ai-investigations/handlers';
 import { getAiCandidateGenerationForContext } from '../../../lib/ai-candidate-generations/server';
 import { publicAiCandidateGeneration } from '../../../lib/ai-candidate-generations/handlers';
+import { getRepairLoopForContext } from '../../../lib/repair-loops/server';
+import { publicRepairLoop } from '../../../lib/repair-loops/handlers';
 import { GitHubConnectionView } from './github-connection-view';
 
 export default async function GitHubConnectionPage() {
@@ -44,6 +46,7 @@ export default async function GitHubConnectionPage() {
     let candidateVerification = undefined;
     let aiInvestigation = undefined;
     let aiCandidateGeneration = undefined;
+    let repairLoop = undefined;
     if (installation) {
       try {
         const overview = await getRepositoryOverviewForContext(context);
@@ -80,6 +83,9 @@ export default async function GitHubConnectionPage() {
         candidateVerification = repairCandidate
           ? publicCandidateVerification(await getCandidateVerificationForContext(context, repairCandidate.id))
           : null;
+        repairLoop = repairRun
+          ? publicRepairLoop(await getRepairLoopForContext(context, repairRun.id))
+          : null;
       } catch {
         repositoryError = 'unavailable';
       }
@@ -90,12 +96,14 @@ export default async function GitHubConnectionPage() {
         installation={installation}
         aiInvestigationRequestId={randomUUID()}
         aiCandidateGenerationRequestId={randomUUID()}
+        repairLoopRequestId={randomUUID()}
         investigationRequestId={randomUUID()}
         {...(investigation !== undefined ? { investigation } : {})}
         {...(repairCandidate !== undefined ? { repairCandidate } : {})}
         {...(candidateVerification !== undefined ? { candidateVerification } : {})}
         {...(aiInvestigation !== undefined ? { aiInvestigation } : {})}
         {...(aiCandidateGeneration !== undefined ? { aiCandidateGeneration } : {})}
+        {...(repairLoop !== undefined ? { repairLoop } : {})}
         {...(baseline !== undefined ? { baseline } : {})}
         {...(executionProfile !== undefined ? { executionProfile } : {})}
         {...(repositories ? { repositories } : {})}

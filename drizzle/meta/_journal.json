@@ -127,6 +127,20 @@
       "when": 1790244000000,
       "tag": "0017_ai-candidate-generation-protocol-v3",
       "breakpoints": true
+    },
+    {
+      "idx": 18,
+      "version": "7",
+      "when": 1790330400000,
+      "tag": "0018_historical-schema-reconciliation",
+      "breakpoints": true
+    },
+    {
+      "idx": 19,
+      "version": "7",
+      "when": 1790416800000,
+      "tag": "0019_repair-loop",
+      "breakpoints": true
     }
   ]
 }

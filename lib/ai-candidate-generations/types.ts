@@ -1,6 +1,7 @@
 import type { CandidateOperation } from '../repair-candidates/types.ts';
 
 export const AI_CANDIDATE_GENERATION_PROTOCOL_VERSION = 3 as const;
+export const REPAIR_LOOP_AI_CANDIDATE_GENERATION_PROTOCOL_VERSION = 4 as const;
 export const AI_CANDIDATE_GENERATION_LIMITS = Object.freeze({
   maxModelTurns: 7,
   maxToolBearingTurns: 5,

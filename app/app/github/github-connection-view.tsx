@@ -3,6 +3,7 @@ import { InvestigationStatus, type InvestigationSummary } from './investigation-
 import { RepairCandidateStatus, type RepairCandidateSummary } from './repair-candidate-status.tsx';
 import type { CandidateVerificationSummary } from './candidate-verification-status.tsx';
 import { AiInvestigationStatus, type AiCandidateGenerationSummary, type AiInvestigationSummary } from './ai-investigation-status.tsx';
+import { RepairLoopStatus, type RepairLoopSummary } from './repair-loop-status.tsx';
 
 interface InstallationSummary {
   accountLogin: string;
@@ -85,6 +86,8 @@ export interface GitHubConnectionViewProps {
   repositories?: RepositorySummary[];
   repairRequestId: string;
   repairRun?: RepairRunSummary | null;
+  repairLoop?: RepairLoopSummary | null;
+  repairLoopRequestId?: string;
   repositoryError?: 'unavailable';
   selectedRepository?: RepositorySummary | null;
   workspaceId: string;
@@ -105,10 +108,13 @@ export function GitHubConnectionView({
   repositories,
   repairRequestId,
   repairRun = null,
+  repairLoop = null,
+  repairLoopRequestId,
   repositoryError,
   selectedRepository = null,
   workspaceId,
 }: GitHubConnectionViewProps) {
+  const repairLoopActive = repairLoop?.state === 'queued' || repairLoop?.state === 'running';
   return (
     <main className="workspace-shell">
       <header className="workspace-header">
@@ -202,8 +208,16 @@ export function GitHubConnectionView({
                       </form>
                     )}
                     {investigation && <InvestigationStatus initialInvestigation={investigation} />}
-                    {investigation?.state === 'ready' && aiInvestigationRequestId && aiCandidateGenerationRequestId && <AiInvestigationStatus investigationId={investigation.id} initialAiInvestigation={aiInvestigation} startRequestId={aiInvestigationRequestId} initialAiCandidateGeneration={aiCandidateGeneration} candidateGenerationRequestId={aiCandidateGenerationRequestId} />}
-                    {investigation?.state === 'ready' && <RepairCandidateStatus candidate={repairCandidate} verification={candidateVerification} />}
+                    {investigation?.state === 'ready' && aiInvestigationRequestId && aiCandidateGenerationRequestId && <AiInvestigationStatus investigationId={investigation.id} initialAiInvestigation={aiInvestigation} startRequestId={aiInvestigationRequestId} initialAiCandidateGeneration={aiCandidateGeneration} candidateGenerationRequestId={aiCandidateGenerationRequestId} suppressCandidateActions={repairLoopActive} />}
+                    {aiInvestigation?.state === 'completed' && aiInvestigation.conclusion?.status === 'diagnosis_found' && repairRun && repairLoopRequestId && !repairLoop && (
+                      <form action="/api/repair-loops" method="post">
+                        <input type="hidden" name="repairRunId" value={repairRun.id} />
+                        <input type="hidden" name="idempotencyKey" value={repairLoopRequestId} />
+                        <button className="primary-action" type="submit">Start bounded repair loop</button>
+                      </form>
+                    )}
+                    {repairLoop && <RepairLoopStatus initialLoop={repairLoop} />}
+                    {investigation?.state === 'ready' && <RepairCandidateStatus candidate={repairCandidate} verification={candidateVerification} workflowOwned={repairLoopActive} />}
                     {baseline && (
                       <section className="repository-panel" aria-labelledby="baseline-title">
                         <p className="eyebrow">Execution evidence</p>

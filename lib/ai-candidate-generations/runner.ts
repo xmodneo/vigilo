@@ -2,15 +2,16 @@ import { randomUUID } from 'node:crypto';
 
 import { and, eq, gt } from 'drizzle-orm';
 
-import { aiCandidateGeneration, aiCandidateGenerationAttempt, aiInvestigation, executionProfile, investigation, investigationContextEvent, repairIntent, repositoryBaseline } from '../../db/schema.ts';
+import { aiCandidateGeneration, aiCandidateGenerationAttempt, aiInvestigation, candidateVerification, candidateVerificationEvidence, executionProfile, investigation, investigationContextEvent, repairCandidate, repairCandidateFile, repairIntent, repairLoopIteration, repositoryBaseline } from '../../db/schema.ts';
 import type { InvestigationModelProvider, ModelProviderFailureCode, ToolName } from '../ai-investigations/types.ts';
 import { ModelProviderError } from '../ai-investigations/types.ts';
 import type { VigiloDatabase } from '../db/types.ts';
 import type { GitHubAppConfiguration } from '../github-app/types.ts';
 import { InvestigationContextError, listPaths, readBaselineSummary, readTextFile, searchText } from '../investigations/context.ts';
 import type { InvestigationSourceGateway } from '../investigations/types.ts';
-import { AI_CANDIDATE_GENERATION_LIMITS, AI_CANDIDATE_GENERATION_PROTOCOL_VERSION, type AiCandidateGenerationModelResult } from './types.ts';
+import { AI_CANDIDATE_GENERATION_LIMITS, AI_CANDIDATE_GENERATION_PROTOCOL_VERSION, REPAIR_LOOP_AI_CANDIDATE_GENERATION_PROTOCOL_VERSION, type AiCandidateGenerationModelResult } from './types.ts';
 import { AI_CANDIDATE_PROPOSAL_FINALIZATION_INPUT, AI_CANDIDATE_PROPOSAL_INSTRUCTIONS, AI_CANDIDATE_PROPOSAL_PROVIDER_SCHEMA, AI_CANDIDATE_PROPOSAL_TOOLS, AiCandidateProposalValidationError, aiCandidateProposalToolOutput, buildAiCandidateProposalInput, parseAiCandidateProposal } from './protocol.ts';
+import { buildRepairLoopFeedback, validateStoredRepairLoopFeedback } from '../repair-loops/feedback.ts';
 
 export type AiCandidateGenerationErrorCode = 'candidate_generation_authority_mismatch' | 'candidate_generation_ownership_lost' | 'invalid_model_proposal' | 'schema_mismatch' | 'invalid_operation_shape' | 'invalid_path' | 'proposal_limit_exceeded' | 'fresh_observation_missing' | 'model_limit_exceeded' | 'model_protocol_error' | 'model_timeout' | 'unread_existing_file' | 'model_provider_mismatch' | 'model_provider_failed' | 'context_source_unavailable' | ModelProviderFailureCode;
 
@@ -41,13 +42,71 @@ export async function runAiCandidateGeneration(database: VigiloDatabase, gateway
   const [authority] = await database.select({ generation: aiCandidateGeneration, source: aiInvestigation, parent: investigation, intent: repairIntent, profile: executionProfile, baseline: repositoryBaseline })
     .from(aiCandidateGeneration).innerJoin(aiInvestigation, eq(aiInvestigation.id, aiCandidateGeneration.aiInvestigationId)).innerJoin(investigation, eq(investigation.id, aiCandidateGeneration.investigationId)).innerJoin(repairIntent, eq(repairIntent.id, investigation.repairIntentId)).innerJoin(executionProfile, and(eq(executionProfile.githubRepositoryId, investigation.githubRepositoryId), eq(executionProfile.workspaceId, investigation.workspaceId))).innerJoin(repositoryBaseline, eq(repositoryBaseline.id, investigation.baselineId))
     .where(and(eq(aiCandidateGeneration.id, input.generationId), eq(aiCandidateGeneration.workspaceId, input.workspaceId))).limit(1);
-  if (!authority || authority.generation.protocolVersion !== AI_CANDIDATE_GENERATION_PROTOCOL_VERSION || authority.generation.aiInvestigationId !== input.aiInvestigationId || authority.generation.investigationId !== input.investigationId || authority.generation.baseCommitSha !== input.baseCommitSha || authority.generation.profileIdentity !== input.profileIdentity || authority.generation.baselineId !== input.baselineId || authority.generation.state !== 'generating' || authority.source.state !== 'completed' || authority.source.conclusionStatus !== 'diagnosis_found' || authority.parent.state !== 'ready' || authority.profile.status !== 'ready' || authority.parent.baseCommitSha !== input.baseCommitSha || authority.profile.baseCommitSha !== input.baseCommitSha || authority.baseline.baseCommitSha !== input.baseCommitSha || authority.parent.profileIdentity !== input.profileIdentity || authority.profile.profileIdentity !== input.profileIdentity || authority.baseline.profileIdentity !== input.profileIdentity) throw new AiCandidateGenerationError('candidate_generation_authority_mismatch');
+  if (!authority || ![AI_CANDIDATE_GENERATION_PROTOCOL_VERSION, REPAIR_LOOP_AI_CANDIDATE_GENERATION_PROTOCOL_VERSION].includes(authority.generation.protocolVersion as 3 | 4) || authority.generation.aiInvestigationId !== input.aiInvestigationId || authority.generation.investigationId !== input.investigationId || authority.generation.baseCommitSha !== input.baseCommitSha || authority.generation.profileIdentity !== input.profileIdentity || authority.generation.baselineId !== input.baselineId || authority.generation.state !== 'generating' || authority.source.state !== 'completed' || authority.source.conclusionStatus !== 'diagnosis_found' || authority.parent.state !== 'ready' || authority.profile.status !== 'ready' || authority.parent.baseCommitSha !== input.baseCommitSha || authority.profile.baseCommitSha !== input.baseCommitSha || authority.baseline.baseCommitSha !== input.baseCommitSha || authority.parent.profileIdentity !== input.profileIdentity || authority.profile.profileIdentity !== input.profileIdentity || authority.baseline.profileIdentity !== input.profileIdentity) throw new AiCandidateGenerationError('candidate_generation_authority_mismatch');
+
+  let verificationFeedback: unknown;
+  if (authority.generation.protocolVersion === REPAIR_LOOP_AI_CANDIDATE_GENERATION_PROTOCOL_VERSION) {
+    const [iteration] = await database.select().from(repairLoopIteration).where(eq(repairLoopIteration.aiCandidateGenerationId, input.generationId)).limit(1);
+    if (!iteration) throw new AiCandidateGenerationError('candidate_generation_authority_mismatch');
+    if (iteration.ordinal === 2) {
+      try {
+        const stored = validateStoredRepairLoopFeedback(iteration.feedbackSnapshot, iteration.feedbackHash, iteration.feedbackBytes);
+        const [predecessor] = await database.select({
+          iteration: repairLoopIteration,
+          generation: aiCandidateGeneration,
+          candidate: repairCandidate,
+          verification: candidateVerification,
+          evidence: candidateVerificationEvidence,
+        }).from(repairLoopIteration)
+          .innerJoin(aiCandidateGeneration, eq(aiCandidateGeneration.id, repairLoopIteration.aiCandidateGenerationId))
+          .innerJoin(repairCandidate, eq(repairCandidate.id, aiCandidateGeneration.repairCandidateId))
+          .innerJoin(candidateVerification, eq(candidateVerification.id, repairLoopIteration.candidateVerificationId))
+          .innerJoin(candidateVerificationEvidence, eq(candidateVerificationEvidence.id, candidateVerification.evidenceId))
+          .where(eq(repairLoopIteration.id, iteration.previousIterationId!)).limit(1);
+        if (!predecessor || predecessor.iteration.repairLoopId !== iteration.repairLoopId || predecessor.iteration.ordinal !== 1 ||
+            predecessor.iteration.decision !== 'repairable_failure' || predecessor.iteration.objectiveEvidence === null ||
+            predecessor.candidate.candidateIdentity === null || iteration.feedbackVerificationId !== predecessor.verification.id ||
+            iteration.feedbackEvidenceId !== predecessor.evidence.id) throw new Error('repair_loop_feedback_invalid');
+        const files = await database.select({ path: repairCandidateFile.path, operation: repairCandidateFile.operation }).from(repairCandidateFile).where(eq(repairCandidateFile.candidateId, predecessor.candidate.id));
+        const expected = buildRepairLoopFeedback({
+          version: 1,
+          provenance: {
+            previousIterationId: predecessor.iteration.id,
+            generationId: predecessor.generation.id,
+            candidateId: predecessor.candidate.id,
+            candidateIdentity: predecessor.candidate.candidateIdentity,
+            verificationId: predecessor.verification.id,
+            evidenceId: predecessor.evidence.id,
+          },
+          previousCandidate: { files: files.map((file) => ({ path: file.path, operation: file.operation as 'add' | 'modify' | 'delete' })) },
+          verification: {
+            contract: predecessor.verification.verificationContract!,
+            baselineComparison: predecessor.verification.baselineComparison!,
+            objectiveEvidence: predecessor.iteration.objectiveEvidence as 'satisfied' | 'failed' | 'not_measured',
+            phases: {
+              install: { status: predecessor.evidence.installStatus, exitCode: predecessor.evidence.installExitCode, timedOut: predecessor.evidence.installTimedOut },
+              typecheck: { status: predecessor.evidence.typecheckStatus, exitCode: predecessor.evidence.typecheckExitCode, timedOut: predecessor.evidence.typecheckTimedOut },
+              build: { status: predecessor.evidence.buildStatus, exitCode: predecessor.evidence.buildExitCode, timedOut: predecessor.evidence.buildTimedOut },
+              test: { status: predecessor.evidence.testStatus, exitCode: predecessor.evidence.testExitCode, timedOut: predecessor.evidence.testTimedOut },
+            },
+            safeFailure: { phase: predecessor.evidence.errorPhase, code: predecessor.evidence.errorCode },
+          },
+          priorDiagnosis: { summary: authority.source.summary!, proposedApproach: authority.source.proposedApproach!, confidence: authority.source.confidence! },
+          boundaries: { repositoryValues: 'UNTRUSTED_REPOSITORY_DATA', modelValues: 'UNTRUSTED_MODEL_DATA', completeReplacementAgainstOriginalBase: true },
+        });
+        if (expected.hash !== iteration.feedbackHash || expected.bytes !== iteration.feedbackBytes) throw new Error('repair_loop_feedback_invalid');
+        verificationFeedback = stored;
+      } catch { throw new AiCandidateGenerationError('candidate_generation_authority_mismatch'); }
+    } else if (iteration.ordinal !== 1 || iteration.feedbackSnapshot !== null || iteration.feedbackHash !== null || iteration.feedbackBytes !== null) {
+      throw new AiCandidateGenerationError('candidate_generation_authority_mismatch');
+    }
+  }
 
   const conclusion = { status: authority.source.conclusionStatus, summary: authority.source.summary, suspectedFiles: authority.source.suspectedFiles, evidence: authority.source.evidenceReferences, proposedApproach: authority.source.proposedApproach, confidence: authority.source.confidence };
   const controller = new AbortController(); const timeout = setTimeout(() => controller.abort('model_timeout'), options.timeoutMs ?? AI_CANDIDATE_GENERATION_LIMITS.timeoutMs); const externalAbort = () => controller.abort(options.signal?.reason); options.signal?.addEventListener('abort', externalAbort, { once: true });
   const session = provider.createSession({
     instructions: AI_CANDIDATE_PROPOSAL_INSTRUCTIONS,
-    initialInput: buildAiCandidateProposalInput({ objective: authority.intent.objective, conclusion, baseCommitSha: input.baseCommitSha, profile: { runtimeFamily: authority.profile.runtimeFamily, nodeMajor: authority.profile.nodeMajor, packageManager: authority.profile.packageManager, testRunner: authority.profile.testRunner, commands: [authority.profile.installOperation, authority.profile.typecheckScript, authority.profile.buildScript, authority.profile.testScript].filter(Boolean) }, baseline: { id: authority.baseline.id, executionOutcome: authority.baseline.executionOutcome, overallOutcome: authority.baseline.overallOutcome }, context: { maxOperations: authority.parent.maxOperations, maxCumulativeBytes: authority.parent.maxCumulativeBytes, maxGenerationContextBytes: AI_CANDIDATE_GENERATION_LIMITS.maxContextResultBytes } }),
+    initialInput: buildAiCandidateProposalInput({ objective: authority.intent.objective, conclusion, baseCommitSha: input.baseCommitSha, profile: { runtimeFamily: authority.profile.runtimeFamily, nodeMajor: authority.profile.nodeMajor, packageManager: authority.profile.packageManager, testRunner: authority.profile.testRunner, commands: [authority.profile.installOperation, authority.profile.typecheckScript, authority.profile.buildScript, authority.profile.testScript].filter(Boolean) }, baseline: { id: authority.baseline.id, executionOutcome: authority.baseline.executionOutcome, overallOutcome: authority.baseline.overallOutcome }, context: { maxOperations: authority.parent.maxOperations, maxCumulativeBytes: authority.parent.maxCumulativeBytes, maxGenerationContextBytes: AI_CANDIDATE_GENERATION_LIMITS.maxContextResultBytes }, protocolVersion: authority.generation.protocolVersion as 3 | 4, ...(verificationFeedback === undefined ? {} : { verificationFeedback }) }),
     finalizationInput: AI_CANDIDATE_PROPOSAL_FINALIZATION_INPUT,
     tools: AI_CANDIDATE_PROPOSAL_TOOLS, conclusionSchema: AI_CANDIDATE_PROPOSAL_PROVIDER_SCHEMA, maxOutputTokens: AI_CANDIDATE_GENERATION_LIMITS.maxOutputTokens,
   });

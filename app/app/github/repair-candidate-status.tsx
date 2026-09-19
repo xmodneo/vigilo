@@ -13,7 +13,7 @@ export interface RepairCandidateSummary {
   completedAt: string | null;
 }
 
-export function RepairCandidateStatus({ candidate, verification }: { candidate: RepairCandidateSummary | null; verification?: CandidateVerificationSummary | null }) {
+export function RepairCandidateStatus({ candidate, verification, workflowOwned = false }: { candidate: RepairCandidateSummary | null; verification?: CandidateVerificationSummary | null; workflowOwned?: boolean }) {
   return (
     <section className="repository-panel" aria-labelledby="repair-candidate-title">
       <p className="eyebrow">Exact changed-file artifact</p>
@@ -26,13 +26,13 @@ export function RepairCandidateStatus({ candidate, verification }: { candidate: 
           <div><dt>Candidate</dt><dd><code>{candidate.candidateIdentity?.slice(0, 12) ?? 'Unavailable'}</code></dd></div>
         </dl>
       )}
-      {candidate?.state === 'frozen' && !verification && (
+      {!workflowOwned && candidate?.state === 'frozen' && !verification && (
         <form action="/api/candidate-verifications" method="post">
           <input type="hidden" name="candidateId" value={candidate.id} />
           <button className="primary-action" type="submit">Verify candidate</button>
         </form>
       )}
-      {verification && <CandidateVerificationStatus initialVerification={verification} />}
+      {verification && <CandidateVerificationStatus initialVerification={verification} allowReverify={!workflowOwned} />}
     </section>
   );
 }

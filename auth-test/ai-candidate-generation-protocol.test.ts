@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 import test from 'node:test';
 
 import { GeminiInvestigationProvider } from '../lib/ai-investigations/gemini-provider.ts';
-import { parseAiCandidateGenerationJobPayload } from '../lib/repair-runs/queue.ts';
+import { parseAiCandidateGenerationJobPayload, parseRepairLoopJobPayload } from '../lib/repair-runs/queue.ts';
 import { AI_CANDIDATE_PROPOSAL_FINALIZATION_INPUT, AI_CANDIDATE_PROPOSAL_INSTRUCTIONS, AI_CANDIDATE_PROPOSAL_PROVIDER_SCHEMA, AI_CANDIDATE_PROPOSAL_SCHEMA, AI_CANDIDATE_PROPOSAL_TOOLS, AiCandidateProposalValidationError, buildAiCandidateProposalInput, parseAiCandidateProposal } from '../lib/ai-candidate-generations/protocol.ts';
 import { collectGeminiResponseSchemaKeywords, unsupportedGeminiResponseSchemaKeywords } from '../lib/ai-candidate-generations/gemini-schema.ts';
 import { AI_CANDIDATE_GENERATION_LIMITS } from '../lib/ai-candidate-generations/types.ts';
@@ -87,4 +87,13 @@ test('candidate generation reserves a tool-free proposal finalization request', 
   assert.equal(AI_CANDIDATE_GENERATION_LIMITS.maxToolBearingTurns, 5);
   assert.equal(AI_CANDIDATE_GENERATION_LIMITS.reservedFinalizationTurns, 1);
   for (const requirement of [/No tools/i, /only one JSON object/i, /No Markdown/i, /code fences/i, /explanation/i, /proposal_ready/i, /insufficient_evidence/i, /files:\[\]/i, /IDs or hashes/i, /read in this generation/i]) assert.match(AI_CANDIDATE_PROPOSAL_FINALIZATION_INPUT, requirement);
+});
+
+test('protocol v4 adds only bounded untrusted verification feedback and keeps all Task 4.2 limits', () => {
+  const feedback = { version: 1, provenance: { previousIterationId: randomUUID() }, previousCandidate: { files: [{ path: 'src/fix.ts', operation: 'modify' }] } };
+  const parsed = JSON.parse(buildAiCandidateProposalInput({ objective: 'repair', conclusion: {}, baseCommitSha: 'a'.repeat(40), profile: {}, baseline: {}, context: {}, protocolVersion: 4, verificationFeedback: feedback })) as Record<string, unknown>;
+  assert.equal(parsed.protocol, 4); assert.deepEqual(parsed.untrustedVerificationFeedback, { boundary: 'UNTRUSTED_MIXED_DATA', value: feedback });
+  assert.equal(AI_CANDIDATE_GENERATION_LIMITS.maxModelTurns, 7); assert.equal(AI_CANDIDATE_GENERATION_LIMITS.maxToolCalls, 5); assert.equal(AI_CANDIDATE_GENERATION_LIMITS.maxContextResultBytes, 128 * 1024);
+  const loopId = randomUUID(); assert.deepEqual(parseRepairLoopJobPayload({ version: 1, repairLoopId: loopId }), { version: 1, repairLoopId: loopId });
+  for (const forged of [{ version: 1, repairLoopId: loopId, candidateId: randomUUID() }, { version: 1, repairLoopId: loopId, ordinal: 2 }, { version: 2, repairLoopId: loopId }]) assert.throws(() => parseRepairLoopJobPayload(forged));
 });

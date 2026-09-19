@@ -93,12 +93,13 @@ export function parseAiCandidateProposal(value: unknown): AiCandidateProposalPar
   return { status: 'proposal_ready', proposal: { files } };
 }
 
-export function buildAiCandidateProposalInput(facts: { objective: string; conclusion: unknown; baseCommitSha: string; profile: unknown; baseline: unknown; context: unknown }): string {
+export function buildAiCandidateProposalInput(facts: { objective: string; conclusion: unknown; baseCommitSha: string; profile: unknown; baseline: unknown; context: unknown; protocolVersion?: 3 | 4; verificationFeedback?: unknown }): string {
   return JSON.stringify({
-    protocol: AI_CANDIDATE_GENERATION_PROTOCOL_VERSION,
+    protocol: facts.protocolVersion ?? AI_CANDIDATE_GENERATION_PROTOCOL_VERSION,
     trustedAuthority: { baseCommitSha: facts.baseCommitSha, executionProfile: facts.profile, baseline: facts.baseline, contextLimits: facts.context },
     untrustedRepairObjective: { boundary: 'UNTRUSTED_USER_DATA', text: facts.objective },
     untrustedPriorDiagnosis: { boundary: 'UNTRUSTED_MODEL_DATA', conclusion: facts.conclusion },
+    ...(facts.verificationFeedback === undefined ? {} : { untrustedVerificationFeedback: { boundary: 'UNTRUSTED_MIXED_DATA', value: facts.verificationFeedback } }),
   });
 }
 

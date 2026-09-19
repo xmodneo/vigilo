@@ -1,7 +1,3 @@
-ALTER TABLE "repository_baseline" DROP CONSTRAINT "repository_baseline_github_repository_id_repository_github_repository_id_fk";
---> statement-breakpoint
-ALTER TABLE "repository_baseline" DROP CONSTRAINT "repository_baseline_installation_id_github_installation_installation_id_fk";
---> statement-breakpoint
 CREATE TABLE "repair_run" (
 	"id" text PRIMARY KEY NOT NULL,
 	"workspace_id" text NOT NULL,
@@ -53,8 +49,6 @@ ALTER TABLE "repair_run" ADD CONSTRAINT "repair_run_baseline_id_repository_basel
 ALTER TABLE "repair_run_event" ADD CONSTRAINT "repair_run_event_repair_run_id_repair_run_id_fk" FOREIGN KEY ("repair_run_id") REFERENCES "public"."repair_run"("id") ON DELETE cascade ON UPDATE no action;
 --> statement-breakpoint
 CREATE UNIQUE INDEX "repair_run_workspace_idempotency_unique" ON "repair_run" USING btree ("workspace_id","idempotency_key");
---> statement-breakpoint
-CREATE UNIQUE INDEX "repair_run_active_identity_unique" ON "repair_run" USING btree ("workspace_id","github_repository_id","installation_id","profile_identity","base_commit_sha") WHERE "state" in ('created','baseline_running');
 --> statement-breakpoint
 CREATE INDEX "repair_run_workspace_created_idx" ON "repair_run" USING btree ("workspace_id","created_at");
 --> statement-breakpoint

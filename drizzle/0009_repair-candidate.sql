@@ -63,17 +63,17 @@ CREATE TABLE "repair_candidate_event" (
 	CONSTRAINT "repair_candidate_event_facts_check" CHECK (("repair_candidate_event"."event_type" in ('created','freeze_started') and "repair_candidate_event"."candidate_identity" is null and "repair_candidate_event"."rejection_code" is null) or ("repair_candidate_event"."event_type" = 'frozen' and "repair_candidate_event"."candidate_identity" ~ '^[0-9a-f]{64}$' and "repair_candidate_event"."rejection_code" is null) or ("repair_candidate_event"."event_type" = 'rejected' and "repair_candidate_event"."candidate_identity" is null and "repair_candidate_event"."rejection_code" ~ '^[a-z_]{1,64}$'))
 );
 --> statement-breakpoint
-ALTER TABLE "repair_candidate" ADD CONSTRAINT "repair_candidate_investigation_id_investigation_id_fk" FOREIGN KEY ("investigation_id") REFERENCES "public"."investigation"("id") ON DELETE restrict ON UPDATE no action;
+ALTER TABLE "repair_candidate" ADD CONSTRAINT "repair_candidate_investigation_id_investigation_id_fk" FOREIGN KEY ("investigation_id") REFERENCES "public"."investigation"("id") ON DELETE cascade ON UPDATE no action;
 --> statement-breakpoint
-ALTER TABLE "repair_candidate" ADD CONSTRAINT "repair_candidate_repair_run_id_repair_run_id_fk" FOREIGN KEY ("repair_run_id") REFERENCES "public"."repair_run"("id") ON DELETE restrict ON UPDATE no action;
+ALTER TABLE "repair_candidate" ADD CONSTRAINT "repair_candidate_repair_run_id_repair_run_id_fk" FOREIGN KEY ("repair_run_id") REFERENCES "public"."repair_run"("id") ON DELETE cascade ON UPDATE no action;
 --> statement-breakpoint
-ALTER TABLE "repair_candidate" ADD CONSTRAINT "repair_candidate_workspace_id_workspace_id_fk" FOREIGN KEY ("workspace_id") REFERENCES "public"."workspace"("id") ON DELETE restrict ON UPDATE no action;
+ALTER TABLE "repair_candidate" ADD CONSTRAINT "repair_candidate_workspace_id_workspace_id_fk" FOREIGN KEY ("workspace_id") REFERENCES "public"."workspace"("id") ON DELETE cascade ON UPDATE no action;
 --> statement-breakpoint
-ALTER TABLE "repair_candidate_file" ADD CONSTRAINT "repair_candidate_file_candidate_id_repair_candidate_id_fk" FOREIGN KEY ("candidate_id") REFERENCES "public"."repair_candidate"("id") ON DELETE restrict ON UPDATE no action;
+ALTER TABLE "repair_candidate_file" ADD CONSTRAINT "repair_candidate_file_candidate_id_repair_candidate_id_fk" FOREIGN KEY ("candidate_id") REFERENCES "public"."repair_candidate"("id") ON DELETE cascade ON UPDATE no action;
 --> statement-breakpoint
-ALTER TABLE "repair_candidate_event" ADD CONSTRAINT "repair_candidate_event_candidate_id_repair_candidate_id_fk" FOREIGN KEY ("candidate_id") REFERENCES "public"."repair_candidate"("id") ON DELETE restrict ON UPDATE no action;
+ALTER TABLE "repair_candidate_event" ADD CONSTRAINT "repair_candidate_event_candidate_id_repair_candidate_id_fk" FOREIGN KEY ("candidate_id") REFERENCES "public"."repair_candidate"("id") ON DELETE cascade ON UPDATE no action;
 --> statement-breakpoint
-ALTER TABLE "repair_candidate_event" ADD CONSTRAINT "repair_candidate_event_workspace_id_workspace_id_fk" FOREIGN KEY ("workspace_id") REFERENCES "public"."workspace"("id") ON DELETE restrict ON UPDATE no action;
+ALTER TABLE "repair_candidate_event" ADD CONSTRAINT "repair_candidate_event_workspace_id_workspace_id_fk" FOREIGN KEY ("workspace_id") REFERENCES "public"."workspace"("id") ON DELETE cascade ON UPDATE no action;
 --> statement-breakpoint
 CREATE UNIQUE INDEX "repair_candidate_investigation_ordinal_unique" ON "repair_candidate" USING btree ("investigation_id","ordinal");
 --> statement-breakpoint

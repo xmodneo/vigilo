@@ -1052,6 +1052,126 @@ export const aiCandidateGenerationEvent = pgTable(
   ],
 );
 
+export const repairLoop = pgTable(
+  'repair_loop',
+  {
+    id: text('id').primaryKey(),
+    repairRunId: text('repair_run_id').notNull().unique().references(() => repairRun.id, { onDelete: 'restrict' }),
+    workspaceId: text('workspace_id').notNull().references(() => workspace.id, { onDelete: 'restrict' }),
+    investigationId: text('investigation_id').notNull().references(() => investigation.id, { onDelete: 'restrict' }),
+    aiInvestigationId: text('ai_investigation_id').notNull().references(() => aiInvestigation.id, { onDelete: 'restrict' }),
+    protocolVersion: integer('protocol_version').notNull(),
+    maxIterations: integer('max_iterations').notNull(),
+    idempotencyKey: text('idempotency_key').notNull(),
+    state: text('state').notNull(),
+    wakeJobId: text('wake_job_id'),
+    selectedCandidateId: text('selected_candidate_id').references(() => repairCandidate.id, { onDelete: 'restrict' }),
+    selectedVerificationId: text('selected_verification_id').references(() => candidateVerification.id, { onDelete: 'restrict' }),
+    selectedEvidenceId: text('selected_evidence_id').references(() => candidateVerificationEvidence.id, { onDelete: 'restrict' }),
+    failureClassification: text('failure_classification'),
+    failureCode: text('failure_code'),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    startedAt: timestamp('started_at', { withTimezone: true }),
+    completedAt: timestamp('completed_at', { withTimezone: true }),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    uniqueIndex('repair_loop_workspace_idempotency_unique').on(table.workspaceId, table.idempotencyKey),
+    index('repair_loop_workspace_created_idx').on(table.workspaceId, table.createdAt),
+    index('repair_loop_state_updated_idx').on(table.state, table.updatedAt),
+    check('repair_loop_uuid_check', sql`${table.id} ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$' and ${table.idempotencyKey} ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$' and (${table.wakeJobId} is null or ${table.wakeJobId} ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$')`),
+    check('repair_loop_protocol_check', sql`${table.protocolVersion} = 1 and ${table.maxIterations} = 2`),
+    check('repair_loop_state_check', sql`${table.state} in ('queued','running','verified','abstained','review_required','failed','limit_reached')`),
+    check('repair_loop_failure_check', sql`(${table.failureClassification} is null or ${table.failureClassification} in ('generation_failure','verification_failure','infrastructure_failure','integrity_failure','ownership_failure')) and (${table.failureCode} is null or ${table.failureCode} ~ '^[a-z_]{1,64}$')`),
+    check('repair_loop_terminal_facts_check', sql`(
+      ${table.state} in ('queued','running') and ${table.wakeJobId} is not null and ${table.completedAt} is null and ${table.selectedCandidateId} is null and ${table.selectedVerificationId} is null and ${table.selectedEvidenceId} is null and ${table.failureClassification} is null and ${table.failureCode} is null
+    ) or (
+      ${table.state} = 'verified' and ${table.completedAt} is not null and ${table.selectedCandidateId} is not null and ${table.selectedVerificationId} is not null and ${table.selectedEvidenceId} is not null and ${table.failureClassification} is null and ${table.failureCode} is null
+    ) or (
+      ${table.state} in ('abstained','review_required','limit_reached') and ${table.completedAt} is not null and ${table.selectedCandidateId} is null and ${table.selectedVerificationId} is null and ${table.selectedEvidenceId} is null and ${table.failureClassification} is null and ${table.failureCode} is null
+    ) or (
+      ${table.state} = 'failed' and ${table.completedAt} is not null and ${table.selectedCandidateId} is null and ${table.selectedVerificationId} is null and ${table.selectedEvidenceId} is null and ${table.failureClassification} is not null and ${table.failureCode} is not null
+    )`),
+  ],
+);
+
+export const repairLoopIteration = pgTable(
+  'repair_loop_iteration',
+  {
+    id: text('id').primaryKey(),
+    repairLoopId: text('repair_loop_id').notNull().references(() => repairLoop.id, { onDelete: 'restrict' }),
+    ordinal: integer('ordinal').notNull(),
+    aiCandidateGenerationId: text('ai_candidate_generation_id').notNull().unique().references(() => aiCandidateGeneration.id, { onDelete: 'restrict' }),
+    candidateVerificationId: text('candidate_verification_id').unique().references(() => candidateVerification.id, { onDelete: 'restrict' }),
+    previousIterationId: text('previous_iteration_id').unique().references((): AnyPgColumn => repairLoopIteration.id, { onDelete: 'restrict' }),
+    objectiveContractVersion: text('objective_contract_version').notNull(),
+    objectiveContractSnapshot: jsonb('objective_contract_snapshot').notNull(),
+    objectiveContractHash: text('objective_contract_hash').notNull(),
+    objectiveContractBytes: integer('objective_contract_bytes').notNull(),
+    feedbackVersion: integer('feedback_version'),
+    feedbackSnapshot: jsonb('feedback_snapshot'),
+    feedbackHash: text('feedback_hash'),
+    feedbackBytes: integer('feedback_bytes'),
+    feedbackVerificationId: text('feedback_verification_id').references(() => candidateVerification.id, { onDelete: 'restrict' }),
+    feedbackEvidenceId: text('feedback_evidence_id').references(() => candidateVerificationEvidence.id, { onDelete: 'restrict' }),
+    objectiveEvidence: text('objective_evidence'),
+    objectiveEvidenceSnapshot: jsonb('objective_evidence_snapshot'),
+    objectiveEvidenceHash: text('objective_evidence_hash'),
+    objectiveEvidenceBytes: integer('objective_evidence_bytes'),
+    decision: text('decision'),
+    failureCode: text('failure_code'),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    decidedAt: timestamp('decided_at', { withTimezone: true }),
+  },
+  (table) => [
+    uniqueIndex('repair_loop_iteration_ordinal_unique').on(table.repairLoopId, table.ordinal),
+    uniqueIndex('repair_loop_iteration_undecided_unique').on(table.repairLoopId).where(sql`${table.decision} is null`),
+    index('repair_loop_iteration_loop_created_idx').on(table.repairLoopId, table.createdAt),
+    check('repair_loop_iteration_uuid_check', sql`${table.id} ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'`),
+    check('repair_loop_iteration_ordinal_check', sql`${table.ordinal} between 1 and 2`),
+    check('repair_loop_iteration_contract_check', sql`${table.objectiveContractVersion} = 'baseline_recovery_v1' and ${table.objectiveContractHash} ~ '^[0-9a-f]{64}$' and ${table.objectiveContractBytes} between 1 and 16384`),
+    check('repair_loop_iteration_feedback_check', sql`(
+      ${table.ordinal} = 1 and ${table.previousIterationId} is null and ${table.feedbackVersion} is null and ${table.feedbackSnapshot} is null and ${table.feedbackHash} is null and ${table.feedbackBytes} is null and ${table.feedbackVerificationId} is null and ${table.feedbackEvidenceId} is null
+    ) or (
+      ${table.ordinal} = 2 and ${table.previousIterationId} is not null and ${table.feedbackVersion} = 1 and ${table.feedbackSnapshot} is not null and ${table.feedbackHash} ~ '^[0-9a-f]{64}$' and ${table.feedbackBytes} between 1 and 16384 and ${table.feedbackVerificationId} is not null and ${table.feedbackEvidenceId} is not null
+    )`),
+    check('repair_loop_iteration_result_check', sql`(
+      ${table.decision} is null and ${table.objectiveEvidence} is null and ${table.objectiveEvidenceSnapshot} is null and ${table.objectiveEvidenceHash} is null and ${table.objectiveEvidenceBytes} is null and ${table.failureCode} is null and ${table.decidedAt} is null
+    ) or (
+      ${table.decision} in ('abstained','generation_failed') and ${table.candidateVerificationId} is null and ${table.objectiveEvidence} is null and ${table.objectiveEvidenceSnapshot} is null and ${table.objectiveEvidenceHash} is null and ${table.objectiveEvidenceBytes} is null and ${table.decidedAt} is not null
+    ) or (
+      ${table.decision} in ('verified','repairable_failure','verification_non_repairable') and ${table.candidateVerificationId} is not null and ${table.objectiveEvidence} in ('satisfied','failed','not_measured') and ${table.objectiveEvidenceSnapshot} is not null and ${table.objectiveEvidenceHash} ~ '^[0-9a-f]{64}$' and ${table.objectiveEvidenceBytes} between 1 and 16384 and ${table.decidedAt} is not null
+    ) or (
+      ${table.decision} = 'infrastructure_failed' and ${table.objectiveEvidence} = 'not_measured' and ${table.objectiveEvidenceSnapshot} is not null and ${table.objectiveEvidenceHash} ~ '^[0-9a-f]{64}$' and ${table.objectiveEvidenceBytes} between 1 and 16384 and ${table.decidedAt} is not null
+    ) or (
+      ${table.decision} = 'evidence_invalid' and ${table.objectiveEvidence} = 'not_measured' and ${table.objectiveEvidenceSnapshot} is not null and ${table.objectiveEvidenceHash} ~ '^[0-9a-f]{64}$' and ${table.objectiveEvidenceBytes} between 1 and 16384 and ${table.decidedAt} is not null
+    )`),
+    check('repair_loop_iteration_failure_check', sql`(${table.failureCode} is null or ${table.failureCode} ~ '^[a-z_]{1,64}$') and ((${table.decision} in ('generation_failed','infrastructure_failed','evidence_invalid') and ${table.failureCode} is not null) or (${table.decision} not in ('generation_failed','infrastructure_failed','evidence_invalid') and ${table.failureCode} is null))`),
+  ],
+);
+
+export const repairLoopEvent = pgTable(
+  'repair_loop_event',
+  {
+    id: text('id').primaryKey(),
+    repairLoopId: text('repair_loop_id').notNull().references(() => repairLoop.id, { onDelete: 'restrict' }),
+    iterationId: text('iteration_id').references(() => repairLoopIteration.id, { onDelete: 'restrict' }),
+    fromState: text('from_state'),
+    toState: text('to_state').notNull(),
+    eventType: text('event_type').notNull(),
+    decision: text('decision'),
+    failureCode: text('failure_code'),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    index('repair_loop_event_loop_created_idx').on(table.repairLoopId, table.createdAt),
+    check('repair_loop_event_uuid_check', sql`${table.id} ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'`),
+    check('repair_loop_event_state_check', sql`(${table.fromState} is null or ${table.fromState} in ('queued','running','verified','abstained','review_required','failed','limit_reached')) and ${table.toState} in ('queued','running','verified','abstained','review_required','failed','limit_reached')`),
+    check('repair_loop_event_type_check', sql`${table.eventType} in ('created','started','iteration_created','verification_created','iteration_decided','completed','reconciled')`),
+    check('repair_loop_event_safe_check', sql`(${table.decision} is null or ${table.decision} in ('verified','repairable_failure','abstained','generation_failed','verification_non_repairable','infrastructure_failed','evidence_invalid')) and (${table.failureCode} is null or ${table.failureCode} ~ '^[a-z_]{1,64}$')`),
+  ],
+);
+
 export const authSchema = {
   account,
   executionProfile,
@@ -1080,6 +1200,9 @@ export const authSchema = {
   aiCandidateGeneration,
   aiCandidateGenerationAttempt,
   aiCandidateGenerationEvent,
+  repairLoop,
+  repairLoopIteration,
+  repairLoopEvent,
   session,
   user,
   verification,

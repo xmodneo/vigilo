@@ -6,6 +6,7 @@ import { renderToStaticMarkup } from 'react-dom/server';
 import { GitHubConnectionView } from '../app/app/github/github-connection-view.js';
 import { RepairRunStatus } from '../app/app/github/repair-run-status.js';
 import { AiInvestigationStatus } from '../app/app/github/ai-investigation-status.js';
+import { RepairLoopStatus } from '../app/app/github/repair-loop-status.js';
 
 test('GitHub connection page renders the disconnected installation action', () => {
   const html = renderToStaticMarkup(
@@ -246,6 +247,16 @@ test('completed AI investigation renders structured text and only the bounded ca
   assert.match(html, /Diagnosis/); assert.match(html, /Suspected files/); assert.match(html, /Evidence consulted/); assert.match(html, /Proposed approach/); assert.match(html, /Confidence/); assert.match(html, /&lt;script&gt;unsafe\(\)&lt;\/script&gt;/);
   assert.match(html, /Generate repair candidate/); assert.match(html, /action="\/api\/ai-candidate-generations"/); assert.match(html, /name="aiInvestigationId" value="22222222-2222-4222-8222-222222222222"/); assert.match(html, /name="idempotencyKey" value="66666666-6666-4666-8666-666666666666"/);
   assert.doesNotMatch(html, /<script>|Apply fix|Verify|Approve|Publish|name="(?:workspace|commit|repository|revision|model|state)"/);
+});
+
+test('repair loop UI exposes deterministic progress and no approval or publish capability', () => {
+  const html = renderToStaticMarkup(<RepairLoopStatus initialLoop={{
+    id: '11111111-1111-4111-8111-111111111111', repairRunId: '22222222-2222-4222-8222-222222222222', investigationId: '33333333-3333-4333-8333-333333333333',
+    state: 'running', maxIterations: 2, selectedCandidateId: null, selectedVerificationId: null, selectedEvidenceId: null, failureClassification: null, failureCode: null,
+    iterations: [{ id: '44444444-4444-4444-8444-444444444444', ordinal: 1, aiCandidateGenerationId: '55555555-5555-4555-8555-555555555555', candidateVerificationId: null, objectiveContractVersion: 'baseline_recovery_v1', objectiveMeasurable: true, objectiveEvidence: null, decision: null, failureCode: null }],
+  }} />);
+  assert.match(html, /Repair Loop/); assert.match(html, /Iteration.*1.*2/); assert.match(html, /Baseline recovery v1/); assert.match(html, /55555555-555/);
+  assert.doesNotMatch(html, /Approve|Publish|Create PR|Merge|Deploy|GitHub write/i);
 });
 
 test('eligible Repair Run renders its objective and bounded investigation status', () => {
