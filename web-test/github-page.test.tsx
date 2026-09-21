@@ -7,6 +7,7 @@ import { GitHubConnectionView } from '../app/app/github/github-connection-view.j
 import { RepairRunStatus } from '../app/app/github/repair-run-status.js';
 import { AiInvestigationStatus } from '../app/app/github/ai-investigation-status.js';
 import { RepairLoopStatus } from '../app/app/github/repair-loop-status.js';
+import { HumanReviewStatus } from '../app/app/github/human-review-status.js';
 
 test('GitHub connection page renders the disconnected installation action', () => {
   const html = renderToStaticMarkup(
@@ -257,6 +258,29 @@ test('repair loop UI exposes deterministic progress and no approval or publish c
   }} />);
   assert.match(html, /Repair Loop/); assert.match(html, /Iteration.*1.*2/); assert.match(html, /Baseline recovery v1/); assert.match(html, /55555555-555/);
   assert.doesNotMatch(html, /Approve|Publish|Create PR|Merge|Deploy|GitHub write/i);
+});
+
+test('human review renders exact escaped artifacts, distinct gates, and only the three-field decision contract', () => {
+  const html = renderToStaticMarkup(<HumanReviewStatus idempotencyKey="77777777-7777-4777-8777-777777777777" review={{
+    repairRunId: '11111111-1111-4111-8111-111111111111', status: 'awaiting_decision', ineligibleReason: null,
+    reviewSubjectIdentity: 'f'.repeat(64), liveAcceptanceStatus: 'pending', decision: null,
+    subject: {
+      authority: { workspaceId: 'workspace-1', repairRunId: '11111111-1111-4111-8111-111111111111', repairLoopId: '22222222-2222-4222-8222-222222222222', repairLoopIterationId: '33333333-3333-4333-8333-333333333333', aiCandidateGenerationId: '44444444-4444-4444-8444-444444444444', githubRepositoryId: 8101, installationId: 7001, baselineId: '55555555-5555-4555-8555-555555555555', baseCommitSha: 'a'.repeat(40), profileIdentity: 'b'.repeat(64) },
+      candidate: { id: '66666666-6666-4666-8666-666666666666', identity: 'c'.repeat(64), files: [{ path: 'src/repaired.ts', operation: 'add', baseBlobSha: null, baseContentSha256: null, resultContentSha256: 'd'.repeat(64), resultByteLength: 34, resultingContent: '<script>unsafe()</script>\nfixed();\n' }] },
+      verification: { id: '88888888-8888-4888-8888-888888888888', evidenceId: '99999999-9999-4999-8999-999999999999', state: 'completed', verificationContract: 'checks_passed', baselineComparison: 'previous_baseline_failure_resolved', executionOutcome: 'checks_passed', networkIsolation: 'confirmed', cleanup: 'confirmed', phases: { install: { status: 'completed', exitCode: 0, timedOut: false }, typecheck: { status: 'completed', exitCode: 0, timedOut: false }, build: { status: 'completed', exitCode: 0, timedOut: false }, test: { status: 'completed', exitCode: 0, timedOut: false } } },
+      objective: { contractVersion: 'baseline_recovery_v1', contractHash: 'e'.repeat(64), evidenceHash: '1'.repeat(64), measurable: true, result: 'satisfied', evaluatedChecks: ['test'] },
+    },
+    history: { truncated: false, items: [{ kind: 'candidate_verification_attempt', id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', state: 'succeeded', ordinal: 1, createdAt: new Date('2032-02-03T04:05:06.000Z'), failureCode: null }] },
+  }} />);
+  assert.match(html, /Candidate frozen/); assert.match(html, /Verification passed/); assert.match(html, /Technical objective satisfied/);
+  assert.match(html, /Human decision.*Awaiting/); assert.match(html, /Task 4.3 live acceptance.*Pending/);
+  assert.match(html, /src\/repaired.ts/); assert.match(html, /&lt;script&gt;unsafe\(\)&lt;\/script&gt;/);
+  assert.match(html, /action="\/api\/repair-runs\/11111111-1111-4111-8111-111111111111\/human-review-decisions"/);
+  assert.equal((html.match(/name="decision"/g) ?? []).length, 2);
+  assert.equal((html.match(/name="reviewSubjectIdentity"/g) ?? []).length, 2);
+  assert.equal((html.match(/name="idempotencyKey"/g) ?? []).length, 2);
+  assert.doesNotMatch(html, /name="(?:candidateId|verificationId|evidenceId|workspaceId|commit|profileIdentity)"/);
+  assert.doesNotMatch(html, /sandboxName|sandboxSessionId|action="[^"]*(?:publish|pull-request)|>\s*(?:Publish|Create PR|Merge|Deploy)\s*</i);
 });
 
 test('eligible Repair Run renders its objective and bounded investigation status', () => {

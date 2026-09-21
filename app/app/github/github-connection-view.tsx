@@ -4,6 +4,8 @@ import { RepairCandidateStatus, type RepairCandidateSummary } from './repair-can
 import type { CandidateVerificationSummary } from './candidate-verification-status.tsx';
 import { AiInvestigationStatus, type AiCandidateGenerationSummary, type AiInvestigationSummary } from './ai-investigation-status.tsx';
 import { RepairLoopStatus, type RepairLoopSummary } from './repair-loop-status.tsx';
+import { HumanReviewStatus } from './human-review-status.tsx';
+import type { HumanReviewResult } from '../../../lib/human-reviews/types.ts';
 
 interface InstallationSummary {
   accountLogin: string;
@@ -88,6 +90,8 @@ export interface GitHubConnectionViewProps {
   repairRun?: RepairRunSummary | null;
   repairLoop?: RepairLoopSummary | null;
   repairLoopRequestId?: string;
+  humanReview?: HumanReviewResult | null;
+  humanReviewRequestId?: string;
   repositoryError?: 'unavailable';
   selectedRepository?: RepositorySummary | null;
   workspaceId: string;
@@ -110,6 +114,8 @@ export function GitHubConnectionView({
   repairRun = null,
   repairLoop = null,
   repairLoopRequestId,
+  humanReview = null,
+  humanReviewRequestId,
   repositoryError,
   selectedRepository = null,
   workspaceId,
@@ -217,6 +223,7 @@ export function GitHubConnectionView({
                       </form>
                     )}
                     {repairLoop && <RepairLoopStatus initialLoop={repairLoop} />}
+                    {repairLoop && humanReview && humanReviewRequestId && <HumanReviewStatus review={humanReview} idempotencyKey={humanReviewRequestId} />}
                     {investigation?.state === 'ready' && <RepairCandidateStatus candidate={repairCandidate} verification={candidateVerification} workflowOwned={repairLoopActive} />}
                     {baseline && (
                       <section className="repository-panel" aria-labelledby="baseline-title">

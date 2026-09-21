@@ -52,7 +52,7 @@ export function RepairLoopStatus({ initialLoop }: { initialLoop: RepairLoopSumma
       </div>)}
       {loop.selectedCandidateId && <p>Selected candidate: <code>{loop.selectedCandidateId.slice(0, 12)}</code></p>}
       {loop.failureCode && <div className="repository-notice" role="status">Loop stopped safely: {loop.failureCode}</div>}
-      {loop.state === 'review_required' && <div className="repository-notice" role="status">The frozen baseline did not provide a measurable failing check. Human review is required.</div>}
+      {loop.state === 'review_required' && <div className="repository-notice" role="status">The frozen baseline did not provide a measurable failing check. The technical objective is unmeasured, so this result is not eligible for human approval.</div>}
       {loop.state === 'limit_reached' && <div className="repository-notice" role="status">The two-iteration limit was reached.</div>}
     </section>
   );

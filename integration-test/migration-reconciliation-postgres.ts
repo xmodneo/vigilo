@@ -74,7 +74,7 @@ async function migrationRows(sql: Sql) {
 async function assertHistoricalHashes(sql: Sql) {
   const journal = JSON.parse(await readFile(join(migrationsFolder, 'meta/_journal.json'), 'utf8')) as { entries: Array<{ idx: number; tag: string }> };
   const rows = await migrationRows(sql);
-  assert.equal(rows.length, 20);
+  assert.equal(rows.length, 21);
   for (const [tag, expected] of historicalHashes) {
     const entry = journal.entries.find((candidate) => candidate.tag === tag);
     assert.ok(entry, tag);
@@ -171,6 +171,14 @@ async function assertFinalCatalog(sql: Sql) {
   assert.deepEqual([facts?.repairLoop, facts?.repairLoopIteration, facts?.repairLoopEvent], ['repair_loop', 'repair_loop_iteration', 'repair_loop_event']);
   assert.equal(facts?.repairLoopGuardCount, 4);
   assert.equal(facts?.globalCandidateUnique, 0);
+  const [review] = await sql<{ table: string | null; insertGuard: string | null; mutationGuard: string | null; childGuards: number }[]>`
+    select
+      to_regclass('public.human_review_decision')::text as table,
+      (select tgname from pg_trigger where tgname = 'human_review_decision_insert_guard' and not tgisinternal) as "insertGuard",
+      (select tgname from pg_trigger where tgname = 'human_review_decision_mutation_guard' and not tgisinternal) as "mutationGuard",
+      (select count(*)::int from pg_trigger where tgname in ('human_review_generation_write_guard','human_review_candidate_write_guard','human_review_verification_write_guard','human_review_candidate_file_insert_guard') and not tgisinternal) as "childGuards"
+  `;
+  assert.deepEqual(review, { table: 'human_review_decision', insertGuard: 'human_review_decision_insert_guard', mutationGuard: 'human_review_decision_mutation_guard', childGuards: 4 });
 }
 
 async function schemaSnapshot(sql: Sql) {

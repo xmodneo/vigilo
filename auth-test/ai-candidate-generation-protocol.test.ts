@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
+import { readFile } from 'node:fs/promises';
+import { resolve } from 'node:path';
 import test from 'node:test';
 
 import { GeminiInvestigationProvider } from '../lib/ai-investigations/gemini-provider.ts';
@@ -96,4 +98,9 @@ test('protocol v4 adds only bounded untrusted verification feedback and keeps al
   assert.equal(AI_CANDIDATE_GENERATION_LIMITS.maxModelTurns, 7); assert.equal(AI_CANDIDATE_GENERATION_LIMITS.maxToolCalls, 5); assert.equal(AI_CANDIDATE_GENERATION_LIMITS.maxContextResultBytes, 128 * 1024);
   const loopId = randomUUID(); assert.deepEqual(parseRepairLoopJobPayload({ version: 1, repairLoopId: loopId }), { version: 1, repairLoopId: loopId });
   for (const forged of [{ version: 1, repairLoopId: loopId, candidateId: randomUUID() }, { version: 1, repairLoopId: loopId, ordinal: 2 }, { version: 2, repairLoopId: loopId }]) assert.throws(() => parseRepairLoopJobPayload(forged));
+});
+
+test('the application schema preserves protocol-v4 candidate generations', async () => {
+  const source = await readFile(resolve(process.cwd(), 'db', 'schema.ts'), 'utf8');
+  assert.match(source, /ai_candidate_generation_provider_check[\s\S]*protocolVersion}\s+in \(1,2,3,4\)/);
 });

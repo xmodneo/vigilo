@@ -23,13 +23,14 @@ test('historical migration files reproduce the hashes recorded when they were ap
   }
 });
 
-test('journal orders reconciliation before the unchanged RepairLoop migration', async () => {
+test('journal orders reconciliation, RepairLoop, and human review migrations', async () => {
   const journal = JSON.parse(await readFile(migrationPath('meta', '_journal.json'), 'utf8')) as {
     entries: Array<{ idx: number; when: number; tag: string }>;
   };
-  assert.deepEqual(journal.entries.slice(-2).map(({ idx, tag }) => ({ idx, tag })), [
+  assert.deepEqual(journal.entries.slice(-3).map(({ idx, tag }) => ({ idx, tag })), [
     { idx: 18, tag: '0018_historical-schema-reconciliation' },
     { idx: 19, tag: '0019_repair-loop' },
+    { idx: 20, tag: '0020_human-review' },
   ]);
   assert.ok(journal.entries.every((entry, index, entries) => index === 0 || entry.when > entries[index - 1]!.when));
 });
@@ -50,4 +51,25 @@ test('reconciliation is forward-only and never rewrites Drizzle history', async 
     'tool_call_count" between 0 and 20',
     'OLD."execution_ordinal"',
   ]) assert.ok(content.includes(marker), marker);
+});
+
+test('human-review migration enforces relational authority without claiming cryptographic recomputation', async () => {
+  const content = await readFile(migrationPath('0020_human-review.sql'), 'utf8');
+  for (const marker of [
+    'human_review_decision_insert_guard',
+    'human_review_decision_mutation_guard',
+    'IS NOT DISTINCT FROM',
+    'human_review_generation_write_guard',
+    'human_review_candidate_write_guard',
+    'human_review_verification_write_guard',
+    'human_review_candidate_file_insert_guard',
+    'OLD."repair_run_id", NEW."repair_run_id"',
+    'JOIN "candidate_verification_attempt"',
+    'a."expected_evidence_id" = e."id"',
+    'other_i."candidate_verification_id" = v."id"',
+    'b."credentials_exposure" = \'absent\'',
+    'p."status" = \'ready\'',
+    'ON DELETE RESTRICT',
+  ]) assert.ok(content.includes(marker), marker);
+  assert.doesNotMatch(content, /digest\s*\(|sha256\s*\(/i);
 });

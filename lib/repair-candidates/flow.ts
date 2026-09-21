@@ -4,6 +4,7 @@ import { and, desc, eq, max } from 'drizzle-orm';
 
 import {
   investigation,
+  humanReviewDecision,
   repairCandidate,
   repairCandidateEvent,
   repairCandidateFile,
@@ -32,7 +33,8 @@ export class RepairCandidateError extends Error {
     | 'candidate_conflict'
     | 'candidate_not_found'
     | 'investigation_not_eligible'
-    | 'proposal_conflict') {
+    | 'proposal_conflict'
+    | 'repair_run_reviewed') {
     super(code);
     this.name = 'RepairCandidateError';
   }
@@ -104,6 +106,8 @@ async function reserveCandidate(
       transaction.select().from(repairCandidate).where(and(eq(repairCandidate.investigationId, current.id), eq(repairCandidate.state, 'freezing'))).limit(1),
     ]);
     if (!run || !baseline || !['ready_for_investigation', 'baseline_failed'].includes(run.state) || !bindingMatches(current, run, baseline)) throw new RepairCandidateError('investigation_not_eligible');
+    const [review] = await transaction.select({ id: humanReviewDecision.id }).from(humanReviewDecision).where(eq(humanReviewDecision.repairRunId, run.id)).limit(1);
+    if (review) throw new RepairCandidateError('repair_run_reviewed');
     if (active) throw new RepairCandidateError('candidate_conflict');
     const [ordinalResult] = await transaction.select({ value: max(repairCandidate.ordinal) }).from(repairCandidate).where(eq(repairCandidate.investigationId, current.id));
     const ordinal = (ordinalResult?.value ?? 0) + 1;

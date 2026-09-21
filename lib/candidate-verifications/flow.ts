@@ -7,6 +7,7 @@ import {
   candidateVerificationEvidence,
   candidateVerificationEvent,
   executionProfile,
+  humanReviewDecision,
   investigation,
   repairCandidate,
   repairLoop,
@@ -32,7 +33,8 @@ export class CandidateVerificationError extends Error {
     | 'verification_authority_mismatch'
     | 'verification_handoff_failed'
     | 'verification_not_found'
-    | 'verification_owned_by_repair_loop') {
+    | 'verification_owned_by_repair_loop'
+    | 'repair_run_reviewed') {
     super(code);
     this.name = 'CandidateVerificationError';
   }
@@ -115,6 +117,8 @@ export async function startCandidateVerification(
   const [ownedLoop] = await database.select({ id: repairLoop.id }).from(repairLoop)
     .where(and(eq(repairLoop.repairRunId, candidate.repairRunId), eq(repairLoop.workspaceId, context.workspace.id), inArray(repairLoop.state, ['queued', 'running']))).limit(1);
   if (ownedLoop) throw new CandidateVerificationError('verification_owned_by_repair_loop');
+  const [existingReview] = await database.select({ id: humanReviewDecision.id }).from(humanReviewDecision).where(eq(humanReviewDecision.repairRunId, candidate.repairRunId)).limit(1);
+  if (existingReview) throw new CandidateVerificationError('repair_run_reviewed');
   const candidateIdentity = candidate.candidateIdentity;
   try { await selfCheckRepairCandidate(database, context, candidate.id); }
   catch { throw new CandidateVerificationError('candidate_artifact_invalid'); }
@@ -136,6 +140,8 @@ export async function startCandidateVerification(
     return await database.transaction(async (transaction) => {
       const [lockedRun] = await transaction.select({ id: repairRun.id }).from(repairRun).where(and(eq(repairRun.id, candidate.repairRunId), eq(repairRun.workspaceId, context.workspace.id))).for('update').limit(1);
       if (!lockedRun) throw new CandidateVerificationError('verification_authority_mismatch');
+      const [review] = await transaction.select({ id: humanReviewDecision.id }).from(humanReviewDecision).where(eq(humanReviewDecision.repairRunId, candidate.repairRunId)).limit(1);
+      if (review) throw new CandidateVerificationError('repair_run_reviewed');
       const [activeLoop] = await transaction.select({ id: repairLoop.id }).from(repairLoop).where(and(eq(repairLoop.repairRunId, candidate.repairRunId), inArray(repairLoop.state, ['queued', 'running']))).limit(1);
       if (activeLoop) throw new CandidateVerificationError('verification_owned_by_repair_loop');
       const [existing] = await transaction.select().from(candidateVerification).where(

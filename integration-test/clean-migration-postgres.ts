@@ -84,8 +84,17 @@ try {
     facts.candidateRunFk?.includes('ON DELETE RESTRICT') === true && facts.candidateFileFk?.includes('ON DELETE RESTRICT') === true &&
     facts.verificationCandidateFk?.includes('ON DELETE RESTRICT') === true && facts.verificationEvidenceFk?.includes('ON DELETE RESTRICT') === true && facts.contextAiFk?.includes('ON DELETE RESTRICT') === true && facts.contextAiCandidateGenerationFk?.includes('ON DELETE RESTRICT') === true &&
     facts.activeVerificationIndex?.includes("WHERE (state = ANY (ARRAY['created'::text, 'queued'::text, 'verifying'::text]))") === true && facts.activeAiIndex?.includes("WHERE (state = ANY (ARRAY['created'::text, 'queued'::text, 'investigating'::text]))") === true && facts.activeAiAttemptIndex?.includes("WHERE (state = 'active'::text)") === true && facts.activeAiCandidateGenerationAttemptIndex?.includes("WHERE (state = 'active'::text)") === true && facts.activeAiCandidateGenerationIndex?.includes("WHERE (state = ANY (ARRAY['created'::text, 'queued'::text, 'generating'::text]))") === true && facts.aiOrdinalIndex?.includes('investigation_id, execution_ordinal') === true && facts.aiIdempotencyIndex?.includes('investigation_id, idempotency_key') === true && facts.candidateGenerationOrdinalIndex?.includes('ai_investigation_id, execution_ordinal') === true && facts.candidateWideUniqueCount === 0 && facts.aiWideUniqueCount === 0;
-  if (!passed) throw new Error('clean_migration_probe_failed');
-  process.stdout.write(`${JSON.stringify({ migrations: '0000-0019', repairRunAttempt: 'present', investigation: 'present', repairCandidate: 'present', candidateVerification: 'present', aiInvestigation: 'present', aiCandidateGeneration: 'present', repairLoop: 'present', constraints: 'current', result: 'passed' })}\n`);
+  const [reviewFacts] = await probe<{ table: string | null; decisionGuard: string | null; mutationGuard: string | null; childGuardCount: number; decisionFkCount: number }[]>`
+    select
+      to_regclass('public.human_review_decision')::text as table,
+      (select tgname from pg_trigger where tgname = 'human_review_decision_insert_guard' and not tgisinternal) as "decisionGuard",
+      (select tgname from pg_trigger where tgname = 'human_review_decision_mutation_guard' and not tgisinternal) as "mutationGuard",
+      (select count(*)::int from pg_trigger where tgname in ('human_review_generation_write_guard','human_review_candidate_write_guard','human_review_verification_write_guard','human_review_candidate_file_insert_guard') and not tgisinternal) as "childGuardCount",
+      (select count(*)::int from pg_constraint where conrelid = 'human_review_decision'::regclass and contype = 'f' and confdeltype = 'r') as "decisionFkCount"
+  `;
+  const reviewPassed = reviewFacts?.table === 'human_review_decision' && reviewFacts.decisionGuard === 'human_review_decision_insert_guard' && reviewFacts.mutationGuard === 'human_review_decision_mutation_guard' && reviewFacts.childGuardCount === 4 && reviewFacts.decisionFkCount === 10;
+  if (!passed || !reviewPassed) throw new Error('clean_migration_probe_failed');
+  process.stdout.write(`${JSON.stringify({ migrations: '0000-0020', repairRunAttempt: 'present', investigation: 'present', repairCandidate: 'present', candidateVerification: 'present', aiInvestigation: 'present', aiCandidateGeneration: 'present', repairLoop: 'present', humanReview: 'present', constraints: 'current', result: 'passed' })}\n`);
 } finally {
   if (probe) await probe.end();
   await admin`select pg_terminate_backend(pid) from pg_stat_activity where datname = ${databaseName} and pid <> pg_backend_pid()`;

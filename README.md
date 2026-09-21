@@ -167,6 +167,33 @@ separately approved bounded financial exposure; and explicit approval before
 any Gemini, GitHub source, or Vercel Sandbox operation. No RepairLoop was started
 during Task 4.3 review or planning.
 
+## Human review and approval
+
+Milestone 5 adds one immutable human decision for an eligible, terminal
+`verified` RepairLoop. The server reconstructs the exact selected iteration,
+protocol-v4 generation, frozen candidate, verification, evidence, baseline,
+revision, execution profile, and measurable objective result. It recomputes the
+candidate, evidence, review-subject, and decision identities; the browser may
+submit only the decision, review-subject identity, and idempotency key.
+
+The private review view shows the exact frozen resulting file content, available
+base identities, selected verification facts, objective evidence, and bounded
+safe attempt history. It labels technical verification, human decision, and
+Task 4.3 live acceptance independently. A RepairLoop in `review_required` has
+unmeasured evidence and is not eligible for approval; it is not the same state
+as an eligible repair awaiting a human decision. Approval does not publish,
+create a branch or pull request, or perform any GitHub write.
+
+`0020_human-review.sql` installs restrictive provenance foreign keys,
+idempotency and one-decision uniqueness, immutable decision guards, and
+post-decision child-write guards. Application code performs the cryptographic
+identity calculations; SQL independently enforces the relational authority it
+can verify. Task 4.3 live acceptance remains pending and is an independent
+release prerequisite for any future Milestone 6 consumer. Its server-side gate
+is hard-closed while pending and cannot be opened by caller-supplied state.
+The publication-authority resolver cannot return while that gate is closed.
+Migration 0020 is not applied to a persistent database without separate authorization.
+
 ## Web/API shell
 
 Install the pinned dependencies and start local development:
