@@ -23,16 +23,34 @@ test('historical migration files reproduce the hashes recorded when they were ap
   }
 });
 
-test('journal orders reconciliation, RepairLoop, and human review migrations', async () => {
+test('journal orders reconciliation, RepairLoop, human review, and publication migrations', async () => {
   const journal = JSON.parse(await readFile(migrationPath('meta', '_journal.json'), 'utf8')) as {
     entries: Array<{ idx: number; when: number; tag: string }>;
   };
-  assert.deepEqual(journal.entries.slice(-3).map(({ idx, tag }) => ({ idx, tag })), [
+  assert.deepEqual(journal.entries.slice(-4).map(({ idx, tag }) => ({ idx, tag })), [
     { idx: 18, tag: '0018_historical-schema-reconciliation' },
     { idx: 19, tag: '0019_repair-loop' },
     { idx: 20, tag: '0020_human-review' },
+    { idx: 21, tag: '0021_repair-publication' },
   ]);
   assert.ok(journal.entries.every((entry, index, entries) => index === 0 || entry.when > entries[index - 1]!.when));
+});
+
+test('repair-publication migration installs immutable exact authority and append-only recovery history', async () => {
+  const content = await readFile(migrationPath('0021_repair-publication.sql'), 'utf8');
+  for (const marker of [
+    'repair_publication_insert_guard',
+    'repair_publication_update_guard',
+    'repair_publication_delete_guard',
+    'repair_publication_attempt_active_unique',
+    'repair_publication_event_insert_guard',
+    'repair_publication_event_mutation_guard',
+    'prepared publication authority is immutable',
+    'remote branch authority is immutable',
+    'remote pull request authority is immutable',
+    'ON DELETE RESTRICT',
+  ]) assert.ok(content.includes(marker), marker);
+  assert.doesNotMatch(content, /(?:update|delete\s+from)\s+["']?drizzle["']?\s*\.\s*["']?__drizzle_migrations/i);
 });
 
 test('renumbering does not change the reviewed RepairLoop SQL bytes', async () => {

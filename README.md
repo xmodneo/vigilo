@@ -194,6 +194,31 @@ is hard-closed while pending and cannot be opened by caller-supplied state.
 The publication-authority resolver cannot return while that gate is closed.
 Migration 0020 is not applied to a persistent database without separate authorization.
 
+## Safe draft pull request publication
+
+Milestone 6 deterministically prepares one publication intent from an exact
+approved human-review decision. The intent freezes the RepairRun, RepairLoop,
+candidate and candidate identity, verification and evidence identities,
+repository and installation, original revision, execution profile, baseline,
+technical objective evidence, bounded repair objective, publishing user,
+deterministic branch, draft pull-request metadata, and expected Git object
+identities. The browser supplies only an explicit `publish_draft` confirmation,
+the decision identity as a stale-page assertion, and an idempotency key.
+
+Publication uses a dedicated, single-repository installation token with exactly
+`contents:write`, `metadata:read`, and `pull_requests:write`. The worker can
+create and verify blobs, one tree, one single-parent commit, one new dedicated
+branch, and one draft pull request. It has no ref-update, force-push, ref-delete,
+merge, ready-for-review, deployment, workflow-dispatch, or sandbox capability.
+Durable checkpoints reconcile exact object, branch, and pull-request identities;
+ambiguous remote outcomes stop in `review_required` rather than guessing.
+
+The Task 4.3 live-acceptance gate remains hard-closed, so production publication
+reservation and worker execution cannot reach a GitHub write. Milestone 6 has
+only deterministic fake-transport and disposable-database verification; no live
+branch or pull request has been created. `0021_repair-publication.sql` is not
+applied to a persistent database without separate authorization.
+
 ## Web/API shell
 
 Install the pinned dependencies and start local development:

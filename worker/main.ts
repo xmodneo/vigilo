@@ -11,6 +11,7 @@ import {
   AI_INVESTIGATION_QUEUE,
   CANDIDATE_VERIFICATION_QUEUE,
   INVESTIGATION_CONTEXT_QUEUE,
+  REPAIR_PUBLICATION_QUEUE,
   REPAIR_LOOP_QUEUE,
   REPAIR_BASELINE_QUEUE,
   REPAIR_WORK_OPTIONS,
@@ -32,6 +33,8 @@ import { aiCandidateGeneration } from '../db/schema.ts';
 import { processAiCandidateGenerationJob } from '../lib/ai-candidate-generations/worker.ts';
 import { repairLoop } from '../db/schema.ts';
 import { processRepairLoopJob } from '../lib/repair-loops/worker.ts';
+import { repairPublication } from '../db/schema.ts';
+import { processRepairPublicationJob } from '../lib/repair-publications/worker.ts';
 
 async function main(): Promise<void> {
   const environment = readServerEnvironment();
@@ -78,6 +81,11 @@ async function main(): Promise<void> {
       if (!value.wakeJobId) continue;
       try { await boss.retry(REPAIR_LOOP_QUEUE, value.wakeJobId); }
       catch { /* A non-failed fenced wake remains owned by pg-boss. */ }
+    }
+    const activePublications = await database.select({ id: repairPublication.id }).from(repairPublication).where(inArray(repairPublication.state, ['queued', 'preparing', 'publishing']));
+    for (const value of activePublications) {
+      try { await boss.retry(REPAIR_PUBLICATION_QUEUE, value.id); }
+      catch { /* A non-failed canonical publication job remains owned by pg-boss. */ }
     }
 
     const workOptions = { ...REPAIR_WORK_OPTIONS, perJobResults: true as const };
@@ -137,6 +145,12 @@ async function main(): Promise<void> {
       } catch { return [{ id: job.id, status: 'failed' as const, output: { code: 'repair_loop_worker_failed' } }]; }
     });
     workerIds.push({ id: repairLoopWorkerId, queue: REPAIR_LOOP_QUEUE });
+    const repairPublicationWorkerId = await boss.work<unknown, { code?: string }, typeof workOptions>(REPAIR_PUBLICATION_QUEUE, workOptions, async (jobs) => {
+      const job = jobs[0]; if (!job) return [];
+      try { return [await processRepairPublicationJob(job, { configuration, database, gateway, logger, shutdownSignal: shutdown.signal })]; }
+      catch { return [{ id: job.id, status: 'failed' as const, output: { code: 'repair_publication_worker_failed' } }]; }
+    });
+    workerIds.push({ id: repairPublicationWorkerId, queue: REPAIR_PUBLICATION_QUEUE });
 
     await new Promise<void>((resolve) => {
       const stop = () => resolve();

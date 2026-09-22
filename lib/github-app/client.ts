@@ -20,6 +20,7 @@ import type {
   RepositoryRootEntry,
 } from '../execution-profiles/types.ts';
 import type { GitTreeEntry, InvestigationSourceGateway } from '../investigations/types.ts';
+import type { PublicationCommit, PublicationPullRequest, PublicationRepository, PublicationToken, RepairPublicationGateway } from '../repair-publications/types.ts';
 
 const API_BASE_URL = 'https://api.github.com';
 const API_VERSION = '2026-03-10';
@@ -28,6 +29,7 @@ const MAX_RESPONSE_BYTES = 1_000_000;
 const MAX_TREE_RESPONSE_BYTES = 8 * 1024 * 1024;
 const MAX_ARCHIVE_BYTES = 50 * 1024 * 1024;
 const REQUEST_TIMEOUT_MS = 10_000;
+const GIT_SHA = /^[0-9a-f]{40}$/;
 
 export class GitHubProviderError extends Error {
   constructor() {
@@ -314,7 +316,52 @@ function parseGitBlob(value: unknown, maxBytes: number): { bytes: Buffer; sha: s
   return { bytes, sha: gitSha(record.sha) };
 }
 
-export class GitHubApiClient implements GitHubInstallationGateway, GitHubRepositoryAccessGateway, GitHubExecutionProfileGateway, InvestigationSourceGateway {
+function parsePublicationRepository(value: unknown): PublicationRepository {
+  return parseInstallationRepository(value);
+}
+
+function parsePublicationCommit(value: unknown): PublicationCommit {
+  const record = objectValue(value);
+  const tree = objectValue(record.tree);
+  const author = objectValue(record.author);
+  const committer = objectValue(record.committer);
+  if (!Array.isArray(record.parents) || record.parents.length > 8) throw new GitHubProviderError();
+  const person = (value: Record<string, unknown>) => ({
+    name: nonemptyString(value.name), email: nonemptyString(value.email), date: nonemptyString(value.date),
+  });
+  return {
+    sha: gitSha(record.sha), treeSha: gitSha(tree.sha), parents: record.parents.map((parent) => gitSha(objectValue(parent).sha)),
+    message: nonemptyString(record.message, 16_384), author: person(author), committer: person(committer),
+  };
+}
+
+function parsePublicationPullRequest(value: unknown): PublicationPullRequest {
+  const record = objectValue(value);
+  const head = objectValue(record.head); const base = objectValue(record.base);
+  const headRepository = objectValue(head.repo); const baseRepository = objectValue(base.repo);
+  const state = nonemptyString(record.state);
+  if ((state !== 'open' && state !== 'closed') || typeof record.draft !== 'boolean' || headRepository.id !== baseRepository.id) throw new GitHubProviderError();
+  const id = positiveSafeInteger(record.id); const number = positiveSafeInteger(record.number);
+  const urlText = nonemptyString(record.html_url, 2_048);
+  let url: URL;
+  try { url = new URL(urlText); } catch { throw new GitHubProviderError(); }
+  if (url.protocol !== 'https:' || url.hostname !== 'github.com' || url.username || url.password || url.search || url.hash) throw new GitHubProviderError();
+  return {
+    id, number, nodeId: nonemptyString(record.node_id), url: url.toString(), state, draft: record.draft,
+    title: nonemptyString(record.title, 256), body: typeof record.body === 'string' ? nonemptyString(record.body, 16_384) : (() => { throw new GitHubProviderError(); })(),
+    headRef: nonemptyString(head.ref), headSha: gitSha(head.sha), baseRef: nonemptyString(base.ref), baseSha: gitSha(base.sha),
+    repositoryId: positiveSafeInteger(baseRepository.id),
+  };
+}
+
+function parseRepositoryPullRequest(value: unknown, owner: string, repository: string): PublicationPullRequest {
+  const pullRequest = parsePublicationPullRequest(value);
+  const url = new URL(pullRequest.url);
+  if (url.pathname !== `/${owner}/${repository}/pull/${pullRequest.number}`) throw new GitHubProviderError();
+  return pullRequest;
+}
+
+export class GitHubApiClient implements GitHubInstallationGateway, GitHubRepositoryAccessGateway, GitHubExecutionProfileGateway, InvestigationSourceGateway, RepairPublicationGateway {
   private readonly privateKey: KeyObject;
 
   constructor(
@@ -439,6 +486,28 @@ export class GitHubApiClient implements GitHubInstallationGateway, GitHubReposit
     };
   }
 
+  async createPublicationAccessToken(input: { installationId: number; repositoryId: number }): Promise<PublicationToken> {
+    const jwt = createGitHubAppJwt(this.configuration.clientId, this.privateKey, this.now());
+    const result = objectValue(await this.apiJson(`/app/installations/${input.installationId}/access_tokens`, {
+      body: JSON.stringify({ permissions: { contents: 'write', metadata: 'read', pull_requests: 'write' }, repository_ids: [input.repositoryId] }),
+      headers: { Authorization: `Bearer ${jwt}`, 'Content-Type': 'application/json' }, method: 'POST',
+    }));
+    const accessToken = nonemptyString(result.token, 2_048);
+    try {
+      if (!Array.isArray(result.repositories) || result.repositories.length !== 1) throw new GitHubProviderError();
+      const repository = parsePublicationRepository(result.repositories[0]);
+      const permissions = objectValue(result.permissions);
+      const exactPermissions = Object.keys(permissions).sort().join(',') === 'contents,metadata,pull_requests' && permissions.contents === 'write' && permissions.metadata === 'read' && permissions.pull_requests === 'write';
+      const expiresAtText = nonemptyString(result.expires_at);
+      const expiresAt = new Date(expiresAtText);
+      if (repository.id !== input.repositoryId || !exactPermissions || !Number.isFinite(expiresAt.getTime()) || expiresAt.getTime() <= this.now().getTime() || expiresAt.getTime() > this.now().getTime() + 3_700_000) throw new GitHubProviderError();
+      return { accessToken, expiresAt, repository };
+    } catch {
+      try { await this.revokeInstallationAccessToken(accessToken); } catch { /* expiry is the fallback */ }
+      throw new GitHubProviderError();
+    }
+  }
+
   async getRepositoryMetadata(
     accessToken: string,
     owner: string,
@@ -465,6 +534,16 @@ export class GitHubApiClient implements GitHubInstallationGateway, GitHubReposit
       ),
     );
     const object = objectValue(result.object);
+    if (object.type !== 'commit') throw new GitHubProviderError();
+    return gitSha(object.sha);
+  }
+
+  async getBranchCommit(input: { accessToken: string; branch: string; owner: string; repository: string }): Promise<string | null> {
+    const response = await this.request(`${API_BASE_URL}/repos/${encodeURIComponent(input.owner)}/${encodeURIComponent(input.repository)}/git/ref/${encodeURIComponent(`heads/${input.branch}`)}`, {
+      headers: { Accept: 'application/vnd.github+json', Authorization: `Bearer ${input.accessToken}`, 'X-GitHub-Api-Version': API_VERSION },
+    });
+    if (response.status === 404) return null;
+    const result = objectValue(await readBoundedJson(response)); const object = objectValue(result.object);
     if (object.type !== 'commit') throw new GitHubProviderError();
     return gitSha(object.sha);
   }
@@ -527,6 +606,12 @@ export class GitHubApiClient implements GitHubInstallationGateway, GitHubReposit
     return { commitSha, treeSha };
   }
 
+  async getCommit(input: { accessToken: string; owner: string; repository: string; commitSha: string }): Promise<PublicationCommit> {
+    const result = parsePublicationCommit(await this.apiJson(`/repos/${encodeURIComponent(input.owner)}/${encodeURIComponent(input.repository)}/git/commits/${encodeURIComponent(input.commitSha)}`, { headers: { Authorization: `Bearer ${input.accessToken}` } }));
+    if (result.sha !== input.commitSha) throw new GitHubProviderError();
+    return result;
+  }
+
   async getTree(input: { accessToken: string; owner: string; repository: string; treeSha: string }): Promise<{ entries: GitTreeEntry[]; truncated: boolean }> {
     const result = objectValue(await this.apiJson(
       `/repos/${encodeURIComponent(input.owner)}/${encodeURIComponent(input.repository)}/git/trees/${encodeURIComponent(input.treeSha)}?recursive=1`,
@@ -546,6 +631,62 @@ export class GitHubApiClient implements GitHubInstallationGateway, GitHubReposit
     ), maxBytes);
     if (result.sha !== input.blobSha) throw new GitHubProviderError();
     return result;
+  }
+
+  async createBlob(input: { accessToken: string; owner: string; repository: string; bytes: Buffer }): Promise<string> {
+    if (input.bytes.byteLength < 1 || input.bytes.byteLength > 131_072) throw new GitHubProviderError();
+    const result = objectValue(await this.apiJson(`/repos/${encodeURIComponent(input.owner)}/${encodeURIComponent(input.repository)}/git/blobs`, {
+      method: 'POST', headers: { Authorization: `Bearer ${input.accessToken}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content: input.bytes.toString('base64'), encoding: 'base64' }),
+    }));
+    return gitSha(result.sha);
+  }
+
+  async createTree(input: { accessToken: string; owner: string; repository: string; baseTreeSha: string; entries: Array<{ path: string; mode: '100644'; type: 'blob'; sha: string | null }> }): Promise<string> {
+    if (!GIT_SHA.test(input.baseTreeSha) || input.entries.length < 1 || input.entries.length > 16) throw new GitHubProviderError();
+    const result = objectValue(await this.apiJson(`/repos/${encodeURIComponent(input.owner)}/${encodeURIComponent(input.repository)}/git/trees`, {
+      method: 'POST', headers: { Authorization: `Bearer ${input.accessToken}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ base_tree: input.baseTreeSha, tree: input.entries }),
+    }, MAX_TREE_RESPONSE_BYTES));
+    return gitSha(result.sha);
+  }
+
+  async createCommit(input: { accessToken: string; owner: string; repository: string; message: string; treeSha: string; parentSha: string; author: { name: string; email: string; date: string } }): Promise<string> {
+    if (!GIT_SHA.test(input.treeSha) || !GIT_SHA.test(input.parentSha) || Buffer.byteLength(input.message, 'utf8') > 16_384) throw new GitHubProviderError();
+    const result = objectValue(await this.apiJson(`/repos/${encodeURIComponent(input.owner)}/${encodeURIComponent(input.repository)}/git/commits`, {
+      method: 'POST', headers: { Authorization: `Bearer ${input.accessToken}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: input.message, tree: input.treeSha, parents: [input.parentSha], author: input.author, committer: input.author }),
+    }));
+    return gitSha(result.sha);
+  }
+
+  async createBranch(input: { accessToken: string; owner: string; repository: string; branch: string; commitSha: string }): Promise<void> {
+    if (!/^vigilo\/repair\/[0-9a-f]{64}$/.test(input.branch) || !GIT_SHA.test(input.commitSha)) throw new GitHubProviderError();
+    const result = objectValue(await this.apiJson(`/repos/${encodeURIComponent(input.owner)}/${encodeURIComponent(input.repository)}/git/refs`, {
+      method: 'POST', headers: { Authorization: `Bearer ${input.accessToken}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ref: `refs/heads/${input.branch}`, sha: input.commitSha }),
+    }));
+    const object = objectValue(result.object);
+    if (result.ref !== `refs/heads/${input.branch}` || object.type !== 'commit' || gitSha(object.sha) !== input.commitSha) throw new GitHubProviderError();
+  }
+
+  async createDraftPullRequest(input: { accessToken: string; owner: string; repository: string; title: string; body: string; head: string; base: string }): Promise<PublicationPullRequest> {
+    return parseRepositoryPullRequest(await this.apiJson(`/repos/${encodeURIComponent(input.owner)}/${encodeURIComponent(input.repository)}/pulls`, {
+      method: 'POST', headers: { Authorization: `Bearer ${input.accessToken}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title: input.title, body: input.body, head: input.head, base: input.base, draft: true, maintainer_can_modify: false }),
+    }), input.owner, input.repository);
+  }
+
+  async listPullRequests(input: { accessToken: string; owner: string; repository: string; head: string; base: string }): Promise<PublicationPullRequest[]> {
+    const query = new URLSearchParams({ state: 'all', head: `${input.owner}:${input.head}`, base: input.base, per_page: '100' });
+    const result = await this.apiJson(`/repos/${encodeURIComponent(input.owner)}/${encodeURIComponent(input.repository)}/pulls?${query.toString()}`, { headers: { Authorization: `Bearer ${input.accessToken}` } });
+    if (!Array.isArray(result) || result.length > 100) throw new GitHubProviderError();
+    return result.map((value) => parseRepositoryPullRequest(value, input.owner, input.repository));
+  }
+
+  async getPullRequest(input: { accessToken: string; owner: string; repository: string; number: number }): Promise<PublicationPullRequest> {
+    if (!Number.isSafeInteger(input.number) || input.number < 1) throw new GitHubProviderError();
+    return parseRepositoryPullRequest(await this.apiJson(`/repos/${encodeURIComponent(input.owner)}/${encodeURIComponent(input.repository)}/pulls/${input.number}`, { headers: { Authorization: `Bearer ${input.accessToken}` } }), input.owner, input.repository);
   }
 
   async downloadRepositoryArchive(input: {

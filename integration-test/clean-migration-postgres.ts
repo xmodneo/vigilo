@@ -93,8 +93,17 @@ try {
       (select count(*)::int from pg_constraint where conrelid = 'human_review_decision'::regclass and contype = 'f' and confdeltype = 'r') as "decisionFkCount"
   `;
   const reviewPassed = reviewFacts?.table === 'human_review_decision' && reviewFacts.decisionGuard === 'human_review_decision_insert_guard' && reviewFacts.mutationGuard === 'human_review_decision_mutation_guard' && reviewFacts.childGuardCount === 4 && reviewFacts.decisionFkCount === 10;
-  if (!passed || !reviewPassed) throw new Error('clean_migration_probe_failed');
-  process.stdout.write(`${JSON.stringify({ migrations: '0000-0020', repairRunAttempt: 'present', investigation: 'present', repairCandidate: 'present', candidateVerification: 'present', aiInvestigation: 'present', aiCandidateGeneration: 'present', repairLoop: 'present', humanReview: 'present', constraints: 'current', result: 'passed' })}\n`);
+  const [publicationFacts] = await probe<{ publication: string | null; attempt: string | null; event: string | null; guardCount: number; restrictiveFks: number }[]>`
+    select
+      to_regclass('public.repair_publication')::text as publication,
+      to_regclass('public.repair_publication_attempt')::text as attempt,
+      to_regclass('public.repair_publication_event')::text as event,
+      (select count(*)::int from pg_trigger where tgname in ('repair_publication_insert_guard','repair_publication_update_guard','repair_publication_delete_guard','repair_publication_attempt_mutation_guard','repair_publication_event_insert_guard','repair_publication_event_mutation_guard','repair_publication_intent_mutation_guard') and not tgisinternal) as "guardCount",
+      (select count(*)::int from pg_constraint where conrelid = 'repair_publication'::regclass and contype = 'f' and confdeltype = 'r') as "restrictiveFks"
+  `;
+  const publicationPassed = publicationFacts?.publication === 'repair_publication' && publicationFacts.attempt === 'repair_publication_attempt' && publicationFacts.event === 'repair_publication_event' && publicationFacts.guardCount === 7 && publicationFacts.restrictiveFks === 10;
+  if (!passed || !reviewPassed || !publicationPassed) throw new Error('clean_migration_probe_failed');
+  process.stdout.write(`${JSON.stringify({ migrations: '0000-0021', repairRunAttempt: 'present', investigation: 'present', repairCandidate: 'present', candidateVerification: 'present', aiInvestigation: 'present', aiCandidateGeneration: 'present', repairLoop: 'present', humanReview: 'present', repairPublication: 'present', constraints: 'current', result: 'passed' })}\n`);
 } finally {
   if (probe) await probe.end();
   await admin`select pg_terminate_backend(pid) from pg_stat_activity where datname = ${databaseName} and pid <> pg_backend_pid()`;

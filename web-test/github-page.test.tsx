@@ -8,6 +8,7 @@ import { RepairRunStatus } from '../app/app/github/repair-run-status.js';
 import { AiInvestigationStatus } from '../app/app/github/ai-investigation-status.js';
 import { RepairLoopStatus } from '../app/app/github/repair-loop-status.js';
 import { HumanReviewStatus } from '../app/app/github/human-review-status.js';
+import { RepairPublicationStatus } from '../app/app/github/repair-publication-status.js';
 
 test('GitHub connection page renders the disconnected installation action', () => {
   const html = renderToStaticMarkup(
@@ -281,6 +282,25 @@ test('human review renders exact escaped artifacts, distinct gates, and only the
   assert.equal((html.match(/name="idempotencyKey"/g) ?? []).length, 2);
   assert.doesNotMatch(html, /name="(?:candidateId|verificationId|evidenceId|workspaceId|commit|profileIdentity)"/);
   assert.doesNotMatch(html, /sandboxName|sandboxSessionId|action="[^"]*(?:publish|pull-request)|>\s*(?:Publish|Create PR|Merge|Deploy)\s*</i);
+});
+
+test('draft publication UI keeps the independent gate disabled and exposes no merge or deployment action', () => {
+  const review = {
+    repairRunId: '11111111-1111-4111-8111-111111111111', status: 'decided' as const, ineligibleReason: null,
+    reviewSubjectIdentity: 'a'.repeat(64), liveAcceptanceStatus: 'pending' as const, subject: null,
+    decision: { id: '22222222-2222-4222-8222-222222222222', decision: 'approved' as const, reviewerUserId: '33333333-3333-4333-8333-333333333333', decisionIdentity: 'b'.repeat(64), createdAt: new Date('2032-02-03T04:05:06.000Z') },
+    history: { items: [], truncated: false },
+  };
+  const closed = renderToStaticMarkup(<RepairPublicationStatus review={review} publication={null} events={[]} idempotencyKey="44444444-4444-4444-8444-444444444444" />);
+  assert.match(closed, /live acceptance remains pending/i);
+  assert.match(closed, /disabled=""/);
+  assert.match(closed, /action="\/api\/repair-runs\/11111111-1111-4111-8111-111111111111\/publications"/);
+  assert.deepEqual([...closed.matchAll(/name="([^"]+)"/g)].map((match) => match[1]), ['confirmation', 'decisionIdentity', 'idempotencyKey']);
+  assert.doesNotMatch(closed, /name="(?:repositoryId|candidateId|verificationId|branch|installationId)"/);
+  assert.doesNotMatch(closed, />\s*(?:Merge|Deploy|Ready for review|Delete branch)\s*</i);
+  const published = renderToStaticMarkup(<RepairPublicationStatus review={review} publication={{ id: '55555555-5555-4555-8555-555555555555', repairRunId: review.repairRunId, state: 'published', checkpoint: 'completed', targetBranch: `vigilo/repair/${'c'.repeat(64)}`, targetBaseBranch: 'main', expectedCommitSha: 'd'.repeat(40), remoteBranchCommitSha: 'd'.repeat(40), pullRequest: { id: 7, number: 9, nodeId: 'PR_node', url: 'https://github.com/example/repo/pull/9' }, failureCode: null, createdAt: new Date('2032-02-03T04:05:06.000Z'), completedAt: new Date('2032-02-03T04:06:06.000Z') }} events={[{ id: '66666666-6666-4666-8666-666666666666', eventType: 'completed', checkpoint: 'completed', toState: 'published', failureCode: null, createdAt: new Date('2032-02-03T04:06:06.000Z') }]} idempotencyKey="44444444-4444-4444-8444-444444444444" />);
+  assert.match(published, /href="https:\/\/github.com\/example\/repo\/pull\/9"/);
+  assert.match(published, /Publication history/);
 });
 
 test('eligible Repair Run renders its objective and bounded investigation status', () => {

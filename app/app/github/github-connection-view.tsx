@@ -6,6 +6,13 @@ import { AiInvestigationStatus, type AiCandidateGenerationSummary, type AiInvest
 import { RepairLoopStatus, type RepairLoopSummary } from './repair-loop-status.tsx';
 import { HumanReviewStatus } from './human-review-status.tsx';
 import type { HumanReviewResult } from '../../../lib/human-reviews/types.ts';
+import { RepairPublicationStatus } from './repair-publication-status.tsx';
+import type { RepairPublicationResult } from '../../../lib/repair-publications/types.ts';
+
+type RepairPublicationHistory = {
+  publication: RepairPublicationResult | null;
+  events: Array<{ id: string; eventType: string; checkpoint: string; toState: string; failureCode: string | null; createdAt: Date }>;
+};
 
 interface InstallationSummary {
   accountLogin: string;
@@ -92,6 +99,8 @@ export interface GitHubConnectionViewProps {
   repairLoopRequestId?: string;
   humanReview?: HumanReviewResult | null;
   humanReviewRequestId?: string;
+  repairPublication?: RepairPublicationHistory | null;
+  repairPublicationRequestId?: string;
   repositoryError?: 'unavailable';
   selectedRepository?: RepositorySummary | null;
   workspaceId: string;
@@ -116,6 +125,8 @@ export function GitHubConnectionView({
   repairLoopRequestId,
   humanReview = null,
   humanReviewRequestId,
+  repairPublication = null,
+  repairPublicationRequestId,
   repositoryError,
   selectedRepository = null,
   workspaceId,
@@ -224,6 +235,7 @@ export function GitHubConnectionView({
                     )}
                     {repairLoop && <RepairLoopStatus initialLoop={repairLoop} />}
                     {repairLoop && humanReview && humanReviewRequestId && <HumanReviewStatus review={humanReview} idempotencyKey={humanReviewRequestId} />}
+                    {repairLoop && humanReview && repairPublicationRequestId && <RepairPublicationStatus review={humanReview} publication={repairPublication?.publication ?? null} events={repairPublication?.events ?? []} idempotencyKey={repairPublicationRequestId} />}
                     {investigation?.state === 'ready' && <RepairCandidateStatus candidate={repairCandidate} verification={candidateVerification} workflowOwned={repairLoopActive} />}
                     {baseline && (
                       <section className="repository-panel" aria-labelledby="baseline-title">

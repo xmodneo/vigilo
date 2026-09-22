@@ -9,7 +9,7 @@ import {
   candidateVerification, candidateVerificationAttempt, candidateVerificationEvidence,
   executionProfile, githubInstallation, humanReviewDecision, investigation, repairCandidate,
   repairCandidateFile, repairIntent, repairLoop, repairLoopIteration, repairRun,
-  repository, repositoryBaseline, user, workspace,
+  repairPublication, repairPublicationAttempt, repairPublicationEvent, repository, repositoryBaseline, user, workspace,
 } from '../db/schema.ts';
 import type { AuthenticatedWorkspace } from '../lib/auth/protected-context.ts';
 import { AccessDeniedError } from '../lib/auth/protected-context.ts';
@@ -27,11 +27,24 @@ import {
 import { createHumanReviewHandlers } from '../lib/human-reviews/handlers.ts';
 import { CandidateVerificationError, startCandidateVerification } from '../lib/candidate-verifications/flow.ts';
 import { createTestContext } from './support.ts';
+import { createRepairPublication, RepairPublicationError } from '../lib/repair-publications/flow.ts';
+import { processRepairPublicationJobForTest, reserveApprovedPublicationForTest } from '../lib/repair-publications/testing.ts';
+import { processRepairPublicationJob } from '../lib/repair-publications/worker.ts';
+import { parseRepairPublicationJobPayload, type TransactionalRepairPublicationQueue } from '../lib/repair-runs/queue.ts';
+import { prepareGitPublication, type PreparedGitPublication } from '../lib/repair-publications/git-objects.ts';
+import type { PublicationPullRequest, RepairPublicationGateway } from '../lib/repair-publications/types.ts';
+import { createRepairPublicationHandlers } from '../lib/repair-publications/handlers.ts';
 
 const NOW = new Date('2032-02-03T04:05:06.000Z');
 const COMMIT = 'a'.repeat(40); const SOURCE = 'c'.repeat(64);
 const REPOSITORY_ID = 61001; const INSTALLATION_ID = 62001;
 const FILE_CONTENT = '<script>alert("escaped")</script>\nexport const repaired = true;\n';
+
+test('publication queue payload contains only its durable publication identifier', () => {
+  const id = randomUUID();
+  assert.deepEqual(parseRepairPublicationJobPayload({ version: 1, publicationId: id }), { version: 1, publicationId: id });
+  assert.throws(() => parseRepairPublicationJobPayload({ version: 1, publicationId: id, repositoryId: REPOSITORY_ID }), /invalid_repair_publication_job_payload/);
+});
 
 async function seedVerifiedReview(
   context: Awaited<ReturnType<typeof createTestContext>>,
@@ -93,6 +106,79 @@ async function seedVerifiedReview(
   return { owner, userId, workspaceId, runId, baselineId, investigationId, aiInvestigationId, profileIdentity, loopId, iterationId, generationId, candidateId, candidateIdentity: storedCandidateIdentity, verificationId, evidenceId, file };
 }
 
+const EMPTY_TREE = '4b825dc642cb6eb9a060e54bf8d69288fbee4904';
+type PublicationRow = typeof repairPublication.$inferSelect;
+
+class FakePublicationGateway implements RepairPublicationGateway {
+  readonly calls: string[] = [];
+  branch: string | null = null;
+  pullRequests: PublicationPullRequest[] = [];
+  defaultBranchReads = 0;
+  advanceDefaultAt = Number.POSITIVE_INFINITY;
+  branchConflict = false;
+  uncertainPr = false;
+  substitutePr = false;
+  conflictingPr = false;
+  failRevocation = false;
+  revoked = false;
+  beforeBranchRead: (() => Promise<void>) | null = null;
+  beforePullRequestList: (() => Promise<void>) | null = null;
+  afterBranchCreate: (() => Promise<void>) | null = null;
+  beforePullRequestGet: (() => Promise<void>) | null = null;
+
+  constructor(private readonly row: PublicationRow, private readonly prepared: PreparedGitPublication) {}
+  async getInstallation() { this.calls.push('installation'); return { id: INSTALLATION_ID, appId: 1, appSlug: 'vigilo', suspendedAt: null, permissions: { contents: 'write', metadata: 'read', pull_requests: 'write' } }; }
+  async createPublicationAccessToken() { this.calls.push('token'); return { accessToken: 'test-token', expiresAt: new Date(NOW.getTime() + 30_000), repository: { id: REPOSITORY_ID, ownerLogin: 'reviewer', name: 'repo', fullName: 'reviewer/repo', defaultBranch: 'main', isPrivate: true } }; }
+  async revokeInstallationAccessToken() { this.calls.push('revoke'); this.revoked = true; if (this.failRevocation) throw new Error('revocation_failed'); }
+  async getRepositoryMetadata() { return { id: REPOSITORY_ID, ownerLogin: 'reviewer', name: 'repo', fullName: 'reviewer/repo', defaultBranch: 'main', isPrivate: true }; }
+  async resolveBranchCommit() { this.defaultBranchReads += 1; return this.defaultBranchReads >= this.advanceDefaultAt ? '9'.repeat(40) : COMMIT; }
+  async getBranchCommit() {
+    const beforeRead = this.beforeBranchRead; this.beforeBranchRead = null;
+    if (beforeRead) await beforeRead();
+    if (this.branchConflict) return '8'.repeat(40);
+    return this.branch;
+  }
+  async getCommit(input: { commitSha: string }) {
+    if (input.commitSha === COMMIT) return { sha: COMMIT, treeSha: EMPTY_TREE, parents: ['0'.repeat(40)], message: 'base', author: { name: 'Base', email: 'base@test.invalid', date: NOW.toISOString() }, committer: { name: 'Base', email: 'base@test.invalid', date: NOW.toISOString() } };
+    return { sha: this.prepared.commit.sha, treeSha: this.prepared.treeSha, parents: [COMMIT], message: this.prepared.commit.message, author: { ...this.prepared.commit.author, date: this.prepared.commit.committedAt }, committer: { ...this.prepared.commit.author, date: this.prepared.commit.committedAt } };
+  }
+  async getTree(input: { treeSha: string }) { return input.treeSha === EMPTY_TREE ? { entries: [], truncated: false } : { entries: this.prepared.entries.map((entry) => ({ ...entry, size: 1 })), truncated: false }; }
+  async getBlob(): Promise<{ bytes: Buffer; sha: string }> { throw new Error('unexpected_base_blob'); }
+  async createBlob(input: { bytes: Buffer }) { this.calls.push('blob'); return this.prepared.blobs.find((blob) => blob.bytes.equals(input.bytes))!.sha; }
+  async createTree() { this.calls.push('tree'); return this.prepared.treeSha; }
+  async createCommit() { this.calls.push('commit'); return this.prepared.commit.sha; }
+  async createBranch(input: { commitSha: string }) {
+    this.calls.push('branch'); this.branch = input.commitSha;
+    const afterCreate = this.afterBranchCreate; this.afterBranchCreate = null;
+    if (afterCreate) await afterCreate();
+  }
+  private pr(): PublicationPullRequest { return { id: 7001, number: 17, nodeId: 'PR_node', url: 'https://github.com/reviewer/repo/pull/17', state: 'open', draft: true, title: this.row.pullRequestTitle, body: this.row.pullRequestBody, headRef: this.row.targetBranch, headSha: this.prepared.commit.sha, baseRef: 'main', baseSha: COMMIT, repositoryId: REPOSITORY_ID }; }
+  async createDraftPullRequest() { this.calls.push('pr'); if (this.uncertainPr) throw new Error('transport_unknown'); const pr = this.pr(); this.pullRequests = [pr]; return pr; }
+  async listPullRequests() {
+    const beforeList = this.beforePullRequestList; this.beforePullRequestList = null;
+    if (beforeList) await beforeList();
+    if (this.conflictingPr) return [{ ...this.pr(), title: 'Conflicting pre-existing pull request' }];
+    return this.pullRequests;
+  }
+  async getPullRequest() {
+    const beforeGet = this.beforePullRequestGet; this.beforePullRequestGet = null;
+    if (beforeGet) await beforeGet();
+    const value = this.pullRequests[0] ?? this.pr(); return this.substitutePr ? { ...value, headSha: '7'.repeat(40) } : value;
+  }
+}
+
+async function approvedPublication(context: Awaited<ReturnType<typeof createTestContext>>) {
+  const seeded = await seedVerifiedReview(context);
+  const review = await getHumanReview(context.database, seeded.owner, seeded.runId);
+  const decision = await createHumanReviewDecision(context.database, seeded.owner, seeded.runId, { decision: 'approved', reviewSubjectIdentity: review.reviewSubjectIdentity!, idempotencyKey: randomUUID() });
+  const authority = await resolveApprovedHumanReviewAuthority(context.database, seeded.workspaceId, decision.id);
+  const queue: TransactionalRepairPublicationQueue = { enqueuePublication: async (_transaction, payload) => payload.publicationId };
+  const publication = await reserveApprovedPublicationForTest(context.database, seeded.owner, queue, authority, { decisionIdentity: decision.decisionIdentity, idempotencyKey: randomUUID() }, { clock: () => NOW });
+  const [row] = await context.database.select().from(repairPublication).where(eq(repairPublication.id, publication.id)); assert.ok(row);
+  const prepared = prepareGitPublication({ baseCommitSha: COMMIT, baseTreeSha: EMPTY_TREE, candidateIdentity: seeded.candidateIdentity, committedAt: NOW, files: [seeded.file], profileIdentity: seeded.profileIdentity, treeEntries: [] });
+  return { authority, publication, row, prepared };
+}
+
 test('eligible exact evidence can be approved and remains immutable and release-gated', async (t) => {
   const context = await createTestContext(); t.after(() => context.client.close());
   const seeded = await seedVerifiedReview(context);
@@ -113,6 +199,185 @@ test('eligible exact evidence can be approved and remains immutable and release-
   await context.database.execute(sql`drop trigger human_review_decision_mutation_guard on human_review_decision`);
   await context.database.update(humanReviewDecision).set({ githubRepositoryId: REPOSITORY_ID + 1 }).where(eq(humanReviewDecision.id, decision.id));
   await assert.rejects(resolveApprovedHumanReviewAuthority(context.database, seeded.workspaceId, decision.id), (error: unknown) => error instanceof HumanReviewError && error.code === 'human_review_ineligible');
+});
+
+test('production publication reservation remains hard-closed and performs no queue or GitHub work', async (t) => {
+  const context = await createTestContext(); t.after(() => context.client.close());
+  const seeded = await seedVerifiedReview(context);
+  const review = await getHumanReview(context.database, seeded.owner, seeded.runId);
+  const decision = await createHumanReviewDecision(context.database, seeded.owner, seeded.runId, { decision: 'approved', reviewSubjectIdentity: review.reviewSubjectIdentity!, idempotencyKey: randomUUID() });
+  let queueCalls = 0;
+  const queue: TransactionalRepairPublicationQueue = { enqueuePublication: async (_transaction, payload) => { queueCalls += 1; return payload.publicationId; } };
+  await assert.rejects(
+    createRepairPublication(context.database, seeded.owner, queue, seeded.runId, { decisionIdentity: decision.decisionIdentity, idempotencyKey: randomUUID() }),
+    (error: unknown) => error instanceof HumanReviewError && error.code === 'live_acceptance_pending',
+  );
+  assert.equal(queueCalls, 0);
+  assert.equal((await context.database.select().from(repairPublication)).length, 0);
+});
+
+test('test-local publication reservation is exact, idempotent, immutable, and workspace isolated', async (t) => {
+  const context = await createTestContext(); t.after(() => context.client.close());
+  const seeded = await seedVerifiedReview(context);
+  const review = await getHumanReview(context.database, seeded.owner, seeded.runId);
+  const decision = await createHumanReviewDecision(context.database, seeded.owner, seeded.runId, { decision: 'approved', reviewSubjectIdentity: review.reviewSubjectIdentity!, idempotencyKey: randomUUID() });
+  const authority = await resolveApprovedHumanReviewAuthority(context.database, seeded.workspaceId, decision.id);
+  const key = randomUUID(); let queueCalls = 0;
+  const queue: TransactionalRepairPublicationQueue = { enqueuePublication: async (_transaction, payload) => { queueCalls += 1; return payload.publicationId; } };
+  const [first, second] = await Promise.all([
+    reserveApprovedPublicationForTest(context.database, seeded.owner, queue, authority, { decisionIdentity: decision.decisionIdentity, idempotencyKey: key }, { clock: () => new Date(NOW.getTime() + 789) }),
+    reserveApprovedPublicationForTest(context.database, seeded.owner, queue, authority, { decisionIdentity: decision.decisionIdentity, idempotencyKey: key }, { clock: () => new Date(NOW.getTime() + 789) }),
+  ]);
+  assert.equal(first.id, second.id);
+  assert.equal(queueCalls, 1);
+  const [stored] = await context.database.select().from(repairPublication);
+  assert.ok(stored);
+  assert.equal(stored.createdAt.toISOString(), NOW.toISOString());
+  assert.deepEqual({ run: stored.repairRunId, loop: stored.repairLoopId, decision: stored.humanReviewDecisionId, candidate: stored.repairCandidateId, verification: stored.candidateVerificationId, evidence: stored.verificationEvidenceId }, { run: seeded.runId, loop: seeded.loopId, decision: decision.id, candidate: seeded.candidateId, verification: seeded.verificationId, evidence: seeded.evidenceId });
+  assert.equal((await context.database.select().from(repairPublicationEvent)).length, 1);
+  await assert.rejects(context.database.update(repairPublication).set({ targetBranch: `vigilo/repair/${'f'.repeat(64)}` }).where(eq(repairPublication.id, first.id)));
+  await assert.rejects(context.database.delete(repairPublication).where(eq(repairPublication.id, first.id)));
+  const [event] = await context.database.select().from(repairPublicationEvent).where(eq(repairPublicationEvent.publicationId, first.id)); assert.ok(event);
+  await assert.rejects(context.database.update(repairPublicationEvent).set({ eventType: 'failed' }).where(eq(repairPublicationEvent.id, event.id)));
+  await assert.rejects(context.database.delete(repairPublicationEvent).where(eq(repairPublicationEvent.id, event.id)));
+  const foreign = { ...seeded.owner, workspace: { ...seeded.owner.workspace, id: randomUUID() } };
+  await assert.rejects(reserveApprovedPublicationForTest(context.database, foreign, queue, authority, { decisionIdentity: decision.decisionIdentity, idempotencyKey: randomUUID() }), (error: unknown) => error instanceof RepairPublicationError && error.code === 'publication_invalid_request');
+});
+
+test('production publication worker rechecks the real release gate before any GitHub operation', async (t) => {
+  const context = await createTestContext(); t.after(() => context.client.close());
+  const seeded = await seedVerifiedReview(context);
+  const review = await getHumanReview(context.database, seeded.owner, seeded.runId);
+  const decision = await createHumanReviewDecision(context.database, seeded.owner, seeded.runId, { decision: 'approved', reviewSubjectIdentity: review.reviewSubjectIdentity!, idempotencyKey: randomUUID() });
+  const authority = await resolveApprovedHumanReviewAuthority(context.database, seeded.workspaceId, decision.id);
+  const queue: TransactionalRepairPublicationQueue = { enqueuePublication: async (_transaction, payload) => payload.publicationId };
+  const publication = await reserveApprovedPublicationForTest(context.database, seeded.owner, queue, authority, { decisionIdentity: decision.decisionIdentity, idempotencyKey: randomUUID() }, { clock: () => NOW });
+  let gatewayCalls = 0;
+  const unavailable = new Proxy({}, { get: () => async () => { gatewayCalls += 1; throw new Error('unexpected_gateway_call'); } });
+  const result = await processRepairPublicationJob({ id: publication.id, data: { version: 1, publicationId: publication.id } } as never, { database: context.database, configuration: { appId: 1, clientId: 'client', appSlug: 'vigilo', baseUrl: 'https://github.com' }, gateway: unavailable as never, logger: { write() {} }, clock: () => NOW });
+  assert.equal(result.status, 'completed');
+  assert.equal(gatewayCalls, 0);
+  const [failed] = await context.database.select().from(repairPublication).where(eq(repairPublication.id, publication.id));
+  assert.deepEqual({ state: failed?.state, code: failed?.failureCode }, { state: 'failed', code: 'live_acceptance_pending' });
+});
+
+test('publication handlers accept only explicit same-origin confirmation and remain gate-closed', async (t) => {
+  const context = await createTestContext(); t.after(() => context.client.close()); const seeded = await seedVerifiedReview(context);
+  const review = await getHumanReview(context.database, seeded.owner, seeded.runId);
+  const decision = await createHumanReviewDecision(context.database, seeded.owner, seeded.runId, { decision: 'approved', reviewSubjectIdentity: review.reviewSubjectIdentity!, idempotencyKey: randomUUID() });
+  let queued = 0;
+  const handlers = createRepairPublicationHandlers({ database: context.database, configuration: { baseUrl: 'http://localhost:3000' } as never, queue: { enqueuePublication: async (_transaction, payload) => { queued += 1; return payload.publicationId; } }, resolveContext: async () => seeded.owner });
+  const body = new URLSearchParams({ confirmation: 'publish_draft', decisionIdentity: decision.decisionIdentity, idempotencyKey: randomUUID() });
+  const forbidden = await handlers.create(new Request('http://localhost:3000/api', { method: 'POST', headers: { origin: 'https://evil.test', 'content-type': 'application/x-www-form-urlencoded' }, body }), seeded.runId);
+  assert.equal(forbidden.status, 403);
+  const closed = await handlers.create(new Request('http://localhost:3000/api', { method: 'POST', headers: { origin: 'http://localhost:3000', 'content-type': 'application/x-www-form-urlencoded' }, body }), seeded.runId);
+  assert.equal(closed.status, 303); assert.match(closed.headers.get('location')!, /live_acceptance_pending/); assert.equal(queued, 0);
+  const forged = new URLSearchParams({ confirmation: 'publish_draft', decisionIdentity: decision.decisionIdentity, idempotencyKey: randomUUID(), repositoryId: String(REPOSITORY_ID) });
+  const rejected = await handlers.create(new Request('http://localhost:3000/api', { method: 'POST', headers: { origin: 'http://localhost:3000', 'content-type': 'application/x-www-form-urlencoded' }, body: forged }), seeded.runId);
+  assert.match(rejected.headers.get('location')!, /publication_invalid_request/);
+  const oversized = new URLSearchParams({ confirmation: 'publish_draft', decisionIdentity: decision.decisionIdentity, idempotencyKey: randomUUID(), padding: 'x'.repeat(2_000) });
+  const tooLarge = await handlers.create(new Request('http://localhost:3000/api', { method: 'POST', headers: { origin: 'http://localhost:3000', 'content-type': 'application/x-www-form-urlencoded' }, body: oversized }), seeded.runId);
+  assert.match(tooLarge.headers.get('location')!, /publication_invalid_request/);
+  const wrongMedia = await handlers.create(new Request('http://localhost:3000/api', { method: 'POST', headers: { origin: 'http://localhost:3000', 'content-type': 'application/json' }, body: '{}' }), seeded.runId);
+  assert.match(wrongMedia.headers.get('location')!, /publication_invalid_request/);
+  const read = await handlers.read(new Request('http://localhost:3000/api'), seeded.runId);
+  assert.equal(read.headers.get('cache-control'), 'private, no-store'); assert.deepEqual(await read.json(), { publication: null, events: [] });
+});
+
+test('test-local worker publishes and reconciles one exact branch and draft PR', async (t) => {
+  const context = await createTestContext(); t.after(() => context.client.close());
+  const seeded = await approvedPublication(context); const gateway = new FakePublicationGateway(seeded.row, seeded.prepared);
+  const job = { id: seeded.publication.id, data: { version: 1, publicationId: seeded.publication.id } } as never;
+  const dependencies = { database: context.database, configuration: { appId: 1, clientId: 'client', appSlug: 'vigilo', baseUrl: 'https://github.com' }, gateway, logger: { write() {} }, clock: () => NOW };
+  const result = await processRepairPublicationJobForTest(job, dependencies, async () => seeded.authority);
+  assert.equal(result.status, 'completed');
+  const [published] = await context.database.select().from(repairPublication).where(eq(repairPublication.id, seeded.publication.id));
+  assert.deepEqual({ state: published?.state, checkpoint: published?.checkpoint, branch: published?.remoteBranchCommitSha, pr: published?.githubPullRequestNumber }, { state: 'published', checkpoint: 'completed', branch: seeded.prepared.commit.sha, pr: 17 });
+  assert.deepEqual(gateway.calls, ['installation', 'token', 'blob', 'tree', 'commit', 'branch', 'pr', 'revoke']);
+  assert.equal(gateway.revoked, true);
+  const before = gateway.calls.length;
+  assert.equal((await processRepairPublicationJobForTest(job, dependencies, async () => seeded.authority)).status, 'completed');
+  assert.equal(gateway.calls.length, before);
+  const [attempt] = await context.database.select().from(repairPublicationAttempt).where(eq(repairPublicationAttempt.publicationId, seeded.publication.id)); assert.ok(attempt);
+  await assert.rejects(context.database.update(repairPublicationAttempt).set({ ownershipToken: randomUUID() }).where(eq(repairPublicationAttempt.id, attempt.id)));
+  await assert.rejects(context.database.delete(repairPublicationAttempt).where(eq(repairPublicationAttempt.id, attempt.id)));
+});
+
+test('branch or PR substitution, base advance, ambiguous PR creation, and revocation failure stop closed', async (t) => {
+  for (const scenario of ['branch_conflict', 'base_advance', 'uncertain_pr', 'pr_substitution', 'pr_collision', 'revoke_failure', 'revoke_after_error'] as const) {
+    const context = await createTestContext(); t.after(() => context.client.close());
+    const seeded = await approvedPublication(context); const gateway = new FakePublicationGateway(seeded.row, seeded.prepared);
+    if (scenario === 'branch_conflict' || scenario === 'revoke_after_error') gateway.branchConflict = true;
+    if (scenario === 'base_advance') gateway.advanceDefaultAt = 5;
+    if (scenario === 'uncertain_pr') gateway.uncertainPr = true;
+    if (scenario === 'pr_substitution') gateway.substitutePr = true;
+    if (scenario === 'pr_collision') gateway.conflictingPr = true;
+    if (scenario === 'revoke_failure' || scenario === 'revoke_after_error') gateway.failRevocation = true;
+    const result = await processRepairPublicationJobForTest({ id: seeded.publication.id, data: { version: 1, publicationId: seeded.publication.id } } as never, { database: context.database, configuration: { appId: 1, clientId: 'client', appSlug: 'vigilo', baseUrl: 'https://github.com' }, gateway, logger: { write() {} }, clock: () => NOW }, async () => seeded.authority);
+    assert.equal(result.status, 'completed', scenario);
+    const [stored] = await context.database.select().from(repairPublication).where(eq(repairPublication.id, seeded.publication.id));
+    assert.equal(stored?.state, 'review_required', scenario);
+    assert.equal(stored?.failureCode, scenario === 'branch_conflict' ? 'github_branch_conflict' : scenario === 'base_advance' ? 'base_advanced_after_branch' : scenario === 'uncertain_pr' ? 'github_pr_outcome_unknown' : scenario === 'pr_substitution' ? 'github_pr_mismatch' : scenario === 'pr_collision' ? 'github_pr_ambiguous' : 'token_revocation_unconfirmed');
+    assert.equal(gateway.revoked, true, scenario);
+    if (scenario === 'branch_conflict' || scenario === 'base_advance' || scenario === 'pr_collision') assert.ok(!gateway.calls.includes('pr'), scenario);
+  }
+});
+
+test('lease loss cannot authorize a successor GitHub write or stale terminal transition', async (t) => {
+  const abandonActiveAttempt = async (context: Awaited<ReturnType<typeof createTestContext>>, publicationId: string) => {
+    const [attempt] = await context.database.select().from(repairPublicationAttempt).where(and(eq(repairPublicationAttempt.publicationId, publicationId), eq(repairPublicationAttempt.state, 'active'))).limit(1);
+    assert.ok(attempt);
+    await context.database.update(repairPublicationAttempt).set({ state: 'abandoned', failureCode: 'stale_worker_recovery', completedAt: NOW }).where(eq(repairPublicationAttempt.id, attempt.id));
+  };
+
+  for (const boundary of ['branch_create', 'pr_create', 'terminal'] as const) {
+    const context = await createTestContext(); t.after(() => context.client.close());
+    const seeded = await approvedPublication(context); const gateway = new FakePublicationGateway(seeded.row, seeded.prepared);
+    if (boundary === 'pr_create') gateway.beforePullRequestList = () => abandonActiveAttempt(context, seeded.publication.id);
+    else gateway.beforeBranchRead = () => abandonActiveAttempt(context, seeded.publication.id);
+    if (boundary === 'terminal') gateway.branchConflict = true;
+
+    const result = await processRepairPublicationJobForTest(
+      { id: seeded.publication.id, data: { version: 1, publicationId: seeded.publication.id } } as never,
+      { database: context.database, configuration: { appId: 1, clientId: 'client', appSlug: 'vigilo', baseUrl: 'https://github.com' }, gateway, logger: { write() {} }, clock: () => NOW },
+      async () => seeded.authority,
+    );
+    assert.deepEqual({ status: result.status, code: result.output?.code }, { status: 'failed', code: 'publication_ownership_lost' }, boundary);
+    const [stored] = await context.database.select().from(repairPublication).where(eq(repairPublication.id, seeded.publication.id));
+    assert.equal(stored?.state, 'publishing', boundary);
+    assert.equal(stored?.checkpoint, boundary === 'pr_create' ? 'pr_create_requested' : 'branch_create_requested', boundary);
+    if (boundary !== 'pr_create') assert.equal(gateway.calls.includes('branch'), false, boundary);
+    assert.equal(gateway.calls.includes('pr'), false, boundary);
+  }
+});
+
+test('restart records exact branch and PR facts before classifying an advanced base', async (t) => {
+  const abandonActiveAttempt = async (context: Awaited<ReturnType<typeof createTestContext>>, publicationId: string) => {
+    const [attempt] = await context.database.select().from(repairPublicationAttempt).where(and(eq(repairPublicationAttempt.publicationId, publicationId), eq(repairPublicationAttempt.state, 'active'))).limit(1);
+    assert.ok(attempt);
+    await context.database.update(repairPublicationAttempt).set({ state: 'abandoned', failureCode: 'stale_worker_recovery', completedAt: NOW }).where(eq(repairPublicationAttempt.id, attempt.id));
+  };
+
+  for (const boundary of ['branch', 'pull_request'] as const) {
+    const context = await createTestContext(); t.after(() => context.client.close());
+    const seeded = await approvedPublication(context); const gateway = new FakePublicationGateway(seeded.row, seeded.prepared);
+    if (boundary === 'branch') gateway.afterBranchCreate = () => abandonActiveAttempt(context, seeded.publication.id);
+    else gateway.beforePullRequestGet = () => abandonActiveAttempt(context, seeded.publication.id);
+    const job = { id: seeded.publication.id, data: { version: 1, publicationId: seeded.publication.id } } as never;
+    const dependencies = { database: context.database, configuration: { appId: 1, clientId: 'client', appSlug: 'vigilo', baseUrl: 'https://github.com' }, gateway, logger: { write() {} }, clock: () => NOW };
+
+    const interrupted = await processRepairPublicationJobForTest(job, dependencies, async () => seeded.authority);
+    assert.deepEqual({ status: interrupted.status, code: interrupted.output?.code }, { status: 'failed', code: 'publication_ownership_lost' }, boundary);
+    const [beforeResume] = await context.database.select().from(repairPublication).where(eq(repairPublication.id, seeded.publication.id));
+    assert.equal(beforeResume?.checkpoint, boundary === 'branch' ? 'branch_create_requested' : 'pr_create_requested', boundary);
+
+    gateway.advanceDefaultAt = gateway.defaultBranchReads + 1;
+    const resumed = await processRepairPublicationJobForTest(job, dependencies, async () => seeded.authority);
+    assert.equal(resumed.status, 'completed', boundary);
+    const [afterResume] = await context.database.select().from(repairPublication).where(eq(repairPublication.id, seeded.publication.id));
+    assert.deepEqual({ state: afterResume?.state, code: afterResume?.failureCode, branch: afterResume?.remoteBranchCommitSha }, { state: 'review_required', code: 'base_advanced_after_branch', branch: seeded.prepared.commit.sha }, boundary);
+    assert.equal(afterResume?.githubPullRequestNumber, boundary === 'pull_request' ? 17 : null, boundary);
+  }
 });
 
 test('normal rejection is immutable while unmeasured and failed verification subjects stay ineligible', async (t) => {

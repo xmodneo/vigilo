@@ -26,6 +26,7 @@ import { publicAiCandidateGeneration } from '../../../lib/ai-candidate-generatio
 import { getRepairLoopForContext } from '../../../lib/repair-loops/server';
 import { publicRepairLoop } from '../../../lib/repair-loops/handlers';
 import { getHumanReviewForContext } from '../../../lib/human-reviews/server';
+import { getRepairPublicationForContext } from '../../../lib/repair-publications/server';
 import { GitHubConnectionView } from './github-connection-view';
 
 export default async function GitHubConnectionPage() {
@@ -49,6 +50,7 @@ export default async function GitHubConnectionPage() {
     let aiCandidateGeneration = undefined;
     let repairLoop = undefined;
     let humanReview = undefined;
+    let repairPublication = undefined;
     if (installation) {
       try {
         const overview = await getRepositoryOverviewForContext(context);
@@ -91,6 +93,9 @@ export default async function GitHubConnectionPage() {
         humanReview = repairRun && repairLoop
           ? await getHumanReviewForContext(context, repairRun.id)
           : null;
+        repairPublication = repairRun
+          ? await getRepairPublicationForContext(context, repairRun.id)
+          : null;
       } catch {
         repositoryError = 'unavailable';
       }
@@ -111,6 +116,8 @@ export default async function GitHubConnectionPage() {
         {...(repairLoop !== undefined ? { repairLoop } : {})}
         {...(humanReview !== undefined ? { humanReview } : {})}
         humanReviewRequestId={randomUUID()}
+        {...(repairPublication !== undefined ? { repairPublication } : {})}
+        repairPublicationRequestId={randomUUID()}
         {...(baseline !== undefined ? { baseline } : {})}
         {...(executionProfile !== undefined ? { executionProfile } : {})}
         {...(repositories ? { repositories } : {})}

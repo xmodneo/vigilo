@@ -204,6 +204,91 @@ test('repository discovery rejects malformed provider metadata', async () => {
   );
 });
 
+test('publication token is repository-scoped, permission-exact, short-lived, and revoked', async () => {
+  const keys = keyPair();
+  const requests: Array<{ body: string; method: string; url: string }> = [];
+  const responses = [
+    Response.json({
+      token: 'ghs_publication-token-sentinel', expires_at: '2026-09-07T12:59:00.000Z',
+      permissions: { contents: 'write', metadata: 'read', pull_requests: 'write' },
+      repositories: [repositoryResponse({ id: 8101 })],
+    }, { status: 201 }),
+    new Response(null, { status: 204 }),
+  ];
+  const client = new GitHubApiClient(CONFIGURATION, keys.privateKey, async (input, init) => {
+    requests.push({ body: typeof init?.body === 'string' ? init.body : '', method: init?.method ?? 'GET', url: String(input) });
+    return responses.shift()!;
+  }, () => NOW);
+
+  const token = await client.createPublicationAccessToken({ installationId: 7001, repositoryId: 8101 });
+  await client.revokeInstallationAccessToken(token.accessToken);
+
+  assert.equal(token.repository.id, 8101);
+  assert.equal(token.expiresAt.toISOString(), '2026-09-07T12:59:00.000Z');
+  assert.deepEqual(JSON.parse(requests[0]!.body), {
+    permissions: { contents: 'write', metadata: 'read', pull_requests: 'write' },
+    repository_ids: [8101],
+  });
+  assert.equal(requests[1]?.url, 'https://api.github.com/installation/token');
+  assert.equal(requests[1]?.method, 'DELETE');
+});
+
+test('publication token rejects broadened provider scope and revokes the returned credential', async () => {
+  const keys = keyPair();
+  let calls = 0;
+  const client = new GitHubApiClient(CONFIGURATION, keys.privateKey, async () => {
+    calls += 1;
+    if (calls === 1) return Response.json({
+      token: 'ghs_broadened-token-sentinel', expires_at: '2026-09-07T12:59:00.000Z',
+      permissions: { contents: 'write', metadata: 'read', pull_requests: 'write', workflows: 'write' },
+      repositories: [repositoryResponse({ id: 8101 })],
+    }, { status: 201 });
+    return new Response(null, { status: 204 });
+  }, () => NOW);
+  await assert.rejects(client.createPublicationAccessToken({ installationId: 7001, repositoryId: 8101 }), /github_api_error/);
+  assert.equal(calls, 2);
+});
+
+test('publication gateway exposes only direct Git objects, branch creation, and draft PR operations', async () => {
+  const keys = keyPair(); const requests: Array<{ url: string; method: string; body: string }> = [];
+  const blobSha = '1'.repeat(40); const treeSha = '2'.repeat(40); const commitSha = '3'.repeat(40); const branch = `vigilo/repair/${'4'.repeat(64)}`;
+  const pr = { id: 91, number: 7, node_id: 'PR_node', html_url: 'https://github.com/xmodneo/vigilo/pull/7', state: 'open', draft: true, title: 'Vigilo repair', body: 'Draft only.', head: { ref: branch, sha: commitSha, repo: { id: 8101 } }, base: { ref: 'main', sha: 'a'.repeat(40), repo: { id: 8101 } } };
+  const responses = [
+    new Response(null, { status: 404 }), Response.json({ sha: blobSha }), Response.json({ sha: treeSha }), Response.json({ sha: commitSha }),
+    Response.json({ ref: `refs/heads/${branch}`, object: { type: 'commit', sha: commitSha } }), Response.json(pr), Response.json([pr]), Response.json(pr),
+  ];
+  const client = new GitHubApiClient(CONFIGURATION, keys.privateKey, async (input, init) => {
+    requests.push({ url: String(input), method: init?.method ?? 'GET', body: typeof init?.body === 'string' ? init.body : '' });
+    const response = responses.shift(); assert.ok(response); return response;
+  }, () => NOW);
+  assert.equal(await client.getBranchCommit({ accessToken: 'token', owner: 'xmodneo', repository: 'vigilo', branch }), null);
+  assert.equal(await client.createBlob({ accessToken: 'token', owner: 'xmodneo', repository: 'vigilo', bytes: Buffer.from('x') }), blobSha);
+  assert.equal(await client.createTree({ accessToken: 'token', owner: 'xmodneo', repository: 'vigilo', baseTreeSha: 'b'.repeat(40), entries: [{ path: 'src/x.ts', mode: '100644', type: 'blob', sha: blobSha }] }), treeSha);
+  assert.equal(await client.createCommit({ accessToken: 'token', owner: 'xmodneo', repository: 'vigilo', message: 'repair\n', treeSha, parentSha: 'a'.repeat(40), author: { name: 'Vigilo', email: 'publication@vigilo.invalid', date: NOW.toISOString() } }), commitSha);
+  await client.createBranch({ accessToken: 'token', owner: 'xmodneo', repository: 'vigilo', branch, commitSha });
+  assert.equal((await client.createDraftPullRequest({ accessToken: 'token', owner: 'xmodneo', repository: 'vigilo', title: 'Vigilo repair', body: 'Draft only.', head: branch, base: 'main' })).draft, true);
+  assert.equal((await client.listPullRequests({ accessToken: 'token', owner: 'xmodneo', repository: 'vigilo', head: branch, base: 'main' })).length, 1);
+  assert.equal((await client.getPullRequest({ accessToken: 'token', owner: 'xmodneo', repository: 'vigilo', number: 7 })).repositoryId, 8101);
+  assert.equal(requests.filter((request) => request.method === 'POST').length, 5);
+  assert.deepEqual(JSON.parse(requests[5]!.body), { title: 'Vigilo repair', body: 'Draft only.', head: branch, base: 'main', draft: true, maintainer_can_modify: false });
+  assert.equal(requests.some((request) => /merge|dispatch|deploy|force|delete/i.test(request.url)), false);
+});
+
+test('publication gateway rejects a pull-request URL outside the exact repository and number', async () => {
+  const keys = keyPair();
+  const branch = `vigilo/repair/${'4'.repeat(64)}`;
+  const client = new GitHubApiClient(CONFIGURATION, keys.privateKey, async () => Response.json({
+    id: 91, number: 7, node_id: 'PR_node', html_url: 'https://github.com/another/repository/pull/99',
+    state: 'open', draft: true, title: 'Vigilo repair', body: 'Draft only.',
+    head: { ref: branch, sha: '3'.repeat(40), repo: { id: 8101 } },
+    base: { ref: 'main', sha: 'a'.repeat(40), repo: { id: 8101 } },
+  }), () => NOW);
+  await assert.rejects(
+    client.getPullRequest({ accessToken: 'token', owner: 'xmodneo', repository: 'vigilo', number: 7 }),
+    /github_api_error/,
+  );
+});
+
 test('execution-profile inspection uses one read-only repository token and immutable refs', async () => {
   const keys = keyPair();
   const requests: Array<{ body: string; headers: Headers; method: string; url: string }> = [];

@@ -74,7 +74,7 @@ async function migrationRows(sql: Sql) {
 async function assertHistoricalHashes(sql: Sql) {
   const journal = JSON.parse(await readFile(join(migrationsFolder, 'meta/_journal.json'), 'utf8')) as { entries: Array<{ idx: number; tag: string }> };
   const rows = await migrationRows(sql);
-  assert.equal(rows.length, 21);
+  assert.equal(rows.length, 22);
   for (const [tag, expected] of historicalHashes) {
     const entry = journal.entries.find((candidate) => candidate.tag === tag);
     assert.ok(entry, tag);
@@ -179,6 +179,19 @@ async function assertFinalCatalog(sql: Sql) {
       (select count(*)::int from pg_trigger where tgname in ('human_review_generation_write_guard','human_review_candidate_write_guard','human_review_verification_write_guard','human_review_candidate_file_insert_guard') and not tgisinternal) as "childGuards"
   `;
   assert.deepEqual(review, { table: 'human_review_decision', insertGuard: 'human_review_decision_insert_guard', mutationGuard: 'human_review_decision_mutation_guard', childGuards: 4 });
+  const [publication] = await sql<{ table: string | null; attempt: string | null; event: string | null; guardCount: number; activeIndex: string | null; restrictiveFks: number }[]>`
+    select
+      to_regclass('public.repair_publication')::text as table,
+      to_regclass('public.repair_publication_attempt')::text as attempt,
+      to_regclass('public.repair_publication_event')::text as event,
+      (select count(*)::int from pg_trigger where tgname in ('repair_publication_insert_guard','repair_publication_update_guard','repair_publication_delete_guard','repair_publication_attempt_mutation_guard','repair_publication_event_insert_guard','repair_publication_event_mutation_guard','repair_publication_intent_mutation_guard') and not tgisinternal) as "guardCount",
+      (select indexdef from pg_indexes where indexname = 'repair_publication_attempt_active_unique') as "activeIndex",
+      (select count(*)::int from pg_constraint where conrelid = 'repair_publication'::regclass and contype = 'f' and confdeltype = 'r') as "restrictiveFks"
+  `;
+  assert.deepEqual([publication?.table, publication?.attempt, publication?.event], ['repair_publication', 'repair_publication_attempt', 'repair_publication_event']);
+  assert.equal(publication?.guardCount, 7);
+  assert.ok(publication?.activeIndex?.includes("WHERE (state = 'active'::text)"));
+  assert.equal(publication?.restrictiveFks, 10);
 }
 
 async function schemaSnapshot(sql: Sql) {
