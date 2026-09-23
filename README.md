@@ -192,7 +192,10 @@ can verify. Task 4.3 live acceptance remains pending and is an independent
 release prerequisite for any future Milestone 6 consumer. Its server-side gate
 is hard-closed while pending and cannot be opened by caller-supplied state.
 The publication-authority resolver cannot return while that gate is closed.
-Migration 0020 is not applied to a persistent database without separate authorization.
+Migration 0020 was applied to the positively identified local development
+database during the reviewed Milestone 5 workflow. Other environments must
+establish their own migration ledger and apply it through the documented
+forward-only migration process; this local fact is not a deployment guarantee.
 
 ## Safe draft pull request publication
 
@@ -217,7 +220,10 @@ The Task 4.3 live-acceptance gate remains hard-closed, so production publication
 reservation and worker execution cannot reach a GitHub write. Milestone 6 has
 only deterministic fake-transport and disposable-database verification; no live
 branch or pull request has been created. `0021_repair-publication.sql` is not
-applied to a persistent database without separate authorization.
+evidence of production readiness. It was applied to the positively identified
+local development database during the reviewed Milestone 6 workflow. Arbitrary
+deployments must independently verify and apply their own migration ledger.
+Managed SaaS production readiness has not been established.
 
 ## Web/API shell
 
@@ -228,9 +234,20 @@ npm ci --ignore-scripts
 npm run dev
 ```
 
-Open `http://localhost:3000` for the landing page. The health endpoint is
-available at `http://localhost:3000/api/health` and returns the service status as
-JSON.
+Open `http://localhost:3000` for the landing page. `GET /api/health` is a process
+liveness signal only; it does not claim database, migration, worker, queue, or
+provider readiness. `GET /api/health/readiness` deliberately returns HTTP 503
+with those checks marked `not_checked` until Milestone 7.4 implements real local
+dependency readiness. Neither endpoint contacts an external provider.
+
+All application, API, and authentication responses receive a baseline Content
+Security Policy, MIME-sniffing protection, frame denial, referrer policy, and
+permissions policy. HSTS and insecure-request upgrading are emitted only for a
+production build whose configured `BETTER_AUTH_URL` uses HTTPS. Next.js currently
+requires inline hydration scripts and styles, so the CSP retains `unsafe-inline`
+for those directives; development additionally permits `unsafe-eval` and WebSocket
+connections for the framework development runtime. No third-party script, style,
+frame, object, or general network origin is allowed.
 
 ## Local authentication and PostgreSQL
 

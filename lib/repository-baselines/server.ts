@@ -1,22 +1,13 @@
 import { resolveRequestWorkspace } from '../auth/resolve-request.ts';
 import { getAuthDatabase } from '../auth/server.ts';
 import type { AuthenticatedWorkspace } from '../auth/protected-context.ts';
-import { GitHubApiClient } from '../github-app/client.ts';
-import { readGitHubAppEnvironment, readGitHubAppPrivateKey } from '../github-app/environment.ts';
 import { getCurrentRepositoryBaseline } from './flow.ts';
 import { createRepositoryBaselineHandlers } from './handlers.ts';
 
-let dependencies: Promise<{ configuration: ReturnType<typeof readGitHubAppEnvironment>; database: ReturnType<typeof getAuthDatabase>; gateway: GitHubApiClient }> | undefined;
+let dependencies: Promise<{ database: ReturnType<typeof getAuthDatabase> }> | undefined;
 
 async function getDependencies() {
-  if (!dependencies) dependencies = (async () => {
-    const configuration = readGitHubAppEnvironment();
-    return {
-      configuration,
-      database: getAuthDatabase(),
-      gateway: new GitHubApiClient(configuration, await readGitHubAppPrivateKey(configuration.privateKeyPath)),
-    };
-  })();
+  if (!dependencies) dependencies = Promise.resolve({ database: getAuthDatabase() });
   return dependencies;
 }
 

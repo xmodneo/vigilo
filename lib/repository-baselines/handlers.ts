@@ -1,20 +1,17 @@
 import { AccessDeniedError, type AuthenticatedWorkspace } from '../auth/protected-context.ts';
 import type { VigiloDatabase } from '../db/types.ts';
-import type { GitHubAppConfiguration } from '../github-app/types.ts';
-import { BaselineAuthorityError } from './authority.ts';
-import { executeSelectedRepositoryBaseline, getCurrentRepositoryBaseline, RepositoryBaselineError } from './flow.ts';
-import type { GitHubBaselineGateway } from './types.ts';
+import { getCurrentRepositoryBaseline } from './flow.ts';
 
 interface Dependencies {
-  configuration: GitHubAppConfiguration;
   database: VigiloDatabase;
-  gateway: GitHubBaselineGateway;
   resolveContext: (headers: Headers) => Promise<AuthenticatedWorkspace>;
-  execute?: typeof executeSelectedRepositoryBaseline;
 }
 
-function redirect(baseUrl: string, path: string) {
-  return new Response(null, { status: 303, headers: { 'Cache-Control': 'private, no-store', Location: new URL(path, baseUrl).toString() } });
+export function legacyBaselineExecutionUnavailable(): Response {
+  return Response.json(
+    { error: 'legacy_baseline_execution_unavailable' },
+    { status: 405, headers: { Allow: 'GET', 'Cache-Control': 'private, no-store' } },
+  );
 }
 
 export function publicBaseline(value: Awaited<ReturnType<typeof getCurrentRepositoryBaseline>>) {
@@ -41,19 +38,8 @@ export function createRepositoryBaselineHandlers(dependencies: Dependencies) {
         return Response.json({ error: error instanceof AccessDeniedError ? 'unauthorized' : 'baseline_unavailable' }, { status: error instanceof AccessDeniedError ? 401 : 502, headers: { 'Cache-Control': 'private, no-store' } });
       }
     },
-    async run(request: Request) {
-      if (request.headers.get('origin') !== dependencies.configuration.baseUrl) {
-        return Response.json({ error: 'forbidden' }, { status: 403, headers: { 'Cache-Control': 'private, no-store' } });
-      }
-      try {
-        const context = await dependencies.resolveContext(request.headers);
-        const result = await (dependencies.execute ?? executeSelectedRepositoryBaseline)(dependencies.database, context, dependencies.gateway, dependencies.configuration, { cancellation: request.signal });
-        return redirect(dependencies.configuration.baseUrl, `/app/github?baseline=${encodeURIComponent(result.overallOutcome)}`);
-      } catch (error) {
-        if (error instanceof AccessDeniedError) return redirect(dependencies.configuration.baseUrl, '/sign-in');
-        const code = error instanceof BaselineAuthorityError ? error.code : error instanceof RepositoryBaselineError ? error.code : 'baseline_unavailable';
-        return redirect(dependencies.configuration.baseUrl, `/app/github?error=${encodeURIComponent(code)}`);
-      }
+    async run(_request: Request) {
+      return legacyBaselineExecutionUnavailable();
     },
   };
 }

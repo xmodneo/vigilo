@@ -12,11 +12,11 @@ export function RepairPublicationStatus({ review, publication, events, idempoten
       <h3 id="repair-publication-title">Draft pull request publication</h3>
       <dl>
         <div><dt>Human approval</dt><dd>{approved ? 'Approved' : 'Not approved'}</dd></div>
-        <div><dt>Task 4.3 live acceptance</dt><dd>{review.liveAcceptanceStatus}</dd></div>
+        <div><dt>Task 4.3 live acceptance</dt><dd>{publicationAcceptanceLabel(review.liveAcceptanceStatus)}</dd></div>
         <div><dt>Publication</dt><dd>{publication?.state ?? 'Not started'}</dd></div>
         {publication && <div><dt>Checkpoint</dt><dd>{publication.checkpoint}</dd></div>}
       </dl>
-      {!gateOpen && <div className="repository-notice" role="status">Publication blocked: Task 4.3 live acceptance remains pending. Human approval does not open this independent release gate.</div>}
+      {!gateOpen && <div className="repository-notice" role="status">Publication unavailable: Task 4.3 live acceptance is not passed. Human approval does not open this independent release gate.</div>}
       {publication?.failureCode && <div className="repository-notice" role="alert">Safe publication outcome: {publication.failureCode.replaceAll('_', ' ')}</div>}
       {publication?.pullRequest && <p><a className="primary-action button-link" href={publication.pullRequest.url} rel="noreferrer">Open exact draft pull request</a></p>}
       {publication && events.length > 0 && <details><summary>Publication history</summary><ol>{events.map((event) => <li key={event.id}>{event.eventType.replaceAll('_', ' ')} · {event.checkpoint.replaceAll('_', ' ')} · {event.toState.replaceAll('_', ' ')}{event.failureCode ? ` (${event.failureCode})` : ''}</li>)}</ol></details>}
@@ -37,6 +37,14 @@ export function RepairPublicationStatus({ review, publication, events, idempoten
   );
 }
 
-function publicationGateOpen(status: string): boolean {
-  return status !== 'pending';
+export function publicationAcceptanceLabel(status: unknown): string {
+  if (status === 'passed') return 'Passed';
+  if (status === 'pending') return 'Pending';
+  if (status === 'revoked') return 'Revoked';
+  if (status === 'failed') return 'Failed';
+  return 'Unavailable';
+}
+
+export function publicationGateOpen(status: unknown): boolean {
+  return status === 'passed';
 }

@@ -8,7 +8,7 @@ import { RepairRunStatus } from '../app/app/github/repair-run-status.js';
 import { AiInvestigationStatus } from '../app/app/github/ai-investigation-status.js';
 import { RepairLoopStatus } from '../app/app/github/repair-loop-status.js';
 import { HumanReviewStatus } from '../app/app/github/human-review-status.js';
-import { RepairPublicationStatus } from '../app/app/github/repair-publication-status.js';
+import { publicationAcceptanceLabel, publicationGateOpen, RepairPublicationStatus } from '../app/app/github/repair-publication-status.js';
 
 test('GitHub connection page renders the disconnected installation action', () => {
   const html = renderToStaticMarkup(
@@ -292,7 +292,7 @@ test('draft publication UI keeps the independent gate disabled and exposes no me
     history: { items: [], truncated: false },
   };
   const closed = renderToStaticMarkup(<RepairPublicationStatus review={review} publication={null} events={[]} idempotencyKey="44444444-4444-4444-8444-444444444444" />);
-  assert.match(closed, /live acceptance remains pending/i);
+  assert.match(closed, /Publication unavailable: Task 4.3 live acceptance is not passed/i);
   assert.match(closed, /disabled=""/);
   assert.match(closed, /action="\/api\/repair-runs\/11111111-1111-4111-8111-111111111111\/publications"/);
   assert.deepEqual([...closed.matchAll(/name="([^"]+)"/g)].map((match) => match[1]), ['confirmation', 'decisionIdentity', 'idempotencyKey']);
@@ -301,6 +301,19 @@ test('draft publication UI keeps the independent gate disabled and exposes no me
   const published = renderToStaticMarkup(<RepairPublicationStatus review={review} publication={{ id: '55555555-5555-4555-8555-555555555555', repairRunId: review.repairRunId, state: 'published', checkpoint: 'completed', targetBranch: `vigilo/repair/${'c'.repeat(64)}`, targetBaseBranch: 'main', expectedCommitSha: 'd'.repeat(40), remoteBranchCommitSha: 'd'.repeat(40), pullRequest: { id: 7, number: 9, nodeId: 'PR_node', url: 'https://github.com/example/repo/pull/9' }, failureCode: null, createdAt: new Date('2032-02-03T04:05:06.000Z'), completedAt: new Date('2032-02-03T04:06:06.000Z') }} events={[{ id: '66666666-6666-4666-8666-666666666666', eventType: 'completed', checkpoint: 'completed', toState: 'published', failureCode: null, createdAt: new Date('2032-02-03T04:06:06.000Z') }]} idempotencyKey="44444444-4444-4444-8444-444444444444" />);
   assert.match(published, /href="https:\/\/github.com\/example\/repo\/pull\/9"/);
   assert.match(published, /Publication history/);
+});
+
+test('draft publication UI gate recognizes only the explicit passed acceptance state', () => {
+  assert.equal(publicationGateOpen('passed'), true);
+  for (const value of [undefined, null, '', 'pending', 'revoked', 'failed', 'PASSED', 'unknown', 0, false, {}, []]) {
+    assert.equal(publicationGateOpen(value), false, `unexpected gate opening for ${String(value)}`);
+  }
+  assert.equal(publicationAcceptanceLabel('pending'), 'Pending');
+  assert.equal(publicationAcceptanceLabel('revoked'), 'Revoked');
+  assert.equal(publicationAcceptanceLabel('failed'), 'Failed');
+  for (const value of [undefined, null, '', 'PASSED', 'unknown', 0, false, {}, []]) {
+    assert.equal(publicationAcceptanceLabel(value), 'Unavailable');
+  }
 });
 
 test('eligible Repair Run renders its objective and bounded investigation status', () => {

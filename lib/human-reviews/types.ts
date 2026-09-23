@@ -1,7 +1,9 @@
 import type { FrozenCandidateFile } from '../repair-candidates/types.ts';
 import type { HumanReviewDecision } from './identity.ts';
 
-export const TASK_4_3_LIVE_ACCEPTANCE_STATUS = 'pending' as const;
+export const TASK_4_3_LIVE_ACCEPTANCE_STATUSES = ['pending', 'passed', 'revoked', 'failed'] as const;
+export type Task43LiveAcceptanceStatus = (typeof TASK_4_3_LIVE_ACCEPTANCE_STATUSES)[number];
+export const TASK_4_3_LIVE_ACCEPTANCE_STATUS = 'pending' as const satisfies Task43LiveAcceptanceStatus;
 
 export type HumanReviewIneligibleReason =
   | 'repair_loop_not_verified'
@@ -78,7 +80,7 @@ export interface HumanReviewResult {
   status: 'ineligible' | 'awaiting_decision' | 'decided';
   ineligibleReason: HumanReviewIneligibleReason | null;
   reviewSubjectIdentity: string | null;
-  liveAcceptanceStatus: typeof TASK_4_3_LIVE_ACCEPTANCE_STATUS;
+  liveAcceptanceStatus: Task43LiveAcceptanceStatus;
   subject: HumanReviewSubject | null;
   decision: HumanReviewDecisionResult | null;
   history: { items: HumanReviewHistoryItem[]; truncated: boolean };
