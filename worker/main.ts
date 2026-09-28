@@ -35,12 +35,14 @@ import { repairLoop } from '../db/schema.ts';
 import { processRepairLoopJob } from '../lib/repair-loops/worker.ts';
 import { repairPublication } from '../db/schema.ts';
 import { processRepairPublicationJob } from '../lib/repair-publications/worker.ts';
+import { DurableExternalExecutionAuthorizer } from '../lib/external-execution/authority.ts';
 
 async function main(): Promise<void> {
   const environment = readServerEnvironment();
   const configuration = readGitHubAppEnvironment();
   const client = postgres(environment.databaseUrl, { max: 2, prepare: false });
   const database = drizzle(client, { schema });
+  const executionAuthority = new DurableExternalExecutionAuthorizer(database);
   const logger = createConsoleWorkerLogger();
   const shutdown = new AbortController();
   let boss: Awaited<ReturnType<typeof createRepairBoss>> | undefined;
@@ -93,7 +95,7 @@ async function main(): Promise<void> {
       const job = jobs[0];
       if (!job) return [];
       try {
-        return [await processRepairJob(job, { configuration, database, gateway, logger, shutdownSignal: shutdown.signal })];
+        return [await processRepairJob(job, { configuration, database, gateway, logger, shutdownSignal: shutdown.signal, executionAuthority })];
       } catch {
         return [{ id: job.id, status: 'failed' as const, output: { code: 'worker_operation_failed' } }];
       }
@@ -113,7 +115,7 @@ async function main(): Promise<void> {
       const job = jobs[0];
       if (!job) return [];
       try {
-        return [await processCandidateVerificationJob(job, { configuration, database, gateway, logger, shutdownSignal: shutdown.signal })];
+        return [await processCandidateVerificationJob(job, { configuration, database, gateway, logger, shutdownSignal: shutdown.signal, executionAuthority })];
       } catch {
         return [{ id: job.id, status: 'failed' as const, output: { code: 'candidate_verification_worker_failed' } }];
       }
@@ -121,13 +123,13 @@ async function main(): Promise<void> {
     workerIds.push({ id: verificationWorkerId, queue: CANDIDATE_VERIFICATION_QUEUE });
     const aiWorkerId = await boss.work<unknown, { code?: string }, typeof workOptions>(AI_INVESTIGATION_QUEUE, workOptions, async (jobs) => {
       const job = jobs[0]; if (!job) return [];
-      try { return [await processAiInvestigationJob(job, { configuration, database, gateway, shutdownSignal: shutdown.signal, createProvider: () => new GeminiInvestigationProvider(readModelApiKey()) })]; }
+      try { return [await processAiInvestigationJob(job, { configuration, database, gateway, shutdownSignal: shutdown.signal, createProvider: () => new GeminiInvestigationProvider(readModelApiKey(), undefined, undefined, executionAuthority) })]; }
       catch { return [{ id: job.id, status: 'failed' as const, output: { code: 'ai_investigation_worker_failed' } }]; }
     });
     workerIds.push({ id: aiWorkerId, queue: AI_INVESTIGATION_QUEUE });
     const aiCandidateGenerationWorkerId = await boss.work<unknown, { code?: string }, typeof workOptions>(AI_CANDIDATE_GENERATION_QUEUE, workOptions, async (jobs) => {
       const job = jobs[0]; if (!job) return [];
-      try { return [await processAiCandidateGenerationJob(job, { configuration, database, gateway, shutdownSignal: shutdown.signal, createProvider: () => new GeminiInvestigationProvider(readModelApiKey()) })]; }
+      try { return [await processAiCandidateGenerationJob(job, { configuration, database, gateway, shutdownSignal: shutdown.signal, createProvider: () => new GeminiInvestigationProvider(readModelApiKey(), undefined, undefined, executionAuthority) })]; }
       catch { return [{ id: job.id, status: 'failed' as const, output: { code: 'ai_candidate_generation_worker_failed' } }]; }
     });
     workerIds.push({ id: aiCandidateGenerationWorkerId, queue: AI_CANDIDATE_GENERATION_QUEUE });
@@ -137,7 +139,7 @@ async function main(): Promise<void> {
     const repairLoopWorkerId = await boss.work<unknown, { code?: string }, typeof workOptions>(REPAIR_LOOP_QUEUE, workOptions, async (jobs) => {
       const job = jobs[0]; if (!job) return [];
       try {
-        return [await processRepairLoopJob(job, { database, queues: {
+        return [await processRepairLoopJob(job, { database, executionAuthority, queues: {
           enqueueRepairLoop: loopQueue.enqueueRepairLoop.bind(loopQueue),
           enqueueAiCandidateGeneration: generationQueue.enqueueAiCandidateGeneration.bind(generationQueue),
           enqueueVerification: verificationQueue.enqueueVerification.bind(verificationQueue),

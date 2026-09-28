@@ -3,6 +3,7 @@ import test from "node:test";
 import { Readable } from "node:stream";
 import { APIError, Sandbox } from "@vercel/sandbox";
 import { loadOriginalFixture, fixtureHash, parseBaselineTests, EXPECTED_FIXTURE_HASH, runBaseline } from "../src/baseline.js";
+import { sandboxAuthority, TEST_OIDC_TOKEN } from "./external-execution-support.js";
 
 const names = [
   "charges 500 cents below the free-shipping threshold",
@@ -66,7 +67,7 @@ test("baseline gates repository scripts on deny-all and cleans up every outcome"
     else process.env[name] = original[index];
   }));
   authNames.forEach(name => { delete process.env[name]; });
-  process.env.VERCEL_OIDC_TOKEN = "host-only-secret-sentinel";
+  process.env.VERCEL_OIDC_TOKEN = TEST_OIDC_TOKEN;
 
   const scenarios = {
     expected: "expected_baseline_application_failure",
@@ -102,6 +103,7 @@ test("baseline gates repository scripts on deny-all and cleans up every outcome"
         async runCommand(params: { cmd: string; args: string[]; env?: unknown }) {
           assert.equal(params.cmd, "node");
           assert.equal(params.env, undefined);
+          assert(!JSON.stringify(params).includes(TEST_OIDC_TOKEN));
           assert(!JSON.stringify(params).includes("host-only-secret-sentinel"));
           let output: string;
           if (params.args[0] === "--version") output = "v24.19.0";
@@ -158,11 +160,12 @@ test("baseline gates repository scripts on deny-all and cleans up every outcome"
         readBackConfirmed = transitioned;
         return fake;
       });
-      const result = await runBaseline();
+      const result = await runBaseline(sandboxAuthority("sandbox_baseline"));
       assert.equal(result.outcome, outcome);
       assert.equal(result.success, scenario === "expected");
       assert(stopped);
       assert.equal(deleted, scenario !== "cleanup_failed");
+      assert(!JSON.stringify(result).includes(TEST_OIDC_TOKEN));
       assert(!JSON.stringify(result).includes("host-only-secret-sentinel"));
       if (["install_failed", "transition_failed", "wrong_session", "timeout", "corrupt_upload", "ambiguous_create"].includes(scenario)) {
         assert(npmCommands.every(command => command[0] === "ci"));

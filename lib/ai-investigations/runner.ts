@@ -9,6 +9,7 @@ import { InvestigationContextError, listPaths, readBaselineSummary, readTextFile
 import type { InvestigationSourceGateway } from '../investigations/types.ts';
 import { buildInitialInput, CONCLUSION_SCHEMA, encodeToolOutput, MODEL_INSTRUCTIONS, MODEL_TOOLS, parseConclusion, parseToolArguments } from './protocol.ts';
 import { AI_LIMITS, ModelProviderError, type InvestigationConclusion, type InvestigationModelProvider, type ModelProviderFailureCode, type ToolName } from './types.ts';
+import type { ExternalExecutionFailureCode } from '../external-execution/types.ts';
 
 export type AiAgentErrorCode =
   | 'ai_authority_mismatch'
@@ -20,6 +21,7 @@ export type AiAgentErrorCode =
   | 'unobserved_suspected_file'
   | 'model_provider_failed'
   | 'model_provider_mismatch'
+  | ExternalExecutionFailureCode
   | ModelProviderFailureCode;
 
 export class AiAgentError extends Error {
@@ -82,6 +84,15 @@ export async function runAiInvestigation(
     tools: MODEL_TOOLS,
     conclusionSchema: CONCLUSION_SCHEMA,
     maxOutputTokens: AI_LIMITS.maxOutputTokens,
+    externalExecutionScope: {
+      workspaceId: input.workspaceId,
+      repairRunId: authority.current.repairRunId,
+      githubRepositoryId: authority.current.githubRepositoryId,
+      baseCommitSha: input.baseCommitSha,
+      operationCategory: 'gemini_investigation',
+      providerId: provider.providerId,
+      modelId: provider.modelId,
+    },
   });
   const perTool: Record<ToolName, number> = { listPaths: 0, readTextFile: 0, searchText: 0, readBaselineSummary: 0 };
   const observed = new Map<string, { kind: 'baseline' | 'file' | 'search'; paths: string[] }>();

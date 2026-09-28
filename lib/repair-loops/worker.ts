@@ -9,6 +9,10 @@ import {
   candidateVerification,
   candidateVerificationEvidence,
   candidateVerificationEvent,
+  executionBudgetGrant,
+  executionBudgetGrantRevocation,
+  externalExecutionLease,
+  externalExecutionReservation,
   repairCandidate,
   repairCandidateFile,
   repairLoop,
@@ -16,6 +20,9 @@ import {
   repairLoopIteration,
 } from '../../db/schema.ts';
 import type { VigiloDatabase } from '../db/types.ts';
+import { DurableExternalExecutionAuthorizer } from '../external-execution/authority.ts';
+import { executionGrantIdentityMatches, executionReservationIdentityMatches } from '../external-execution/identity.ts';
+import { ExternalExecutionAuthorityError, type ExternalExecutionAuthorizer } from '../external-execution/types.ts';
 import { selfCheckRepairCandidate } from '../repair-candidates/flow.ts';
 import { AI_MODEL_ID, AI_PROVIDER_ID } from '../ai-investigations/types.ts';
 import { REPAIR_LOOP_AI_CANDIDATE_GENERATION_PROTOCOL_VERSION } from '../ai-candidate-generations/types.ts';
@@ -59,6 +66,7 @@ export interface RepairLoopWorkerDependencies {
   afterWakeValidated?: () => Promise<void>;
   afterVerificationCreated?: () => Promise<void>;
   afterEvidenceObserved?: () => Promise<void>;
+  executionAuthority?: ExternalExecutionAuthorizer;
 }
 
 const ACTIVE_LOOP_STATES = ['queued', 'running'] as const;
@@ -74,6 +82,74 @@ function classifyGenerationFailure(code: string): 'generation_failure' | 'infras
 
 class RepairLoopIntegrityError extends Error {
   constructor(public readonly code: string) { super(code); this.name = 'RepairLoopIntegrityError'; }
+}
+
+async function authorizeIteration(
+  dependencies: RepairLoopWorkerDependencies,
+  loop: LoopRow,
+  generation: GenerationRow,
+  operationKey: string,
+): Promise<void> {
+  const existingAuthority = async (): Promise<boolean> => {
+    const [reservation] = await dependencies.database.select().from(externalExecutionReservation)
+      .where(eq(externalExecutionReservation.operationKey, operationKey)).limit(1);
+    if (!reservation) return false;
+    const [lease] = await dependencies.database.select().from(externalExecutionLease)
+      .where(eq(externalExecutionLease.reservationId, reservation.id)).limit(1);
+    const grants = await dependencies.database.select().from(executionBudgetGrant)
+      .where(inArray(executionBudgetGrant.id, [reservation.accountGrantId, reservation.grantId]));
+    const revocations = await dependencies.database.select({ grantId: executionBudgetGrantRevocation.grantId })
+      .from(executionBudgetGrantRevocation)
+      .where(inArray(executionBudgetGrantRevocation.grantId, [reservation.accountGrantId, reservation.grantId]));
+    if (grants.length !== 2 || !lease) throw new ExternalExecutionAuthorityError('execution_authority_missing');
+    if (revocations.length > 0) throw new ExternalExecutionAuthorityError('execution_authority_missing');
+    const now = (dependencies.clock ?? (() => new Date()))();
+    if (grants.some((grant) => grant.expiresAt <= now)) throw new ExternalExecutionAuthorityError('execution_authority_expired');
+    if (grants.some((grant) => !executionGrantIdentityMatches(grant)) || !executionReservationIdentityMatches(reservation)) {
+      throw new ExternalExecutionAuthorityError('execution_authority_mismatch');
+    }
+    const accountGrant = grants.find((grant) => grant.id === reservation.accountGrantId);
+    const operationGrant = grants.find((grant) => grant.id === reservation.grantId);
+    const exact = reservation.workspaceId === loop.workspaceId && reservation.repairRunId === loop.repairRunId &&
+      reservation.githubRepositoryId === generation.githubRepositoryId && reservation.baseCommitSha === generation.baseCommitSha &&
+      reservation.operationCategory === 'repair_loop_iteration' && reservation.providerId === 'vigilo' && reservation.modelId === null &&
+      reservation.acceptancePurpose === null && reservation.reservedLogicalRequests === 1 && reservation.reservedProviderAttempts === 0 &&
+      reservation.reservedInputTokens === 0 && reservation.reservedOutputTokens === 0 && reservation.reservedSandboxIdentities === 0 &&
+      reservation.reservedSandboxRuntimeMs === 0 && reservation.sandboxResourceClass === null && reservation.reservedVerificationAttempts === 0 &&
+      reservation.reservedRepairLoopIterations === 1 && accountGrant?.scope === 'account' &&
+      operationGrant?.scope === 'operation' &&
+      (lease.state === 'succeeded' || lease.state === 'active' && lease.leaseExpiresAt > now);
+    if ((lease.state === 'active' && lease.leaseExpiresAt <= now) || lease.state === 'expired') {
+      throw new ExternalExecutionAuthorityError('execution_authority_expired');
+    }
+    if (!exact) throw new ExternalExecutionAuthorityError('execution_authority_mismatch');
+    return true;
+  };
+  if (await existingAuthority()) return;
+  const authority = dependencies.executionAuthority ?? new DurableExternalExecutionAuthorizer(dependencies.database);
+  let permit;
+  try {
+    permit = await authority.reserve({
+      operationKey,
+      scope: {
+        workspaceId: loop.workspaceId,
+        repairRunId: loop.repairRunId,
+        githubRepositoryId: generation.githubRepositoryId,
+        baseCommitSha: generation.baseCommitSha,
+        operationCategory: 'repair_loop_iteration',
+        providerId: 'vigilo',
+      },
+      amounts: {
+        logicalRequests: 1, providerAttempts: 0, inputTokens: 0, outputTokens: 0,
+        sandboxIdentities: 0, sandboxRuntimeMs: 0, verificationAttempts: 0,
+        repairLoopIterations: 1,
+      },
+    });
+  } catch (error) {
+    if (error instanceof ExternalExecutionAuthorityError && await existingAuthority()) return;
+    throw error;
+  }
+  await permit.complete('succeeded');
 }
 
 function contractFor(loop: LoopRow, iteration: IterationRow, generation: GenerationRow): BaselineRecoveryContract {
@@ -238,6 +314,8 @@ async function decideCompletedVerification(dependencies: RepairLoopWorkerDepende
     priorDiagnosis: { summary: diagnosis.summary!, proposedApproach: diagnosis.proposedApproach!, confidence: diagnosis.confidence! },
     boundaries: { repositoryValues: 'UNTRUSTED_REPOSITORY_DATA', modelValues: 'UNTRUSTED_MODEL_DATA', completeReplacementAgainstOriginalBase: true },
   }); } catch { throw new RepairLoopIntegrityError('repair_loop_feedback_invalid'); }
+  const generationId = randomId(); const nextIterationId = randomId(); const wakeJobId = randomId();
+  await authorizeIteration(dependencies, loop, generation, iteration.id);
   await dependencies.database.transaction(async (transaction) => {
     const [ownedLoop] = await transaction.select({ id: repairLoop.id }).from(repairLoop).where(and(eq(repairLoop.id, loop.id), eq(repairLoop.state, 'running'), eq(repairLoop.wakeJobId, expectedWakeJobId))).for('update').limit(1);
     if (!ownedLoop) return;
@@ -246,7 +324,6 @@ async function decideCompletedVerification(dependencies: RepairLoopWorkerDepende
     const [other] = await transaction.select({ id: repairLoopIteration.id }).from(repairLoopIteration).where(eq(repairLoopIteration.repairLoopId, loop.id)).orderBy(desc(repairLoopIteration.ordinal)).limit(1);
     if (!other || other.id !== owned.id) return;
     const [ordinalValue] = await transaction.select({ value: max(aiCandidateGeneration.executionOrdinal) }).from(aiCandidateGeneration).where(eq(aiCandidateGeneration.aiInvestigationId, loop.aiInvestigationId));
-    const generationId = randomId(); const nextIterationId = randomId(); const wakeJobId = randomId();
     await transaction.update(repairLoopIteration).set({ objectiveEvidence: evaluated.result, objectiveEvidenceSnapshot: objective.snapshot, objectiveEvidenceHash: objective.hash, objectiveEvidenceBytes: objective.bytes, decision: 'repairable_failure', decidedAt: now }).where(eq(repairLoopIteration.id, iteration.id));
     await transaction.insert(aiCandidateGeneration).values({
       id: generationId, aiInvestigationId: loop.aiInvestigationId, executionOrdinal: (ordinalValue?.value ?? 0) + 1,
@@ -291,6 +368,7 @@ async function reconcile(dependencies: RepairLoopWorkerDependencies, loop: LoopR
   if (!iteration) throw new RepairLoopIntegrityError('repair_loop_iteration_missing');
   const [generation] = await dependencies.database.select().from(aiCandidateGeneration).where(eq(aiCandidateGeneration.id, iteration.aiCandidateGenerationId)).limit(1);
   if (!generation || generation.aiInvestigationId !== loop.aiInvestigationId || generation.investigationId !== loop.investigationId || generation.repairRunId !== loop.repairRunId || generation.workspaceId !== loop.workspaceId || generation.protocolVersion !== 4) throw new RepairLoopIntegrityError('repair_loop_generation_invalid');
+  await authorizeIteration(dependencies, loop, generation, iteration.ordinal === 1 ? loop.id : iteration.previousIterationId!);
   if (['created', 'queued', 'generating'].includes(generation.state)) {
     await dependencies.database.transaction((transaction) => scheduleWake(transaction, currentLoop, expectedWakeJobId, dependencies.queues, randomId, now)); return;
   }
@@ -359,6 +437,10 @@ export async function processRepairLoopJob(job: RepairQueueJob, dependencies: Re
   if (!ACTIVE_LOOP_STATES.includes(loop.state as typeof ACTIVE_LOOP_STATES[number]) || loop.wakeJobId !== job.id) return { id: job.id, status: 'completed' };
   try { await dependencies.afterWakeValidated?.(); await reconcile(dependencies, loop, job.id, randomId, now); return { id: job.id, status: 'completed' }; }
   catch (error) {
+    if (error instanceof ExternalExecutionAuthorityError) {
+      await failInfrastructure(dependencies.database, loop.id, job.id, error.code, randomId, now);
+      return { id: job.id, status: 'completed' };
+    }
     if (error instanceof RepairLoopIntegrityError) {
       await failIntegrity(dependencies.database, loop.id, job.id, error.code, randomId, now);
       return { id: job.id, status: 'completed' };

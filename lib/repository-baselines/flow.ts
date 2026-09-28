@@ -11,6 +11,7 @@ import { resolveBaselineAuthority } from './authority.ts';
 import { runFrozenRepositoryBaseline } from './runner.ts';
 import type { BaselineEvidence, GitHubBaselineGateway } from './types.ts';
 import type { SandboxLifecycleObserver } from '../../src/sandbox-boundary.ts';
+import type { ExternalExecutionAuthorizer, ExternalExecutionScope } from '../external-execution/types.ts';
 
 export class RepositoryBaselineError extends Error {
   constructor(public readonly code: 'authority_changed' | 'installation_unavailable' | 'repository_access_changed' | 'source_unavailable' | 'persistence_failed') {
@@ -111,6 +112,7 @@ export async function executeSelectedRepositoryBaseline(
     randomId?: () => string;
     runner?: typeof runFrozenRepositoryBaseline;
     sandboxObserver?: SandboxLifecycleObserver;
+    sandboxAuthority?: { authorizer: ExternalExecutionAuthorizer; scope: ExternalExecutionScope };
   } = {},
 ) {
   const authority = await resolveBaselineAuthority(database, context);
@@ -129,7 +131,7 @@ export async function executeSelectedRepositoryBaseline(
     archiveSha256: createHash('sha256').update(archive).digest('hex'),
     runId: options.evidenceId ?? options.randomId?.() ?? randomUUID(),
     startedAt: clock(),
-  }, options.cancellation, clock, options.sandboxObserver);
+  }, options.cancellation, clock, options.sandboxObserver, options.sandboxAuthority);
   await options.authorizePersistence?.(report);
   await persistBaseline(database, report);
   return report;

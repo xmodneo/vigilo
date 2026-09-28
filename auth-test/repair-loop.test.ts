@@ -7,7 +7,8 @@ import { and, eq } from 'drizzle-orm';
 import {
   account, aiCandidateGeneration, aiInvestigation, candidateVerification, candidateVerificationAttempt,
   candidateVerificationEvidence, executionProfile, githubInstallation, investigation, repairCandidate,
-  repairCandidateFile, repairIntent, repairLoop, repairLoopEvent, repairLoopIteration, repairRun,
+  executionBudgetGrant, executionBudgetGrantRevocation, repairCandidateFile, repairIntent, repairLoop,
+  repairLoopEvent, repairLoopIteration, repairRun,
   repository, repositoryBaseline, user, workspace,
 } from '../db/schema.ts';
 import { startAiCandidateGeneration, AiCandidateGenerationFlowError } from '../lib/ai-candidate-generations/flow.ts';
@@ -25,11 +26,15 @@ import type { AiCandidateGenerationJobPayload, CandidateVerificationJobPayload, 
 import { createTestContext } from './support.ts';
 import type { GitHubAppConfiguration } from '../lib/github-app/types.ts';
 import type { InvestigationSourceGateway } from '../lib/investigations/types.ts';
+import { createTestExternalExecutionAuthorizer } from './external-execution-support.ts';
+import { DurableExternalExecutionAuthorizer } from '../lib/external-execution/authority.ts';
+import { computeExecutionGrantIdentity } from '../lib/external-execution/identity.ts';
 
 const NOW = new Date('2031-01-02T03:04:05.000Z');
 const COMMIT = 'a'.repeat(40); const PROFILE = 'b'.repeat(64); const TREE = 'c'.repeat(40);
 const SOURCE_IDENTITY = 'd'.repeat(64); const REPOSITORY_ID = 51001; const INSTALLATION_ID = 52001;
 const PATH = 'src/fix.ts'; const BASE = 'export const value = 1;\n'; const FIX = 'export const value = 2;\n';
+const TEST_EXECUTION_AUTHORITY = createTestExternalExecutionAuthorizer();
 const blobSha = (value: string) => createHash('sha1').update(`blob ${Buffer.byteLength(value)}\0`).update(value).digest('hex');
 const owner = (workspaceId: string) => ({ workspace: { id: workspaceId } } as unknown as AuthenticatedWorkspace);
 const CONFIGURATION: GitHubAppConfiguration = { appId: 7, appSlug: 'vigilo-test', baseUrl: 'http://localhost:3000', clientId: 'client' };
@@ -85,7 +90,7 @@ async function currentWake(context: Awaited<ReturnType<typeof createTestContext>
 
 async function runWake(context: Awaited<ReturnType<typeof createTestContext>>, loopId: string, queues: Queues) {
   const id = await currentWake(context, loopId);
-  return processRepairLoopJob({ id, data: { version: 1, repairLoopId: loopId }, name: 'repair-loop-v1', signal: new AbortController().signal } as never, { database: context.database, queues, clock: () => NOW });
+  return processRepairLoopJob({ id, data: { version: 1, repairLoopId: loopId }, name: 'repair-loop-v1', signal: new AbortController().signal } as never, { database: context.database, queues, clock: () => NOW, executionAuthority: TEST_EXECUTION_AUTHORITY });
 }
 
 async function freezeGeneration(context: Awaited<ReturnType<typeof createTestContext>>, generationId: string, seeded: Awaited<ReturnType<typeof seed>>, ordinal: number, validIdentity = true) {
@@ -115,6 +120,46 @@ async function createLoop(context: Awaited<ReturnType<typeof createTestContext>>
   return { seeded, queues, loop };
 }
 
+async function createDurableLoopAuthority(context: Awaited<ReturnType<typeof createTestContext>>, seeded: Awaited<ReturnType<typeof seed>>) {
+  const expiresAt = new Date(NOW.getTime() + 60_000);
+  const authorizedBy = 'test-operator';
+  const limits = {
+    logicalRequests: 1, providerAttempts: 0, inputTokens: 0, outputTokens: 0,
+    sandboxIdentities: 0, sandboxRuntimeMs: 0, verificationAttempts: 0, repairLoopIterations: 1,
+    maxConcurrentExternalOperations: 1,
+  };
+  const accountGrantId = randomUUID();
+  await context.database.insert(executionBudgetGrant).values({
+    id: accountGrantId, version: 1, scope: 'account', maxLogicalRequests: 1, maxProviderAttempts: 0,
+    maxInputTokens: 0, maxOutputTokens: 0, maxSandboxIdentities: 0, maxSandboxRuntimeMs: 0,
+    maxVerificationAttempts: 0, maxRepairLoopIterations: 1, maxConcurrentExternalOperations: 1,
+    expiresAt, authorizedBy, grantIdentity: computeExecutionGrantIdentity({
+      version: 1, scope: 'account', workspaceId: null, repairRunId: null, githubRepositoryId: null,
+      baseCommitSha: null, operationCategory: null, providerId: null, modelId: null,
+      acceptancePurpose: null, limits, expiresAt: expiresAt.toISOString(), authorizedBy,
+    }), createdAt: NOW,
+  });
+  const operationGrantId = randomUUID();
+  await context.database.insert(executionBudgetGrant).values({
+    id: operationGrantId, version: 1, scope: 'operation', workspaceId: seeded.workspaceId,
+    repairRunId: seeded.runId, githubRepositoryId: REPOSITORY_ID, baseCommitSha: COMMIT,
+    operationCategory: 'repair_loop_iteration', providerId: 'vigilo', maxLogicalRequests: 1,
+    maxProviderAttempts: 0, maxInputTokens: 0, maxOutputTokens: 0, maxSandboxIdentities: 0,
+    maxSandboxRuntimeMs: 0, maxVerificationAttempts: 0, maxRepairLoopIterations: 1,
+    maxConcurrentExternalOperations: 0, expiresAt, authorizedBy,
+    grantIdentity: computeExecutionGrantIdentity({
+      version: 1, scope: 'operation', workspaceId: seeded.workspaceId, repairRunId: seeded.runId,
+      githubRepositoryId: REPOSITORY_ID, baseCommitSha: COMMIT, operationCategory: 'repair_loop_iteration',
+      providerId: 'vigilo', modelId: null, acceptancePurpose: null,
+      limits: { ...limits, maxConcurrentExternalOperations: 0 }, expiresAt: expiresAt.toISOString(), authorizedBy,
+    }), createdAt: NOW,
+  });
+  return {
+    authority: new DurableExternalExecutionAuthorizer(context.database, { clock: () => NOW }),
+    operationGrantId,
+  };
+}
+
 test('migration 0019 creates an idempotent loop and preserves immutable append-only authority', async (t) => {
   const context = await createTestContext(); t.after(() => context.client.close()); const seeded = await seed(context); const queues = new Queues(); const key = randomUUID();
   const [a, b] = await Promise.all([startRepairLoop(context.database, seeded.workspaceContext, seeded.runId, queues, { idempotencyKey: key, clock: () => NOW }), startRepairLoop(context.database, seeded.workspaceContext, seeded.runId, queues, { idempotencyKey: key, clock: () => NOW })]);
@@ -125,9 +170,44 @@ test('migration 0019 creates an idempotent loop and preserves immutable append-o
   await assert.rejects(context.database.delete(repairLoopEvent).where(eq(repairLoopEvent.id, event!.id)));
 });
 
+test('RepairLoop execution fails terminally before reconciliation when durable iteration authority is absent', async (t) => {
+  const context = await createTestContext(); t.after(() => context.client.close());
+  const { seeded, queues, loop } = await createLoop(context);
+  const wake = await currentWake(context, loop.id);
+  const result = await processRepairLoopJob({ id: wake, data: { version: 1, repairLoopId: loop.id } } as never, {
+    database: context.database, queues, clock: () => NOW,
+  });
+  assert.equal(result.status, 'completed');
+  const stored = await getRepairLoop(context.database, seeded.workspaceContext, loop.id);
+  assert.equal(stored?.state, 'failed');
+  assert.equal(stored?.failureCode, 'execution_authority_missing');
+  assert.equal(queues.verifications.length, 0);
+});
+
+test('RepairLoop restart revalidates a completed reservation against current grant revocation', async (t) => {
+  const context = await createTestContext(); t.after(() => context.client.close());
+  const { seeded, queues, loop } = await createLoop(context);
+  const { authority, operationGrantId } = await createDurableLoopAuthority(context, seeded);
+  let wake = await currentWake(context, loop.id);
+  assert.equal((await processRepairLoopJob({ id: wake, data: { version: 1, repairLoopId: loop.id } } as never, {
+    database: context.database, queues, clock: () => NOW, executionAuthority: authority,
+  })).status, 'completed');
+  await context.database.insert(executionBudgetGrantRevocation).values({
+    id: randomUUID(), grantId: operationGrantId, reasonCode: 'operator_revoked',
+    revokedBy: 'test-operator', createdAt: NOW,
+  });
+  wake = await currentWake(context, loop.id);
+  assert.equal((await processRepairLoopJob({ id: wake, data: { version: 1, repairLoopId: loop.id } } as never, {
+    database: context.database, queues, clock: () => NOW, executionAuthority: authority,
+  })).status, 'completed');
+  const stored = await getRepairLoop(context.database, seeded.workspaceContext, loop.id);
+  assert.equal(stored?.state, 'failed');
+  assert.equal(stored?.failureCode, 'execution_authority_missing');
+});
+
 test('stale and duplicate wake delivery cannot create duplicate children; manual child actions are rejected', async (t) => {
   const context = await createTestContext(); t.after(() => context.client.close()); const { seeded, queues, loop } = await createLoop(context); const stale = randomUUID();
-  assert.equal((await processRepairLoopJob({ id: stale, data: { version: 1, repairLoopId: loop.id } } as never, { database: context.database, queues })).status, 'completed');
+  assert.equal((await processRepairLoopJob({ id: stale, data: { version: 1, repairLoopId: loop.id } } as never, { database: context.database, queues, executionAuthority: TEST_EXECUTION_AUTHORITY })).status, 'completed');
   await Promise.all([runWake(context, loop.id, queues), runWake(context, loop.id, queues)]);
   assert.equal((await context.database.select().from(repairLoopIteration)).length, 1); assert.equal(queues.wakes.length, 2);
   await assert.rejects(startAiCandidateGeneration(context.database, seeded.workspaceContext, seeded.aiId, queues), (error: unknown) => error instanceof AiCandidateGenerationFlowError && error.code === 'candidate_generation_owned_by_repair_loop');
@@ -137,7 +217,7 @@ test('a delivery that becomes stale after its initial read cannot mutate using s
   const context = await createTestContext(); t.after(() => context.client.close()); const { seeded, queues, loop } = await createLoop(context);
   const oldWake = await currentWake(context, loop.id); const successorWake = randomUUID();
   const result = await processRepairLoopJob({ id: oldWake, data: { version: 1, repairLoopId: loop.id } } as never, {
-    database: context.database, queues, clock: () => NOW,
+    database: context.database, queues, clock: () => NOW, executionAuthority: TEST_EXECUTION_AUTHORITY,
     afterWakeValidated: async () => { await context.database.update(repairLoop).set({ wakeJobId: successorWake, updatedAt: NOW }).where(eq(repairLoop.id, loop.id)); },
   });
   assert.equal(result.status, 'completed');
@@ -233,12 +313,12 @@ test('iteration 2 may satisfy the objective and select only its exact evidence t
 test('restart-style reconciliation resumes after verification creation and evidence persistence', async (t) => {
   const context = await createTestContext(); t.after(() => context.client.close()); const { seeded, queues, loop } = await createLoop(context);
   await runWake(context, loop.id, queues); const candidate = await freezeGeneration(context, loop.iterations[0]!.aiCandidateGenerationId, seeded, 1);
-  const creationWake = await currentWake(context, loop.id); const crashed = await processRepairLoopJob({ id: creationWake, data: { version: 1, repairLoopId: loop.id } } as never, { database: context.database, queues, clock: () => NOW, afterVerificationCreated: async () => { throw new Error('simulated_process_loss'); } });
+  const creationWake = await currentWake(context, loop.id); const crashed = await processRepairLoopJob({ id: creationWake, data: { version: 1, repairLoopId: loop.id } } as never, { database: context.database, queues, clock: () => NOW, executionAuthority: TEST_EXECUTION_AUTHORITY, afterVerificationCreated: async () => { throw new Error('simulated_process_loss'); } });
   assert.equal(crashed.status, 'failed'); assert.equal((await context.database.select().from(candidateVerification)).length, 1);
   await runWake(context, loop.id, queues); const [iteration] = await context.database.select().from(repairLoopIteration).where(eq(repairLoopIteration.repairLoopId, loop.id)); await completeVerification(context, iteration!.candidateVerificationId!, candidate.candidateId, candidate.candidateIdentity, seeded, true);
-  const evidenceWake = await currentWake(context, loop.id); const evidenceCrash = await processRepairLoopJob({ id: evidenceWake, data: { version: 1, repairLoopId: loop.id } } as never, { database: context.database, queues, clock: () => NOW, afterEvidenceObserved: async () => { throw new Error('simulated_process_loss'); } });
+  const evidenceWake = await currentWake(context, loop.id); const evidenceCrash = await processRepairLoopJob({ id: evidenceWake, data: { version: 1, repairLoopId: loop.id } } as never, { database: context.database, queues, clock: () => NOW, executionAuthority: TEST_EXECUTION_AUTHORITY, afterEvidenceObserved: async () => { throw new Error('simulated_process_loss'); } });
   assert.equal(evidenceCrash.status, 'failed'); assert.equal((await getRepairLoop(context.database, seeded.workspaceContext, loop.id))?.state, 'running');
-  assert.equal((await processRepairLoopJob({ id: evidenceWake, data: { version: 1, repairLoopId: loop.id } } as never, { database: context.database, queues, clock: () => NOW })).status, 'completed'); assert.equal((await getRepairLoop(context.database, seeded.workspaceContext, loop.id))?.state, 'verified');
+  assert.equal((await processRepairLoopJob({ id: evidenceWake, data: { version: 1, repairLoopId: loop.id } } as never, { database: context.database, queues, clock: () => NOW, executionAuthority: TEST_EXECUTION_AUTHORITY })).status, 'completed'); assert.equal((await getRepairLoop(context.database, seeded.workspaceContext, loop.id))?.state, 'verified');
 });
 
 test('terminal generation failure and artifact-integrity failure stop closed without iteration 2', async (t) => {
@@ -288,7 +368,7 @@ test('repair-loop reconciliation exhaustion becomes a terminal infrastructure fa
     enqueueVerification: queues.enqueueVerification.bind(queues),
     enqueueRepairLoop: async () => { throw new Error('controlled_queue_failure'); },
   };
-  const result = await processRepairLoopJob({ id: wakeJobId, data: { version: 1, repairLoopId: loop.id }, retryCount: 4, retryLimit: 4 } as never, { database: context.database, queues: brokenQueues, clock: () => NOW });
+  const result = await processRepairLoopJob({ id: wakeJobId, data: { version: 1, repairLoopId: loop.id }, retryCount: 4, retryLimit: 4 } as never, { database: context.database, queues: brokenQueues, clock: () => NOW, executionAuthority: TEST_EXECUTION_AUTHORITY });
   assert.equal(result.status, 'completed');
   const finished = await getRepairLoop(context.database, seeded.workspaceContext, loop.id);
   assert.equal(finished?.state, 'failed'); assert.equal(finished?.failureClassification, 'infrastructure_failure');

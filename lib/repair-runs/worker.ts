@@ -15,6 +15,8 @@ import {
 import { recoverSandbox, type SandboxLifecycleObserver } from '../../src/sandbox-boundary.ts';
 import type { AuthenticatedWorkspace } from '../auth/protected-context.ts';
 import type { VigiloDatabase } from '../db/types.ts';
+import { DurableExternalExecutionAuthorizer } from '../external-execution/authority.ts';
+import type { ExternalExecutionAuthorizer } from '../external-execution/types.ts';
 import type { GitHubAppConfiguration } from '../github-app/types.ts';
 import { resolveBaselineAuthority } from '../repository-baselines/authority.ts';
 import { executeSelectedRepositoryBaseline } from '../repository-baselines/flow.ts';
@@ -62,6 +64,7 @@ export interface RepairWorkerDependencies {
   clock?: () => Date;
   randomId?: () => string;
   recover?: Recovery;
+  executionAuthority?: ExternalExecutionAuthorizer;
 }
 
 type Claim =
@@ -336,8 +339,13 @@ async function recoverStaleAttempt(dependencies: RepairWorkerDependencies, run: 
   const evidence = await evidenceForAttempt(dependencies.database, attempt);
   if (evidence) return finalizeFromEvidence(dependencies, run, attempt, evidence);
 
+  const executionAuthority = dependencies.executionAuthority ?? new DurableExternalExecutionAuthorizer(dependencies.database);
   const cleanup = attempt.sandboxName
-    ? await (dependencies.recover ?? recoverSandbox)({ name: attempt.sandboxName, sessionId: attempt.sandboxSessionId })
+    ? await (dependencies.recover ?? recoverSandbox)(
+      { name: attempt.sandboxName, sessionId: attempt.sandboxSessionId },
+      executionAuthority,
+      { workspaceId: run.workspaceId, repairRunId: run.id, githubRepositoryId: run.githubRepositoryId, baseCommitSha: run.baseCommitSha, operationCategory: 'sandbox_baseline', providerId: 'vercel' },
+    )
     : { stop: 'not_needed', delete: 'not_needed', lookup: 'absent', errors: [] };
   dependencies.logger.write({ event: 'cleanup_observed', runId: run.id, attemptId: attempt.id, outcome: cleanup.lookup });
   const confirmed = cleanup.lookup === 'absent' && ['confirmed', 'not_needed'].includes(cleanup.stop) && ['confirmed', 'not_needed'].includes(cleanup.delete);
@@ -433,6 +441,10 @@ async function executeAttempt(dependencies: RepairWorkerDependencies, run: Store
         },
         authorizePersistence: () => renewAttempt(dependencies.database, attempt, (dependencies.clock ?? (() => new Date()))()),
         sandboxObserver: observerFor(dependencies, attempt),
+        sandboxAuthority: {
+          authorizer: dependencies.executionAuthority ?? new DurableExternalExecutionAuthorizer(dependencies.database),
+          scope: { workspaceId: run.workspaceId, repairRunId: run.id, githubRepositoryId: run.githubRepositoryId, baseCommitSha: run.baseCommitSha, operationCategory: 'sandbox_baseline', providerId: 'vercel' },
+        },
       },
     );
     dependencies.logger.write({ event: 'baseline_classified', runId: run.id, attemptId: attempt.id, outcome: evidence.overallOutcome });

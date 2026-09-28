@@ -19,6 +19,7 @@ import { acquireExactRepositoryArchive } from '../repository-baselines/flow.ts';
 import { runFrozenCandidateVerification } from './runner.ts';
 import { trustworthyComparableBaseline } from './classification.ts';
 import type { CandidateVerificationEvidence, CandidateVerificationGateway } from './types.ts';
+import { ZERO_EXTERNAL_EXECUTION_AUTHORITY, type ExternalExecutionAuthorizer } from '../external-execution/types.ts';
 
 export class CandidateVerificationPreparationError extends Error {
   constructor(public readonly code: 'candidate_artifact_invalid' | 'verification_authority_mismatch' | 'verification_source_unavailable') {
@@ -38,7 +39,7 @@ export async function executeCandidateVerification(
   gateway: CandidateVerificationGateway,
   configuration: GitHubAppConfiguration,
   input: { verificationId: string; attemptId: string; evidenceId: string },
-  options: { cancellation?: AbortSignal; clock?: () => Date; runner?: typeof runFrozenCandidateVerification; sandboxObserver?: SandboxLifecycleObserver } = {},
+  options: { cancellation?: AbortSignal; clock?: () => Date; runner?: typeof runFrozenCandidateVerification; sandboxObserver?: SandboxLifecycleObserver; executionAuthority?: ExternalExecutionAuthorizer } = {},
 ): Promise<CandidateVerificationEvidence> {
   const [verification] = await database.select().from(candidateVerification).where(eq(candidateVerification.id, input.verificationId)).limit(1);
   if (!verification) throw new CandidateVerificationPreparationError('verification_authority_mismatch');
@@ -82,5 +83,15 @@ export async function executeCandidateVerification(
     baselineId: verification.baselineId, baselineSandbox: { name: baseline.sandboxName, sessionId: baseline.sandboxSessionId },
     baselineOutcome: baseline.overallOutcome, profile: frozenProfile, files: artifact.files, archive,
     archiveSha256: createHash('sha256').update(archive).digest('hex'), startedAt: clock(),
-  }, options.cancellation, clock, options.sandboxObserver);
+  }, options.cancellation, clock, options.sandboxObserver, {
+    authorizer: options.executionAuthority ?? ZERO_EXTERNAL_EXECUTION_AUTHORITY,
+    scope: {
+      workspaceId: verification.workspaceId,
+      repairRunId: verification.repairRunId,
+      githubRepositoryId: verification.githubRepositoryId,
+      baseCommitSha: verification.baseCommitSha,
+      operationCategory: 'sandbox_verification',
+      providerId: 'vercel',
+    },
+  });
 }

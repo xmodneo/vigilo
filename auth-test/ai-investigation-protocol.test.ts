@@ -7,8 +7,11 @@ import { classifyGeminiProviderError, GeminiInvestigationProvider, readModelApiK
 import { buildInitialInput, CONCLUSION_SCHEMA, encodeToolOutput, MODEL_INSTRUCTIONS, MODEL_TOOLS, parseConclusion, parseToolArguments } from '../lib/ai-investigations/protocol.ts';
 import { AI_LIMITS, AI_MODEL_ID } from '../lib/ai-investigations/types.ts';
 import { parseAiInvestigationJobPayload } from '../lib/repair-runs/queue.ts';
+import { createTestExternalExecutionAuthorizer, TEST_EXTERNAL_EXECUTION_SCOPE } from './external-execution-support.ts';
 
 const conclusion = { status: 'diagnosis_found', summary: 'The boundary comparison is exclusive.', suspectedFiles: [{ path: 'src/shipping.ts', reason: 'Contains the threshold check.' }], evidence: [{ kind: 'file', reference: randomUUID() }], proposedApproach: 'Make the threshold inclusive.', confidence: 'high' } as const;
+const authority = createTestExternalExecutionAuthorizer();
+const providerConfiguration = { instructions: MODEL_INSTRUCTIONS, initialInput: '{}', tools: MODEL_TOOLS, conclusionSchema: CONCLUSION_SCHEMA, maxOutputTokens: AI_LIMITS.maxOutputTokens, externalExecutionScope: TEST_EXTERNAL_EXECUTION_SCOPE } as const;
 
 test('the model protocol exposes exactly four read-only investigation tools', async (t) => {
   const expected = ['listPaths', 'readTextFile', 'searchText', 'readBaselineSummary'];
@@ -66,11 +69,12 @@ test('minimal durable job payload rejects extra authority', () => {
 
 test('Gemini adapter exposes only four custom functions with structured stateless output', async () => {
   const requests: unknown[] = [];
-  const client = { create: async (request: unknown) => { requests.push(request); return { id: 'interaction-1', status: 'completed', steps: [{ type: 'thought', signature: 'opaque-provider-signature' }, { type: 'model_output', content: [{ type: 'text', text: JSON.stringify(conclusion) }] }], output_text: JSON.stringify(conclusion), usage: { total_input_tokens: 42, total_output_tokens: 7, total_thought_tokens: 5 } }; } };
-  const provider = new GeminiInvestigationProvider('test-secret-value-with-adequate-length', AI_MODEL_ID, client as never);
-  const session = provider.createSession({ instructions: MODEL_INSTRUCTIONS, initialInput: '{}', tools: MODEL_TOOLS, conclusionSchema: CONCLUSION_SCHEMA, maxOutputTokens: AI_LIMITS.maxOutputTokens });
+  const requestOptions: unknown[] = [];
+  const client = { create: async (request: unknown, options: unknown) => { requests.push(request); requestOptions.push(options); return { id: 'interaction-1', status: 'completed', steps: [{ type: 'thought', signature: 'opaque-provider-signature' }, { type: 'model_output', content: [{ type: 'text', text: JSON.stringify(conclusion) }] }], output_text: JSON.stringify(conclusion), usage: { total_input_tokens: 42, total_output_tokens: 7, total_thought_tokens: 5 } }; } };
+  const provider = new GeminiInvestigationProvider('test-secret-value-with-adequate-length', AI_MODEL_ID, client as never, authority);
+  const session = provider.createSession(providerConfiguration);
   const turn = await session.next({ signal: new AbortController().signal });
-  assert.deepEqual(turn.conclusion, conclusion); assert.deepEqual(turn.usage, { inputTokens: 42, outputTokens: 7 });
+  assert.deepEqual(turn.conclusion, conclusion); assert.deepEqual(turn.usage, { inputTokens: 42, outputTokens: 12 });
   assert.deepEqual(Object.keys(turn).sort(), ['conclusion', 'toolCalls', 'usage']);
   const request = requests[0] as Record<string, any>;
   assert.equal(request.model, 'gemini-3.1-flash-lite'); assert.equal(request.store, false); assert.equal(request.previous_interaction_id, undefined);
@@ -78,6 +82,7 @@ test('Gemini adapter exposes only four custom functions with structured stateles
   assert.deepEqual(request.response_format, { type: 'text', mime_type: 'application/json', schema: CONCLUSION_SCHEMA });
   assert.deepEqual(request.tools.map((tool: Record<string, unknown>) => ({ type: tool.type, name: tool.name })), MODEL_TOOLS.map((tool) => ({ type: 'function', name: tool.name })));
   assert.ok(request.tools.every((tool: Record<string, unknown>) => Object.keys(tool).every((key) => ['type', 'name', 'description', 'parameters'].includes(key))));
+  assert.deepEqual((requestOptions[0] as { retries: unknown }).retries, { strategy: 'none' });
   const serialized = JSON.stringify(request);
   assert.doesNotMatch(serialized, /test-secret-value|opaque-provider-signature/); assert.match(serialized, /Do not provide hidden chain-of-thought/);
 });
@@ -89,8 +94,8 @@ test('Gemini stateless continuation resends transient provider steps and bounded
     if (requests.length === 1) return { id: 'interaction-1', status: 'requires_action', steps: [{ type: 'thought', signature: 'transient-signature' }, { type: 'function_call', id: 'call-1', name: 'readTextFile', arguments: { path: 'src/shipping.ts' } }], output_text: '' };
     return { id: 'interaction-2', status: 'completed', steps: [{ type: 'model_output', content: [{ type: 'text', text: JSON.stringify(conclusion) }] }], output_text: JSON.stringify(conclusion) };
   } };
-  const provider = new GeminiInvestigationProvider('test-secret-value-with-adequate-length', AI_MODEL_ID, client as never);
-  const session = provider.createSession({ instructions: MODEL_INSTRUCTIONS, initialInput: '{}', tools: MODEL_TOOLS, conclusionSchema: CONCLUSION_SCHEMA, maxOutputTokens: AI_LIMITS.maxOutputTokens });
+  const provider = new GeminiInvestigationProvider('test-secret-value-with-adequate-length', AI_MODEL_ID, client as never, authority);
+  const session = provider.createSession(providerConfiguration);
   const first = await session.next({ signal: new AbortController().signal });
   assert.deepEqual(first.toolCalls, [{ callId: 'call-1', name: 'readTextFile', arguments: { path: 'src/shipping.ts' } }]);
   await session.next({ toolOutputs: [{ callId: 'call-1', output: '{"bounded":true}' }], signal: new AbortController().signal });
@@ -110,8 +115,8 @@ test('Gemini finalization request exposes no tools', async () => {
     if (requests.length === 1) return { id: 'interaction-1', status: 'requires_action', steps: [{ type: 'function_call', id: 'call-1', name: 'readBaselineSummary', arguments: {} }], output_text: '' };
     return { id: 'interaction-2', status: 'completed', steps: [{ type: 'model_output', content: [{ type: 'text', text: JSON.stringify(conclusion) }] }], output_text: JSON.stringify(conclusion) };
   } };
-  const provider = new GeminiInvestigationProvider('test-secret-value-with-adequate-length', AI_MODEL_ID, client as never);
-  const session = provider.createSession({ instructions: MODEL_INSTRUCTIONS, initialInput: '{}', tools: MODEL_TOOLS, conclusionSchema: CONCLUSION_SCHEMA, maxOutputTokens: AI_LIMITS.maxOutputTokens });
+  const provider = new GeminiInvestigationProvider('test-secret-value-with-adequate-length', AI_MODEL_ID, client as never, authority);
+  const session = provider.createSession(providerConfiguration);
   await session.next({ signal: new AbortController().signal });
   await session.next({ toolOutputs: [{ callId: 'call-1', output: '{"bounded":true}' }], finalization: true, signal: new AbortController().signal });
   assert.deepEqual(requests[0]?.tools.map((tool: Record<string, unknown>) => tool.name), MODEL_TOOLS.map((tool) => tool.name));
@@ -126,8 +131,8 @@ test('Gemini malformed function-call protocol is rejected before dispatch', asyn
     { type: 'google_search_call', id: 'search-1', arguments: { query: 'forbidden' } },
   ]) {
     const client = { create: async () => ({ id: 'interaction-1', status: 'completed', steps: [step], output_text: '' }) };
-    const session = new GeminiInvestigationProvider('test-secret-value-with-adequate-length', AI_MODEL_ID, client as never)
-      .createSession({ instructions: MODEL_INSTRUCTIONS, initialInput: '{}', tools: MODEL_TOOLS, conclusionSchema: CONCLUSION_SCHEMA, maxOutputTokens: AI_LIMITS.maxOutputTokens });
+    const session = new GeminiInvestigationProvider('test-secret-value-with-adequate-length', AI_MODEL_ID, client as never, authority)
+      .createSession(providerConfiguration);
     await assert.rejects(session.next({ signal: new AbortController().signal }), /model_protocol_error/);
   }
 });
@@ -139,8 +144,8 @@ test('Gemini interaction status must agree with its response steps', async () =>
     { id: 'interaction-1', status: 'incomplete', steps: [{ type: 'model_output', content: [{ type: 'text', text: JSON.stringify(conclusion) }] }], output_text: JSON.stringify(conclusion) },
   ]) {
     const client = { create: async () => response };
-    const session = new GeminiInvestigationProvider('test-secret-value-with-adequate-length', AI_MODEL_ID, client as never)
-      .createSession({ instructions: MODEL_INSTRUCTIONS, initialInput: '{}', tools: MODEL_TOOLS, conclusionSchema: CONCLUSION_SCHEMA, maxOutputTokens: AI_LIMITS.maxOutputTokens });
+    const session = new GeminiInvestigationProvider('test-secret-value-with-adequate-length', AI_MODEL_ID, client as never, authority)
+      .createSession(providerConfiguration);
     await assert.rejects(session.next({ signal: new AbortController().signal }), /model_protocol_error/);
   }
 });

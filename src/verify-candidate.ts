@@ -4,6 +4,7 @@ import { EXPECTED_FIXTURE_HASH, loadOriginalFixture, fixtureHash, parseRepairedT
 import { buildCandidate, collectTree, loadCandidate, sandboxTreeReader, CandidateError } from "./candidate.js";
 import { SandboxBoundary, requireNode24 } from "./sandbox-boundary.js";
 import { ROOT, INSTALL_POLICY, INSTALL_ARGS, commandEvidence, fixtureExecutor, boundedReport, ExecutionFailure } from "./fixture-execution.js";
+import type { ExternalExecutionAuthorizer, ExternalExecutionScope } from "../lib/external-execution/types.js";
 
 // Host-recorded Task 1.4 provenance (docs/candidate.md). Session ID was not
 // retained; the recorded unique sandbox NAME is the separation identifier.
@@ -23,8 +24,12 @@ const BASELINE_NEGATIVE_CONTROL = Object.freeze({
 export async function runVerification(
   candidatePath = fileURLToPath(new URL(`../../.vigilo/candidates/${VERIFICATION_CONTROL.candidateHash}.json`, import.meta.url)),
   control: VerificationControl = VERIFICATION_CONTROL,
+  sandboxAuthority?: { authorizer: ExternalExecutionAuthorizer; scope: ExternalExecutionScope },
 ) {
-  const boundary = new SandboxBoundary("vigilo-verifier", INSTALL_POLICY, 240_000);
+  const boundary = new SandboxBoundary(
+    "vigilo-verifier", INSTALL_POLICY, 240_000, undefined,
+    sandboxAuthority?.authorizer, sandboxAuthority?.scope,
+  );
   const report = {
     success: false, outcome: "invalid_candidate", baseFixtureIdentity: EXPECTED_FIXTURE_HASH,
     frozenCandidateIdentity: null as string | null, repairSandbox: control.repairSandbox,

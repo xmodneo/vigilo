@@ -2,12 +2,26 @@ import { GoogleGenAI, type Interactions } from '@google/genai';
 
 import { ModelProviderError, type InvestigationModelProvider, type InvestigationModelSession, type ModelTurn } from './types.ts';
 import { FINALIZATION_INPUT } from './protocol.ts';
+import { ZERO_EXTERNAL_EXECUTION_AUTHORITY, type ExternalExecutionAuthorizer } from '../external-execution/types.ts';
 
 interface GeminiInteractionsClient {
   create(
     request: Interactions.CreateModelInteractionParamsNonStreaming,
-    options?: { signal?: AbortSignal },
+    options?: { signal?: AbortSignal; retries?: { strategy: 'none' } },
   ): Promise<Interactions.Interaction>;
+}
+
+function observedUsage(usage: Interactions.Interaction['usage']): { inputTokens?: number; outputTokens?: number } | undefined {
+  if (!usage) return undefined;
+  const inputTokens = typeof usage.total_input_tokens === 'number' ? usage.total_input_tokens : undefined;
+  const outputTokens = typeof usage.total_output_tokens === 'number' ? usage.total_output_tokens : undefined;
+  const thoughtTokens = typeof usage.total_thought_tokens === 'number' ? usage.total_thought_tokens : undefined;
+  return {
+    ...(inputTokens !== undefined ? { inputTokens } : {}),
+    ...(outputTokens !== undefined || thoughtTokens !== undefined
+      ? { outputTokens: (outputTokens ?? 0) + (thoughtTokens ?? 0) }
+      : {}),
+  };
 }
 
 const CALL_ID = /^[A-Za-z0-9_.:-]{1,200}$/;
@@ -93,6 +107,7 @@ export class GeminiInvestigationProvider implements InvestigationModelProvider {
     apiKey: string,
     readonly modelId = 'gemini-3.1-flash-lite',
     private readonly client: GeminiInteractionsClient = new GoogleGenAI({ apiKey }).interactions,
+    private readonly executionAuthority: ExternalExecutionAuthorizer = ZERO_EXTERNAL_EXECUTION_AUTHORITY,
   ) {}
 
   createSession(configuration: Parameters<InvestigationModelProvider['createSession']>[0]): InvestigationModelSession {
@@ -110,33 +125,53 @@ export class GeminiInvestigationProvider implements InvestigationModelProvider {
         }
         if (finalization) history.push({ type: 'user_input', content: [{ type: 'text', text: configuration.finalizationInput ?? FINALIZATION_INPUT }] });
 
+        const request = {
+          model: this.modelId,
+          input: [...history],
+          system_instruction: configuration.instructions,
+          tools: (finalization ? [] : configuration.tools).map((tool) => ({
+            type: 'function' as const,
+            name: tool.name,
+            description: tool.description,
+            parameters: tool.parameters,
+          })),
+          generation_config: {
+            thinking_level: 'medium' as const,
+            thinking_summaries: 'none' as const,
+            max_output_tokens: configuration.maxOutputTokens,
+          },
+          response_format: {
+            type: 'text' as const,
+            mime_type: 'application/json',
+            schema: configuration.conclusionSchema,
+          },
+          store: false,
+        };
+        if (!configuration.externalExecutionScope) throw new ModelProviderError('provider_configuration_failed');
+        const permit = await this.executionAuthority.reserve({
+          scope: configuration.externalExecutionScope,
+          amounts: {
+            logicalRequests: 1,
+            providerAttempts: 1,
+            inputTokens: Buffer.byteLength(JSON.stringify(request), 'utf8'),
+            outputTokens: configuration.maxOutputTokens,
+            sandboxIdentities: 0,
+            sandboxRuntimeMs: 0,
+            verificationAttempts: 0,
+            repairLoopIterations: 0,
+          },
+        });
+        const attempt = await permit.beginProviderAttempt();
         let response: Interactions.Interaction;
         try {
-          response = await this.client.create({
-            model: this.modelId,
-            input: [...history],
-            system_instruction: configuration.instructions,
-            tools: (finalization ? [] : configuration.tools).map((tool) => ({
-              type: 'function' as const,
-              name: tool.name,
-              description: tool.description,
-              parameters: tool.parameters,
-            })),
-            generation_config: {
-              thinking_level: 'medium',
-              thinking_summaries: 'none',
-              max_output_tokens: configuration.maxOutputTokens,
-            },
-            response_format: {
-              type: 'text',
-              mime_type: 'application/json',
-              schema: configuration.conclusionSchema,
-            },
-            store: false,
-          }, { signal });
+          response = await this.client.create(request, { signal, retries: { strategy: 'none' } });
         } catch (error) {
+          await permit.finishProviderAttempt(attempt, 'ambiguous');
+          await permit.complete('ambiguous', 'provider_attempt_ambiguous');
           throw classifyGeminiProviderError(error);
         }
+        await permit.finishProviderAttempt(attempt, 'succeeded', observedUsage(response.usage));
+        await permit.complete('succeeded');
 
         if (!Array.isArray(response.steps)) throw new Error('model_protocol_error');
         const calls = parseFunctionCalls(response.steps);
@@ -150,12 +185,7 @@ export class GeminiInvestigationProvider implements InvestigationModelProvider {
         // thought signatures. They remain transient in this in-memory session.
         history.push(...response.steps);
         const conclusion = calls.length === 0 ? parseStructuredOutput(response.output_text) : null;
-        const usage = response.usage
-          ? {
-              ...(typeof response.usage.total_input_tokens === 'number' ? { inputTokens: response.usage.total_input_tokens } : {}),
-              ...(typeof response.usage.total_output_tokens === 'number' ? { outputTokens: response.usage.total_output_tokens } : {}),
-            }
-          : undefined;
+        const usage = observedUsage(response.usage);
         return { toolCalls: calls, conclusion, ...(usage ? { usage } : {}) };
       },
     };

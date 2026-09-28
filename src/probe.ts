@@ -1,5 +1,6 @@
 import { APIError } from "@vercel/sandbox";
 import { SandboxBoundary, CREDENTIALS_SCRIPT, requireNode24 } from "./sandbox-boundary.js";
+import type { ExternalExecutionAuthorizer, ExternalExecutionScope } from "../lib/external-execution/types.js";
 export { cleanupSandbox, requireNode24 } from "./sandbox-boundary.js";
 
 export type NetworkObservation = {
@@ -73,8 +74,13 @@ const NETWORK_SCRIPT = `
   console.log(JSON.stringify(observation));
 `;
 
-export async function runProbe() {
-  const boundary = new SandboxBoundary("vigilo-probe", "allow-all", 120_000);
+export async function runProbe(
+  sandboxAuthority?: { authorizer: ExternalExecutionAuthorizer; scope: ExternalExecutionScope },
+) {
+  const boundary = new SandboxBoundary(
+    "vigilo-probe", "allow-all", 120_000, undefined,
+    sandboxAuthority?.authorizer, sandboxAuthority?.scope,
+  );
   const report = {
     success: false,
     sandbox: boundary.evidence,

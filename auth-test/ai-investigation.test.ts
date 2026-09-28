@@ -7,6 +7,7 @@ import { and, eq } from 'drizzle-orm';
 
 import { account, aiInvestigation, aiInvestigationAttempt, aiInvestigationEvent, executionProfile, githubInstallation, investigation, investigationContextEntry, investigationContextEvent, repairCandidate, repairIntent, repairRun, repository, repositoryBaseline, user, workspace } from '../db/schema.ts';
 import { GeminiInvestigationProvider } from '../lib/ai-investigations/gemini-provider.ts';
+import { createTestExternalExecutionAuthorizer } from './external-execution-support.ts';
 import { AI_LIMITS, type InvestigationModelProvider, type InvestigationModelSession, type InvestigationConclusion, type ModelTurn } from '../lib/ai-investigations/types.ts';
 import { getAiInvestigation, startAiInvestigation, AiInvestigationFlowError } from '../lib/ai-investigations/flow.ts';
 import { processAiInvestigationJob } from '../lib/ai-investigations/worker.ts';
@@ -18,6 +19,7 @@ import { readTextFile, searchText } from '../lib/investigations/context.ts';
 import type { InvestigationSourceGateway } from '../lib/investigations/types.ts';
 import type { AiInvestigationJobPayload, TransactionalAiInvestigationQueue } from '../lib/repair-runs/queue.ts';
 import { createTestContext } from './support.ts';
+import { ExternalExecutionAuthorityError } from '../lib/external-execution/types.ts';
 
 const NOW = new Date();
 const COMMIT = 'a'.repeat(40); const PROFILE = 'b'.repeat(64); const TREE = 'c'.repeat(40);
@@ -244,7 +246,7 @@ test('daily Gemini quota exhaustion fails once without repository or mutation ca
   const seeded = await seedReady(context, root.workspaceId); const ai = await startAiInvestigation(context.database, root.owner, seeded.investigationId, new MemoryQueue()); const gateway = new Gateway();
   const rawMarker = 'provider-secret-response-marker';
   const client = { create: async () => { throw { status: 429, message: `generate_content_free_tier_requests GenerateRequestsPerDayPerProjectPerModel-FreeTier ${rawMarker}`, body: rawMarker }; } };
-  const provider = new GeminiInvestigationProvider('test-secret-value-with-adequate-length', 'gemini-3.1-flash-lite', client as never);
+  const provider = new GeminiInvestigationProvider('test-secret-value-with-adequate-length', 'gemini-3.1-flash-lite', client as never, createTestExternalExecutionAuthorizer());
   const output = await processAiInvestigationJob(job(ai.id), { database: context.database, gateway, configuration: CONFIGURATION, createProvider: () => provider, clock: () => NOW });
   assert.equal(output.status, 'completed');
   const stored = await getAiInvestigation(context.database, root.owner, ai.id); assert.equal(stored?.state, 'failed'); assert.equal(stored?.failureCode, 'provider_quota_exhausted');
@@ -258,6 +260,22 @@ test('daily Gemini quota exhaustion fails once without repository or mutation ca
   assert.doesNotMatch(JSON.stringify(persistedFailureRecords), new RegExp(rawMarker));
   const executionSource = `${readFileSync('lib/ai-investigations/runner.ts', 'utf8')}\n${readFileSync('lib/ai-investigations/worker.ts', 'utf8')}`;
   assert.doesNotMatch(executionSource, /@vercel\/sandbox|createCandidate|freezeCandidate|createBranch|createCommit|createPullRequest/);
+});
+
+test('durable execution-authority failures remain exact and terminal', async (t) => {
+  const context = await createTestContext(); t.after(() => context.client.close()); const root = await seedRoot(context);
+  const seeded = await seedReady(context, root.workspaceId); const ai = await startAiInvestigation(context.database, root.owner, seeded.investigationId, new MemoryQueue());
+  const output = await processAiInvestigationJob(job(ai.id), {
+    database: context.database, gateway: new Gateway(), configuration: CONFIGURATION,
+    createProvider: () => new ScriptedProvider(),
+    executor: (async () => { throw new ExternalExecutionAuthorityError('execution_budget_exhausted'); }) as never,
+    clock: () => NOW,
+  });
+  assert.equal(output.status, 'completed');
+  const stored = await getAiInvestigation(context.database, root.owner, ai.id);
+  assert.equal(stored?.state, 'failed'); assert.equal(stored?.failureCode, 'execution_budget_exhausted');
+  const attempts = await context.database.select().from(aiInvestigationAttempt).where(eq(aiInvestigationAttempt.aiInvestigationId, ai.id));
+  assert.equal(attempts.length, 1); assert.equal(attempts[0]?.state, 'exhausted');
 });
 
 test('short-lived provider rate limits remain bounded by three worker attempts', async (t) => {

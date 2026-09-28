@@ -11,6 +11,8 @@ import {
 } from '../../db/schema.ts';
 import { recoverSandbox, type SandboxLifecycleObserver } from '../../src/sandbox-boundary.ts';
 import type { VigiloDatabase } from '../db/types.ts';
+import { DurableExternalExecutionAuthorizer } from '../external-execution/authority.ts';
+import type { ExternalExecutionAuthorizer } from '../external-execution/types.ts';
 import type { GitHubAppConfiguration } from '../github-app/types.ts';
 import type { WorkerLogger } from '../repair-runs/worker.ts';
 import {
@@ -38,6 +40,7 @@ export interface CandidateVerificationWorkerDependencies {
   randomId?: () => string;
   recover?: typeof recoverSandbox;
   afterEvidencePersisted?: () => Promise<void>;
+  executionAuthority?: ExternalExecutionAuthorizer;
 }
 
 type Claim =
@@ -231,7 +234,11 @@ export async function processCandidateVerificationJob(job: RepairQueueJob, depen
   if (claim.kind !== 'attempt') return { id: job.id, status: 'failed', output: { code: 'verification_claim_failed' } };
   const { attempt, verification } = claim;
   if (claim.recovered && attempt.sandboxName) {
-    const cleanup = await (dependencies.recover ?? recoverSandbox)({ name: attempt.sandboxName, sessionId: attempt.sandboxSessionId });
+    const cleanup = await (dependencies.recover ?? recoverSandbox)(
+      { name: attempt.sandboxName, sessionId: attempt.sandboxSessionId },
+      dependencies.executionAuthority ?? new DurableExternalExecutionAuthorizer(dependencies.database),
+      { workspaceId: verification.workspaceId, repairRunId: verification.repairRunId, githubRepositoryId: verification.githubRepositoryId, baseCommitSha: verification.baseCommitSha, operationCategory: 'sandbox_verification', providerId: 'vercel' },
+    );
     const confirmed = cleanup.stop === 'confirmed' && cleanup.delete === 'confirmed' && cleanup.lookup === 'absent' || cleanup.lookup === 'absent';
     if (!confirmed) return { id: job.id, status: 'failed', output: { code: 'orphan_cleanup_unconfirmed' } };
     await finishAttempt(dependencies.database, attempt, now, { state: 'abandoned', failureCode: 'process_loss', cleanup });
@@ -250,7 +257,7 @@ export async function processCandidateVerificationJob(job: RepairQueueJob, depen
   try {
     const report = await (dependencies.executor ?? executeCandidateVerification)(dependencies.database, dependencies.gateway, dependencies.configuration, {
       verificationId: verification.id, attemptId: attempt.id, evidenceId: attempt.expectedEvidenceId,
-    }, { cancellation: controller.signal, ...(dependencies.clock ? { clock: dependencies.clock } : {}), sandboxObserver: observer });
+    }, { cancellation: controller.signal, ...(dependencies.clock ? { clock: dependencies.clock } : {}), sandboxObserver: observer, executionAuthority: dependencies.executionAuthority ?? new DurableExternalExecutionAuthorizer(dependencies.database) });
     await persistEvidence(dependencies.database, attempt, report);
     await dependencies.afterEvidencePersisted?.();
     const [evidence] = await dependencies.database.select().from(candidateVerificationEvidence).where(eq(candidateVerificationEvidence.id, report.evidenceId)).limit(1);

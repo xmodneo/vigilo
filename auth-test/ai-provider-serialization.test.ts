@@ -7,6 +7,7 @@ import { collectGeminiResponseSchemaKeywords, unsupportedGeminiResponseSchemaKey
 import { AI_CANDIDATE_GENERATION_LIMITS } from '../lib/ai-candidate-generations/types.ts';
 import { buildInitialInput, CONCLUSION_SCHEMA, MODEL_INSTRUCTIONS, MODEL_TOOLS } from '../lib/ai-investigations/protocol.ts';
 import { AI_LIMITS, AI_MODEL_ID } from '../lib/ai-investigations/types.ts';
+import { createTestExternalExecutionAuthorizer, TEST_EXTERNAL_EXECUTION_SCOPE } from './external-execution-support.ts';
 
 type CapturedRequest = {
   method: string;
@@ -56,13 +57,14 @@ async function captureSerializedRequests(): Promise<{ requests: CapturedRequest[
   };
 
   try {
-    const provider = new GeminiInvestigationProvider(FAKE_API_KEY, AI_MODEL_ID);
+    const provider = new GeminiInvestigationProvider(FAKE_API_KEY, AI_MODEL_ID, undefined, createTestExternalExecutionAuthorizer());
     const investigation = provider.createSession({
       instructions: MODEL_INSTRUCTIONS,
       initialInput: buildInitialInput({ objective: 'controlled test objective', baseCommitSha: 'a'.repeat(40), profile: {}, baseline: {}, context: {} }),
       tools: MODEL_TOOLS,
       conclusionSchema: CONCLUSION_SCHEMA,
       maxOutputTokens: AI_LIMITS.maxOutputTokens,
+      externalExecutionScope: TEST_EXTERNAL_EXECUTION_SCOPE,
     });
     await investigation.next({ signal: new AbortController().signal });
 
@@ -73,6 +75,7 @@ async function captureSerializedRequests(): Promise<{ requests: CapturedRequest[
       tools: AI_CANDIDATE_PROPOSAL_TOOLS,
       conclusionSchema: AI_CANDIDATE_PROPOSAL_PROVIDER_SCHEMA,
       maxOutputTokens: AI_CANDIDATE_GENERATION_LIMITS.maxOutputTokens,
+      externalExecutionScope: { ...TEST_EXTERNAL_EXECUTION_SCOPE, operationCategory: 'gemini_candidate_generation' },
     });
     await candidate.next({ signal: new AbortController().signal });
     await candidate.next({ finalization: true, signal: new AbortController().signal });

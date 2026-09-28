@@ -14,6 +14,7 @@ import type { InvestigationSourceGateway } from '../lib/investigations/types.ts'
 import type { TransactionalAiCandidateGenerationQueue, TransactionalAiInvestigationQueue } from '../lib/repair-runs/queue.ts';
 import { ModelProviderError, type InvestigationModelProvider, type InvestigationModelSession, type ModelTurn } from '../lib/ai-investigations/types.ts';
 import { createTestContext } from './support.ts';
+import { ExternalExecutionAuthorityError } from '../lib/external-execution/types.ts';
 
 const NOW = new Date('2030-09-12T12:00:00.000Z');
 const COMMIT = 'a'.repeat(40); const PROFILE = 'b'.repeat(64); const TREE = 'c'.repeat(40);
@@ -342,6 +343,22 @@ test('invalid local provider configuration is terminal before model entry or rep
   const output = await processAiCandidateGenerationJob({ id: queued.id, name: 'ai-candidate-generation-v1', data: { version: 1, proposalGenerationId: queued.id }, signal: new AbortController().signal } as never, { database: context.database, gateway, configuration: CONFIGURATION, createProvider: () => { throw new ModelProviderError('provider_configuration_failed'); }, clock: () => new Date(NOW.getTime() + 1) });
   const [generation] = await context.database.select().from(aiCandidateGeneration).where(eq(aiCandidateGeneration.id, queued.id)); const [attempt] = await context.database.select().from(aiCandidateGenerationAttempt).where(eq(aiCandidateGenerationAttempt.generationId, queued.id));
   assert.equal(output.status, 'completed'); assert.equal(generation?.state, 'failed'); assert.equal(generation?.failureCode, 'provider_configuration_failed'); assert.equal(generation?.modelTurnCount, 0); assert.equal(generation?.toolCallCount, 0); assert.equal(attempt?.state, 'exhausted'); assert.deepEqual(gateway.calls, []); assert.equal((await context.database.select().from(repairCandidate)).length, 0);
+});
+
+test('candidate generation preserves terminal durable execution-authority failures', async (t) => {
+  const context = await createTestContext(); t.after(() => context.client.close()); const seeded = await seed(context);
+  const queued = await startAiCandidateGeneration(context.database, seeded.workspaceContext, seeded.aiId, new CandidateQueue(), { clock: () => NOW });
+  const output = await processAiCandidateGenerationJob({ id: queued.id, name: 'ai-candidate-generation-v1', data: { version: 1, proposalGenerationId: queued.id }, signal: new AbortController().signal } as never, {
+    database: context.database, gateway: new Gateway(), configuration: CONFIGURATION,
+    createProvider: () => new ProposalProvider(),
+    executor: (async () => { throw new ExternalExecutionAuthorityError('execution_authority_expired'); }) as never,
+    clock: () => new Date(NOW.getTime() + 1),
+  });
+  const [generation] = await context.database.select().from(aiCandidateGeneration).where(eq(aiCandidateGeneration.id, queued.id));
+  const attempts = await context.database.select().from(aiCandidateGenerationAttempt).where(eq(aiCandidateGenerationAttempt.generationId, queued.id));
+  assert.equal(output.status, 'completed'); assert.equal(generation?.state, 'failed');
+  assert.equal(generation?.failureCode, 'execution_authority_expired');
+  assert.equal(attempts.length, 1); assert.equal(attempts[0]?.state, 'exhausted');
 });
 
 test('a stale worker cannot checkpoint usage after its ownership lease is lost', async (t) => {

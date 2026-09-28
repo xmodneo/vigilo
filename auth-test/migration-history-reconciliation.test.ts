@@ -23,17 +23,42 @@ test('historical migration files reproduce the hashes recorded when they were ap
   }
 });
 
-test('journal orders reconciliation, RepairLoop, human review, and publication migrations', async () => {
+test('journal orders reconciliation, RepairLoop, human review, publication, and execution-authority migrations', async () => {
   const journal = JSON.parse(await readFile(migrationPath('meta', '_journal.json'), 'utf8')) as {
     entries: Array<{ idx: number; when: number; tag: string }>;
   };
-  assert.deepEqual(journal.entries.slice(-4).map(({ idx, tag }) => ({ idx, tag })), [
+  assert.deepEqual(journal.entries.slice(-5).map(({ idx, tag }) => ({ idx, tag })), [
     { idx: 18, tag: '0018_historical-schema-reconciliation' },
     { idx: 19, tag: '0019_repair-loop' },
     { idx: 20, tag: '0020_human-review' },
     { idx: 21, tag: '0021_repair-publication' },
+    { idx: 22, tag: '0022_external-execution-authority' },
   ]);
   assert.ok(journal.entries.every((entry, index, entries) => index === 0 || entry.when > entries[index - 1]!.when));
+});
+
+test('external-execution migration installs immutable budget, fencing, and acceptance authority without rewriting history', async () => {
+  const content = await readFile(migrationPath('0022_external-execution-authority.sql'), 'utf8');
+  for (const marker of [
+    'execution_budget_grant_mutation_guard',
+    'external_execution_semaphore_mutation_guard',
+    'guard_external_execution_reservation_insert',
+    'guard_external_execution_lease_insert',
+    'external_execution_lease_mutation_guard',
+    'external_execution_event_insert_guard',
+    'external_execution_event_attempt_outcome_unique',
+    'external_execution_event_reserved_unique',
+    'external_execution_event_terminal_unique',
+    'release_acceptance_passed_boundary_unique',
+    'release_acceptance_insert_guard',
+    'release_acceptance_mutation_guard',
+    'release_acceptance_revocation_mutation_guard',
+    'acceptance evidence mismatch',
+    "d.\"decision\" = 'approved'",
+    'acceptance boundary already recorded',
+    'ON DELETE RESTRICT',
+  ]) assert.ok(content.includes(marker), marker);
+  assert.doesNotMatch(content, /(?:update|delete\s+from)\s+["']?drizzle["']?\s*\.\s*["']?__drizzle_migrations/i);
 });
 
 test('repair-publication migration installs immutable exact authority and append-only recovery history', async () => {

@@ -80,7 +80,7 @@ function publicDecision(row: DecisionRow): HumanReviewDecisionResult {
   };
 }
 
-function evidenceIdentityInput(
+export function evidenceIdentityInput(
   row: typeof candidateVerificationEvidence.$inferSelect,
   attempt: typeof candidateVerificationAttempt.$inferSelect,
 ): VerificationEvidenceIdentityInput {

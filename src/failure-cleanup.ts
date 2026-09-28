@@ -1,8 +1,9 @@
 import { Sandbox, APIError } from "@vercel/sandbox";
 import { createHash } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
-import { SandboxBoundary, ExecutionCancelled, requireNode24, providerErrorCode } from "./sandbox-boundary.js";
+import { SandboxBoundary, ExecutionCancelled, requireNode24, providerErrorCode, readSandboxCredentials } from "./sandbox-boundary.js";
 import { ROOT, INSTALL_ARGS, fixtureExecutor, commandEvidence, ExecutionFailure } from "./fixture-execution.js";
+import { ExternalExecutionAuthorityError, ZERO_EXTERNAL_EXECUTION_AUTHORITY, type ExternalExecutionAuthorizer, type ExternalExecutionScope } from "../lib/external-execution/types.ts";
 
 export function classifyFailure(error: unknown) {
   return error instanceof ExecutionCancelled ? "cancelled" : error instanceof ExecutionFailure ? error.kind
@@ -25,8 +26,12 @@ const LONG_SCRIPT = `
 const READY_SCRIPT = `const fs = require('node:fs'); const p = ${JSON.stringify(ROOT + "/.started")};
   console.log(fs.existsSync(p) ? fs.readFileSync(p, 'utf8') : 'not_started');`;
 
-export async function runFailureScenario(scenario: Scenario) {
-  const boundary = new SandboxBoundary("vigilo-failure", "deny-all", 120_000);
+export async function runFailureScenario(
+  scenario: Scenario,
+  authority: ExternalExecutionAuthorizer = ZERO_EXTERNAL_EXECUTION_AUTHORITY,
+  scope?: ExternalExecutionScope,
+) {
+  const boundary = new SandboxBoundary("vigilo-failure", "deny-all", 120_000, undefined, authority, scope);
   const controller = new AbortController();
   const command = commandEvidence(scenario === "installation_failure" ? [...INSTALL_ARGS, "--offline"] : ["test"],
     scenario === "command_timeout" ? 1500 : 30_000);
@@ -108,12 +113,30 @@ export async function runFailureScenario(scenario: Scenario) {
 }
 
 // Metadata-only lookup. Never execute a command through an observer: SDK commands may auto-resume.
-export async function observeSandbox(name: string, sessionId: string) {
+export async function observeSandbox(
+  name: string,
+  sessionId: string,
+  authority: ExternalExecutionAuthorizer = ZERO_EXTERNAL_EXECUTION_AUTHORITY,
+  scope?: ExternalExecutionScope,
+) {
+  if (!scope) throw new ExternalExecutionAuthorityError("execution_authority_missing");
+  const permit = await authority.reserve({
+    scope,
+    amounts: {
+      logicalRequests: 1, providerAttempts: 3, inputTokens: 0, outputTokens: 0,
+      sandboxIdentities: 0, sandboxRuntimeMs: 0, sandboxResourceClass: "vcpu_1",
+      verificationAttempts: 0, repairLoopIterations: 0,
+    },
+  });
+  let sandbox: Sandbox;
   try {
-    const sandbox = await Sandbox.get({ name, resume: false, signal: AbortSignal.timeout(10_000) });
-    return { sandbox, status: sandbox.status as string, sameSession: sandbox.currentSession().sessionId === sessionId, errorCode: null };
+    sandbox = await Sandbox.get({ ...readSandboxCredentials(), name, resume: false, signal: AbortSignal.timeout(10_000), fetch: permit.meteredFetch });
   } catch (error) {
-    return { sandbox: null, status: error instanceof APIError && error.response.status === 404 ? "absent" : "unconfirmed",
-      sameSession: null, errorCode: error instanceof APIError && error.response.status === 404 ? null : providerErrorCode(error) };
+    const absent = error instanceof APIError && error.response.status === 404;
+    await permit.complete(absent ? "succeeded" : "failed", absent ? undefined : "sandbox_cleanup_unresolved");
+    return { sandbox: null, status: absent ? "absent" : "unconfirmed",
+      sameSession: null, errorCode: absent ? null : providerErrorCode(error) };
   }
+  await permit.complete("succeeded");
+  return { sandbox, status: sandbox.status as string, sameSession: sandbox.currentSession().sessionId === sessionId, errorCode: null };
 }

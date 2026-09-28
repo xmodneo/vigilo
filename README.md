@@ -225,6 +225,46 @@ local development database during the reviewed Milestone 6 workflow. Arbitrary
 deployments must independently verify and apply their own migration ledger.
 Managed SaaS production readiness has not been established.
 
+## Durable external execution authority and release acceptance
+
+Milestones 7.2 and 7.3 add a single durable, zero-by-default authority boundary
+for Gemini requests, Vercel Sandbox work, baseline and candidate verification,
+RepairLoop iterations, and future one-shot live acceptance. Immutable grants bind
+the exact workspace, run, repository revision, operation, provider/model,
+expiration, issuer, resource class, and integer execution limits. Reservations
+consume both operation and account-wide budgets conservatively; ambiguous
+provider outcomes are not refunded. A PostgreSQL semaphore, expiring leases,
+and monotonically increasing fences coordinate all queues and server entry
+points rather than relying on process memory.
+
+The installed Gemini SDK is invoked with its retry strategy disabled. The
+installed Vercel Sandbox SDK does not expose an equivalent global retry switch,
+so Vigilo injects a metered transport and reserves a conservative raw-request
+allowance before sandbox activity. The 96-attempt allowance is a hard outbound
+transport ceiling, not a claim that every internal SDK recovery path is proven
+to complete within 96 requests; exhaustion fails closed. Existing Vercel OIDC
+credentials are passed explicitly after local claim/expiry validation so the
+SDK cannot refresh them through an unmetered transport. Sandbox creation
+explicitly selects the smallest supported `vcpu_1` resource class, disables
+persistence, bounds runtime,
+and preserves the existing deny-before-repository-code policy. This SDK does
+not expose an independently enforceable memory setting, so Vigilo does not
+claim one.
+
+Immutable release-acceptance records support repair-loop, human-review,
+draft-publication, and security/cost-control evidence. Boundary commit,
+protocol, provider, model, provenance, and canonical identity mismatches fail
+closed; revocation is a separate append-only record. This implementation only
+provides the future resolver and data authority. Task 4.3 live acceptance is
+still pending, and the production publication gate remains unconditionally
+hard-closed with `live_acceptance_pending`. Deterministic test records cannot
+open it.
+
+`0022_external-execution-authority.sql` has only been exercised against
+disposable databases during this implementation. It has not been applied to
+the persistent local development database or to any deployment. No real grant
+or acceptance record was created, and no live external execution was performed.
+
 ## Web/API shell
 
 Install the pinned dependencies and start local development:

@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 
 import { commandEvidence, fixtureExecutor, ROOT, ExecutionFailure } from '../../src/fixture-execution.ts';
 import { ExecutionCancelled, requireNode24, SandboxBoundary, type SandboxLifecycleObserver } from '../../src/sandbox-boundary.ts';
+import { ExternalExecutionAuthorityError, ZERO_EXTERNAL_EXECUTION_AUTHORITY, type ExternalExecutionAuthorizer, type ExternalExecutionScope } from '../external-execution/types.ts';
 import { ARCHIVE_LIMITS, SAFE_ARCHIVE_EXTRACTION_SCRIPT } from './archive.ts';
 import { BASELINE_EVIDENCE_VERSION, type BaselineEvidence, type BaselineOutcome, type FrozenBaselineInput } from './types.ts';
 
@@ -113,6 +114,7 @@ function safeError(error: unknown): { phase: string; code: string; outcome: Base
     return { phase: 'execution', code: error.message, outcome };
   }
   if (error instanceof DOMException && error.name === 'TimeoutError') return { phase: 'execution', code: 'overall_timeout', outcome: 'timed_out' };
+  if (error instanceof ExternalExecutionAuthorityError) return { phase: 'execution', code: error.code, outcome: 'infrastructure_failed' };
   return { phase: 'execution', code: error instanceof APIError ? `provider_http_${error.response.status}` : 'operation_failed', outcome: 'infrastructure_failed' };
 }
 
@@ -121,8 +123,13 @@ export async function runFrozenRepositoryBaseline(
   cancellation?: AbortSignal,
   clock: () => Date = () => new Date(),
   observer?: SandboxLifecycleObserver,
+  sandboxAuthority?: { authorizer: ExternalExecutionAuthorizer; scope: ExternalExecutionScope },
 ): Promise<BaselineEvidence> {
-  const boundary = new SandboxBoundary('vigilo-repository-baseline', REPOSITORY_INSTALL_POLICY, 600_000, observer);
+  const boundary = new SandboxBoundary(
+    'vigilo-repository-baseline', REPOSITORY_INSTALL_POLICY, 600_000, observer,
+    sandboxAuthority?.authorizer ?? ZERO_EXTERNAL_EXECUTION_AUTHORITY,
+    sandboxAuthority?.scope,
+  );
   const typecheck = input.profile.typecheckScript ? commandEvidence(['--ignore-scripts', 'run', 'typecheck'], 90_000) : null;
   const build = input.profile.buildScript ? commandEvidence(['--ignore-scripts', 'run', 'build'], 180_000) : null;
   const report: BaselineEvidence = {

@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 
 import { commandEvidence, ExecutionFailure, fixtureExecutor, ROOT } from '../../src/fixture-execution.ts';
 import { ExecutionCancelled, requireNode24, SandboxBoundary, type SandboxLifecycleObserver } from '../../src/sandbox-boundary.ts';
+import { ExternalExecutionAuthorityError, ZERO_EXTERNAL_EXECUTION_AUTHORITY, type ExternalExecutionAuthorizer, type ExternalExecutionScope } from '../external-execution/types.ts';
 import { computeCandidateIdentity, sha256 } from '../repair-candidates/identity.ts';
 import { candidatePath } from '../repair-candidates/policy.ts';
 import type { FrozenCandidateFile } from '../repair-candidates/types.ts';
@@ -90,6 +91,7 @@ function safeOutcome(error: unknown): { outcome: VerificationExecutionOutcome; c
     return { outcome: 'infrastructure_failed', code: error.message };
   }
   if (error instanceof DOMException && error.name === 'TimeoutError') return { outcome: 'timed_out', code: 'overall_timeout' };
+  if (error instanceof ExternalExecutionAuthorityError) return { outcome: 'infrastructure_failed', code: error.code };
   return { outcome: 'infrastructure_failed', code: error instanceof APIError ? `provider_http_${error.response.status}` : 'verification_operation_failed' };
 }
 
@@ -98,8 +100,13 @@ export async function runFrozenCandidateVerification(
   cancellation?: AbortSignal,
   clock: () => Date = () => new Date(),
   observer?: SandboxLifecycleObserver,
+  sandboxAuthority?: { authorizer: ExternalExecutionAuthorizer; scope: ExternalExecutionScope },
 ): Promise<CandidateVerificationEvidence> {
-  const boundary = new SandboxBoundary('vigilo-candidate-verifier', REPOSITORY_INSTALL_POLICY, 600_000, observer);
+  const boundary = new SandboxBoundary(
+    'vigilo-candidate-verifier', REPOSITORY_INSTALL_POLICY, 600_000, observer,
+    sandboxAuthority?.authorizer ?? ZERO_EXTERNAL_EXECUTION_AUTHORITY,
+    sandboxAuthority?.scope,
+  );
   const typecheck = input.profile.typecheckScript ? commandEvidence(['--ignore-scripts', 'run', input.profile.typecheckScript], 90_000) : null;
   const build = input.profile.buildScript ? commandEvidence(['--ignore-scripts', 'run', input.profile.buildScript], 180_000) : null;
   const report: CandidateVerificationEvidence = {

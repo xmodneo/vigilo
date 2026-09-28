@@ -9,7 +9,7 @@ import {
   candidateVerification, candidateVerificationAttempt, candidateVerificationEvidence,
   executionProfile, githubInstallation, humanReviewDecision, investigation, repairCandidate,
   repairCandidateFile, repairIntent, repairLoop, repairLoopIteration, repairRun,
-  repairPublication, repairPublicationAttempt, repairPublicationEvent, repository, repositoryBaseline, user, workspace,
+  releaseAcceptance, repairPublication, repairPublicationAttempt, repairPublicationEvent, repository, repositoryBaseline, user, workspace,
 } from '../db/schema.ts';
 import type { AuthenticatedWorkspace } from '../lib/auth/protected-context.ts';
 import { AccessDeniedError } from '../lib/auth/protected-context.ts';
@@ -199,6 +199,23 @@ test('eligible exact evidence can be approved and remains immutable and release-
   await context.database.execute(sql`drop trigger human_review_decision_mutation_guard on human_review_decision`);
   await context.database.update(humanReviewDecision).set({ githubRepositoryId: REPOSITORY_ID + 1 }).where(eq(humanReviewDecision.id, decision.id));
   await assert.rejects(resolveApprovedHumanReviewAuthority(context.database, seeded.workspaceId, decision.id), (error: unknown) => error instanceof HumanReviewError && error.code === 'human_review_ineligible');
+});
+
+test('a rejected human decision cannot become live acceptance evidence', async (t) => {
+  const context = await createTestContext(); t.after(() => context.client.close());
+  const seeded = await seedVerifiedReview(context);
+  const review = await getHumanReview(context.database, seeded.owner, seeded.runId);
+  const decision = await createHumanReviewDecision(context.database, seeded.owner, seeded.runId, {
+    decision: 'rejected', reviewSubjectIdentity: review.reviewSubjectIdentity!, idempotencyKey: randomUUID(),
+  });
+  await assert.rejects(context.database.insert(releaseAcceptance).values({
+    id: randomUUID(), version: 1, kind: 'human_review_live', state: 'passed', boundaryVersion: 'human-review-v1',
+    releasedCommitSha: '7'.repeat(40), workspaceId: seeded.workspaceId, repairRunId: seeded.runId,
+    repairCandidateId: seeded.candidateId, candidateIdentity: seeded.candidateIdentity,
+    candidateVerificationId: seeded.verificationId, verificationEvidenceId: seeded.evidenceId,
+    humanReviewDecisionId: decision.id, executionReservationIds: [], reviewedBy: seeded.userId,
+    acceptedAt: NOW, acceptanceIdentity: '8'.repeat(64), createdAt: NOW,
+  }));
 });
 
 test('production publication reservation remains hard-closed and performs no queue or GitHub work', async (t) => {

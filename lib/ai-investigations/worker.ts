@@ -9,6 +9,7 @@ import type { InvestigationSourceGateway } from '../investigations/types.ts';
 import { parseAiInvestigationJobPayload, REPAIR_JOB_MAX_ATTEMPTS, type RepairQueueJob } from '../repair-runs/queue.ts';
 import { AiAgentError, runAiInvestigation, type AiAgentErrorCode, type AiAgentExecution } from './runner.ts';
 import { ModelProviderError, type InvestigationModelProvider } from './types.ts';
+import { ExternalExecutionAuthorityError } from '../external-execution/types.ts';
 
 const LEASE_MS = 4 * 60_000;
 const HEARTBEAT_MS = 30_000;
@@ -24,6 +25,12 @@ const NON_RETRYABLE_FAILURES = new Set<AiAgentErrorCode>([
   'model_provider_mismatch',
   'provider_configuration_failed',
   'provider_quota_exhausted',
+  'execution_authority_missing',
+  'execution_authority_expired',
+  'execution_budget_exhausted',
+  'execution_authority_mismatch',
+  'provider_attempt_ambiguous',
+  'sandbox_cleanup_unresolved',
   'unobserved_suspected_file',
 ]);
 
@@ -139,7 +146,7 @@ export async function processAiInvestigationJob(job: RepairQueueJob, dependencie
     await dependencies.afterExecution?.();
     return await complete(dependencies.database, row, attempt, execution, clock(), randomId) ? { id: job.id, status: 'completed' } : { id: job.id, status: 'failed', output: { code: 'ai_investigation_ownership_lost' } };
   } catch (error) {
-    const code: AiAgentErrorCode = error instanceof AiAgentError ? error.code : error instanceof ModelProviderError ? error.code : controller.signal.aborted ? 'model_timeout' : 'model_provider_failed';
+    const code: AiAgentErrorCode = error instanceof AiAgentError ? error.code : error instanceof ModelProviderError ? error.code : error instanceof ExternalExecutionAuthorityError ? error.code : controller.signal.aborted ? 'model_timeout' : 'model_provider_failed';
     const normalized = error instanceof ModelProviderError ? new AiAgentError(error.code, error.retryAfterMs) : error;
     const outcome = await failAttempt(dependencies.database, row, attempt, code, retryableFailure(normalized, code), clock(), randomId);
     if (outcome === 'failed') return { id: job.id, status: 'completed' };

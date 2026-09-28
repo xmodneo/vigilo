@@ -9,6 +9,7 @@ import { join } from "node:path";
 import { buildCandidate, parseCandidate, loadCandidate, collectTree, localTreeReader } from "../src/candidate.js";
 import { loadOriginalFixture, parseRepairedTests, TEST_NAMES } from "../src/baseline.js";
 import { runVerification, VERIFICATION_CONTROL } from "../src/verify-candidate.js";
+import { sandboxAuthority, TEST_OIDC_TOKEN } from "./external-execution-support.js";
 
 function passingReport() {
   return { success: true, numTotalTests: 3, numPassedTests: 3, numFailedTests: 0, numPendingTests: 0, numTodoTests: 0,
@@ -101,7 +102,7 @@ test("fresh verifier uses only frozen bytes, gates scripts, rejects failures and
     if (originalEnv[i] === undefined) delete process.env[name]; else process.env[name] = originalEnv[i];
   }));
   authNames.forEach(name => { delete process.env[name]; });
-  process.env.VERCEL_OIDC_TOKEN = "host-only-verifier-sentinel";
+  process.env.VERCEL_OIDC_TOKEN = TEST_OIDC_TOKEN;
   for (const scenario of ["passed", "failed_tests", "mutated_source", "typecheck_failed", "install_failed", "policy_failed", "same_sandbox", "same_session", "cleanup_failed"]) {
     await context.test(scenario, async child => {
       const temporary = mkdtempSync(join(tmpdir(), "vigilo-verifier-work-"));
@@ -148,6 +149,7 @@ test("fresh verifier uses only frozen bytes, gates scripts, rejects failures and
         async runCommand(params: { cmd: string; args: string[]; env?: unknown }) {
           assert.equal(params.cmd, "node"); // No Git/patch applicator can run in the verifier.
           assert.equal(params.env, undefined);
+          assert(!JSON.stringify(params).includes(TEST_OIDC_TOKEN));
           assert(!JSON.stringify(params).includes("host-only-verifier-sentinel"));
           let output = "absent";
           if (params.args[0] === "--version") output = "v24.19.0";
@@ -186,7 +188,7 @@ test("fresh verifier uses only frozen bytes, gates scripts, rejects failures and
       const control = scenario === "same_session" ? { candidateHash: candidate.candidateHash,
         repairSandbox: { name: VERIFICATION_CONTROL.repairSandbox.name, sessionId: "fresh-verifier-session" } }
         : VERIFICATION_CONTROL;
-      const result = await runVerification(path, control);
+      const result = await runVerification(path, control, sandboxAuthority("sandbox_verification"));
       assert.equal(result.success, scenario === "passed");
       assert(stopped);
       assert.equal(deleted, scenario !== "cleanup_failed");
@@ -199,6 +201,7 @@ test("fresh verifier uses only frozen bytes, gates scripts, rejects failures and
         assert.equal(result.tests?.failed, 0);
       }
       if (["install_failed", "policy_failed", "same_sandbox", "same_session"].includes(scenario)) assert(scripts.every(args => args[0] === "ci"));
+      assert(!JSON.stringify(result).includes(TEST_OIDC_TOKEN));
       assert(!JSON.stringify(result).includes("host-only-verifier-sentinel"));
       const verifierSource = readFileSync(new URL("../../src/verify-candidate.ts", import.meta.url), "utf8");
       assert(!verifierSource.includes("free-shipping.patch") && !verifierSource.includes("./freeze-candidate"));

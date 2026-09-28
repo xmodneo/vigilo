@@ -74,7 +74,7 @@ async function migrationRows(sql: Sql) {
 async function assertHistoricalHashes(sql: Sql) {
   const journal = JSON.parse(await readFile(join(migrationsFolder, 'meta/_journal.json'), 'utf8')) as { entries: Array<{ idx: number; tag: string }> };
   const rows = await migrationRows(sql);
-  assert.equal(rows.length, 22);
+  assert.equal(rows.length, 23);
   for (const [tag, expected] of historicalHashes) {
     const entry = journal.entries.find((candidate) => candidate.tag === tag);
     assert.ok(entry, tag);
@@ -192,6 +192,25 @@ async function assertFinalCatalog(sql: Sql) {
   assert.equal(publication?.guardCount, 7);
   assert.ok(publication?.activeIndex?.includes("WHERE (state = 'active'::text)"));
   assert.equal(publication?.restrictiveFks, 10);
+  const [authority] = await sql<{ grant: string | null; reservation: string | null; lease: string | null; event: string | null; acceptance: string | null; semaphoreRows: number; guardCount: number; passedBoundaryIndex: string | null }[]>`
+    select
+      to_regclass('public.execution_budget_grant')::text as grant,
+      to_regclass('public.external_execution_reservation')::text as reservation,
+      to_regclass('public.external_execution_lease')::text as lease,
+      to_regclass('public.external_execution_event')::text as event,
+      to_regclass('public.release_acceptance')::text as acceptance,
+      (select count(*)::int from external_execution_semaphore where id = 'global' and next_fence = 0) as "semaphoreRows",
+      (select indexdef from pg_indexes where indexname = 'release_acceptance_passed_boundary_unique') as "passedBoundaryIndex",
+      (select count(*)::int from pg_trigger where tgname in ('execution_budget_grant_mutation_guard','external_execution_semaphore_mutation_guard','external_execution_reservation_mutation_guard','external_execution_lease_mutation_guard','external_execution_event_insert_guard','external_execution_event_mutation_guard','release_acceptance_insert_guard','release_acceptance_mutation_guard','release_acceptance_revocation_mutation_guard') and not tgisinternal) as "guardCount"
+  `;
+  assert.equal(authority?.grant, 'execution_budget_grant');
+  assert.equal(authority?.reservation, 'external_execution_reservation');
+  assert.equal(authority?.lease, 'external_execution_lease');
+  assert.equal(authority?.event, 'external_execution_event');
+  assert.equal(authority?.acceptance, 'release_acceptance');
+  assert.equal(authority?.semaphoreRows, 1);
+  assert.equal(authority?.guardCount, 9);
+  assert.ok(authority?.passedBoundaryIndex?.includes("WHERE (state = 'passed'::text)"));
 }
 
 async function schemaSnapshot(sql: Sql) {

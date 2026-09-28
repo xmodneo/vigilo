@@ -72,6 +72,7 @@ export interface InvestigationModelProvider {
     tools: readonly ModelToolDefinition[];
     conclusionSchema: Record<string, unknown>;
     maxOutputTokens: number;
+    externalExecutionScope?: import('../external-execution/types.ts').ExternalExecutionScope;
   }): InvestigationModelSession;
 }
 

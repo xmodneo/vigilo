@@ -4,6 +4,7 @@ import { lstatSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { SandboxBoundary, requireNode24 } from "./sandbox-boundary.js";
 import { ROOT, INSTALL_POLICY, INSTALL_ARGS, object, commandEvidence, boundedReport, fixtureExecutor, ExecutionFailure as BaselineFailure } from "./fixture-execution.js";
+import type { ExternalExecutionAuthorizer, ExternalExecutionScope } from "../lib/external-execution/types.js";
 
 const FIXTURE_REVISION = "c349421fac7969ef761b2a799fc9749404cfc511";
 export const EXPECTED_FIXTURE_HASH = "60c6da3af26475c6efd1212487ae1a12d77a069d98fe5dd24dfd301c8d85e596";
@@ -138,10 +139,15 @@ export async function executeBaseline(sandbox: Sandbox, boundary: SandboxBoundar
   report.outcome = "expected_baseline_application_failure";
 }
 
-export async function runBaseline() {
+export async function runBaseline(
+  sandboxAuthority?: { authorizer: ExternalExecutionAuthorizer; scope: ExternalExecutionScope },
+) {
   // No wildcard domains, CIDR ranges, credentials brokering, or GitHub access.
   // https://vercel.com/docs/sandbox/concepts/firewall#user-defined
-  const boundary = new SandboxBoundary("vigilo-baseline", INSTALL_POLICY, 240_000);
+  const boundary = new SandboxBoundary(
+    "vigilo-baseline", INSTALL_POLICY, 240_000, undefined,
+    sandboxAuthority?.authorizer, sandboxAuthority?.scope,
+  );
   const report = createBaselineReport(boundary);
   let phase = "fixture_integrity";
   try {

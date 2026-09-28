@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { APIError, Sandbox } from "@vercel/sandbox";
 import { cleanupSandbox, classifyNetworkResult, requireNode24, runProbe, type NetworkObservation } from "../src/probe.js";
+import { sandboxAuthority, TEST_OIDC_TOKEN } from "./external-execution-support.js";
 
 test("accepts Node 24 and rejects other or malformed runtime output", () => {
   assert.equal(requireNode24("v24.13.0\n"), "v24.13.0");
@@ -72,7 +73,7 @@ test("an intermediate command failure still stops and deletes the sandbox", asyn
     });
   });
   authNames.forEach(name => { delete process.env[name]; });
-  process.env.VERCEL_OIDC_TOKEN = "unit-test-sentinel-never-forward";
+  process.env.VERCEL_OIDC_TOKEN = TEST_OIDC_TOKEN;
   let stopped = false;
   let deleted = false;
   context.mock.method(console, "log", () => {});
@@ -87,11 +88,12 @@ test("an intermediate command failure still stops and deletes the sandbox", asyn
     throw new APIError(new Response(null, { status: 404 }));
   });
 
-  const report = await runProbe();
+  const report = await runProbe(sandboxAuthority("sandbox_baseline"));
   assert.equal(report.success, false);
   assert.deepEqual(report.error, { phase: "runtime", code: "operation_failed" });
   assert.equal(stopped && deleted, true);
   assert.deepEqual(report.cleanup, { stop: "confirmed", delete: "confirmed", lookup: "absent" });
+  assert.equal(JSON.stringify(report).includes(TEST_OIDC_TOKEN), false);
   assert.equal(JSON.stringify(report).includes("unit-test-sentinel"), false);
 });
 
@@ -105,7 +107,7 @@ test("A/B prerequisites fail closed and still clean up", async (context) => {
     });
   });
   authNames.forEach(name => { delete process.env[name]; });
-  process.env.VERCEL_OIDC_TOKEN = "unit-test-sentinel";
+  process.env.VERCEL_OIDC_TOKEN = TEST_OIDC_TOKEN;
 
   for (const scenario of ["positive_failed", "update_failed", "wrong_session", "outbound_connected"] as const) {
     await context.test(scenario, async (child) => {
@@ -124,6 +126,7 @@ test("A/B prerequisites fail closed and still clean up", async (context) => {
         },
         async runCommand(params: { args: string[]; env?: unknown }) {
           assert.equal(params.env, undefined);
+          assert.equal(JSON.stringify(params).includes(TEST_OIDC_TOKEN), false);
           assert.equal(JSON.stringify(params).includes("unit-test-sentinel"), false);
           if (params.args.includes("--input-type=module")) networkCommands.push(params.args);
           const output = outputs.shift();
@@ -150,7 +153,7 @@ test("A/B prerequisites fail closed and still clean up", async (context) => {
         return fake;
       });
 
-      const report = await runProbe();
+      const report = await runProbe(sandboxAuthority("sandbox_baseline"));
       assert.equal(report.success, false);
       assert.deepEqual(report.cleanup, { stop: "confirmed", delete: "confirmed", lookup: "absent" });
       assert.equal(updates, scenario === "positive_failed" ? 0 : 1);

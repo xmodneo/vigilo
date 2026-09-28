@@ -8,13 +8,25 @@ import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
+import type { ExternalExecutionAuthorizer, ExternalExecutionPermit, ExternalExecutionScope } from "../lib/external-execution/types.js";
+
+const executionScope: ExternalExecutionScope = { workspaceId: "test-workspace", operationCategory: "sandbox_baseline", providerId: "vercel" };
+const TEST_OIDC_TOKEN = `header.${Buffer.from(JSON.stringify({ owner_id: "team_test", project_id: "prj_test", exp: 4_102_444_800 })).toString("base64url")}.signature`;
+const executionAuthority: ExternalExecutionAuthorizer = {
+  reserve: async (): Promise<ExternalExecutionPermit> => ({
+    reservationId: "test-reservation", ownershipToken: "test-owner", fence: 1, sandboxResourceClass: "vcpu_1",
+    assertOwnership: async () => undefined, beginProviderAttempt: async () => 1,
+    finishProviderAttempt: async () => undefined, renew: async () => undefined, complete: async () => undefined,
+    meteredFetch: (input, init) => globalThis.fetch(input, init),
+  }),
+};
 
 test("explicit cancellation interrupts work and preserves independent cleanup even if stop fails", async context => {
   const names = ["VERCEL_TOKEN", "VERCEL_TEAM_ID", "VERCEL_PROJECT_ID", "VERCEL_OIDC_TOKEN"];
   const old = names.map(name => process.env[name]);
   context.after(() => names.forEach((name, i) => { if (old[i] === undefined) delete process.env[name]; else process.env[name] = old[i]; }));
   names.forEach(name => { delete process.env[name]; });
-  process.env.VERCEL_OIDC_TOKEN = "host-only-failure-sentinel";
+  process.env.VERCEL_OIDC_TOKEN = TEST_OIDC_TOKEN;
   context.mock.method(console, "log", () => {});
   const controller = new AbortController();
   let deleted = false, furtherWork = false;
@@ -25,7 +37,7 @@ test("explicit cancellation interrupts work and preserves independent cleanup ev
     async delete({ signal }: { signal: AbortSignal }) { assert(!signal.aborted); deleted = true; },
   }));
   context.mock.method(Sandbox, "get", async () => { throw new APIError(new Response(null, { status: 404 })); });
-  const boundary = new SandboxBoundary("vigilo-failure", "deny-all", 90_000);
+  const boundary = new SandboxBoundary("vigilo-failure", "deny-all", 90_000, undefined, executionAuthority, executionScope);
   await assert.rejects(boundary.run(async (_sandbox, signal) => {
     controller.abort();
     signal.throwIfAborted();
@@ -84,7 +96,7 @@ test("controlled scenarios keep execution outcomes separate from failed cleanup 
   const old = auth.map(name => process.env[name]);
   context.after(() => auth.forEach((name, i) => { if (old[i] === undefined) delete process.env[name]; else process.env[name] = old[i]; }));
   auth.forEach(name => { delete process.env[name]; });
-  process.env.VERCEL_OIDC_TOKEN = "host-only-failure-sentinel";
+  process.env.VERCEL_OIDC_TOKEN = TEST_OIDC_TOKEN;
   for (const scenario of ["installation_failure", "command_timeout", "cancellation"] as const) {
     await context.test(scenario, async child => {
       child.mock.method(console, "log", () => {});
@@ -115,7 +127,7 @@ test("controlled scenarios keep execution outcomes separate from failed cleanup 
         if (deleted) throw new APIError(new Response(null, { status: 404 }));
         return fake;
       });
-      const report = await runFailureScenario(scenario);
+      const report = await runFailureScenario(scenario, executionAuthority, executionScope);
       assert.equal(report.classifiedOutcome, scenario === "installation_failure" ? "dependency_installation_failure" : scenario === "cancellation" ? "cancelled" : scenario);
       assert(!report.acceptancePassed && !report.furtherWorkStarted);
       assert(report.diagnosticsPresent);
@@ -129,11 +141,18 @@ test("controlled scenarios keep execution outcomes separate from failed cleanup 
 });
 
 test("provider inspection never resumes a stopped sandbox and never calls authentication failure absence", async context => {
-  context.mock.method(Sandbox, "get", async (params: { resume: boolean }) => {
+  const names = ["VERCEL_TOKEN", "VERCEL_TEAM_ID", "VERCEL_PROJECT_ID", "VERCEL_OIDC_TOKEN"];
+  const old = names.map(name => process.env[name]);
+  context.after(() => names.forEach((name, i) => { if (old[i] === undefined) delete process.env[name]; else process.env[name] = old[i]; }));
+  names.forEach(name => { delete process.env[name]; });
+  process.env.VERCEL_OIDC_TOKEN = TEST_OIDC_TOKEN;
+  context.mock.method(Sandbox, "get", async (params: { resume: boolean; token: string; teamId: string; projectId: string }) => {
     assert.equal(params.resume, false);
+    assert.deepEqual({ token: params.token, teamId: params.teamId, projectId: params.projectId },
+      { token: TEST_OIDC_TOKEN, teamId: "team_test", projectId: "prj_test" });
     throw new APIError(new Response(null, { status: 401 }));
   });
-  const observed = await observeSandbox("owned-sandbox", "known-session");
+  const observed = await observeSandbox("owned-sandbox", "known-session", executionAuthority, executionScope);
   assert.equal(observed.status, "unconfirmed");
   assert.equal(observed.errorCode, "provider_http_401");
 });
