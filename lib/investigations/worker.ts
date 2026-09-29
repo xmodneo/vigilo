@@ -5,6 +5,7 @@ import type { JobResult } from 'pg-boss';
 
 import { investigation, investigationContextEntry, investigationContextEvent, repairIntent, repairRun, repositoryBaseline } from '../../db/schema.ts';
 import type { VigiloDatabase } from '../db/types.ts';
+import { assertPublicRepositoryAuthority } from '../github-repositories/policy.ts';
 import type { GitHubAppConfiguration } from '../github-app/types.ts';
 import { parseInvestigationJobPayload, type InvestigationQueueJob } from '../repair-runs/queue.ts';
 import type { WorkerLogger } from '../repair-runs/worker.ts';
@@ -154,6 +155,7 @@ export async function processInvestigationJob(job: InvestigationQueueJob, depend
   heartbeat.unref();
   try {
     controller.signal.throwIfAborted();
+    await assertPublicRepositoryAuthority(dependencies.database, owned.workspaceId, owned.githubRepositoryId);
     await validateBinding(dependencies.database, owned);
     const context = await withScopedRepositoryToken(dependencies.gateway, dependencies.configuration, owned, async ({ accessToken, owner, repository }) => {
       controller.signal.throwIfAborted();

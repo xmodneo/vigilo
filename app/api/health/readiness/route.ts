@@ -1,13 +1,9 @@
-export function GET(): Response {
-  return Response.json({
-    service: 'vigilo-web',
-    status: 'not_ready',
-    reason: 'readiness_checks_not_implemented',
-    checks: {
-      database: 'not_checked',
-      migrations: 'not_checked',
-      worker: 'not_checked',
-      externalProviders: 'not_checked',
-    },
-  }, { status: 503, headers: { 'Cache-Control': 'no-store' } });
+import { getReadinessResult } from '../../../../lib/operations/readiness.ts';
+
+export async function GET(): Promise<Response> {
+  const result = await getReadinessResult();
+  return Response.json(result.body, {
+    status: result.status,
+    headers: { 'Cache-Control': 'private, no-store' },
+  });
 }

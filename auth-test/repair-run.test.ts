@@ -91,7 +91,7 @@ function profileValues(workspaceId: string, baseCommitSha = COMMIT) {
 
 async function seed(context: Awaited<ReturnType<typeof createTestContext>>, owner: AuthenticatedWorkspace, withProfile = true) {
   await context.database.insert(githubInstallation).values({ accountLogin: 'octo', accountType: 'Organization', githubAccountId: 3001, installationId: INSTALLATION_ID, status: 'active', workspaceId: owner.workspace.id });
-  await context.database.insert(repository).values({ defaultBranch: 'main', fullName: 'octo/app', githubRepositoryId: REPOSITORY_ID, installationId: INSTALLATION_ID, isPrivate: true, name: 'app', ownerId: 3001, ownerLogin: 'octo', workspaceId: owner.workspace.id });
+  await context.database.insert(repository).values({ defaultBranch: 'main', fullName: 'octo/app', githubRepositoryId: REPOSITORY_ID, installationId: INSTALLATION_ID, isPrivate: false, name: 'app', ownerId: 3001, ownerLogin: 'octo', workspaceId: owner.workspace.id });
   if (withProfile) await context.database.insert(executionProfile).values(profileValues(owner.workspace.id));
 }
 

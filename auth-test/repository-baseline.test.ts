@@ -18,7 +18,7 @@ import { createTestContext, saveGithubUser } from './support.ts';
 const COMMIT = 'a'.repeat(40);
 const NOW = new Date('2026-09-09T10:00:00.000Z');
 const CONFIG = { appId: 991, appSlug: 'vigilo-dev-test', baseUrl: 'http://localhost:3000', clientId: 'Iv1.test' } as const;
-const REPO = { defaultBranch: 'main', fullName: 'octo/private', id: 8101, isPrivate: true, name: 'private', ownerId: 3001, ownerLogin: 'octo' };
+const REPO = { defaultBranch: 'main', fullName: 'octo/public', id: 8101, isPrivate: false, name: 'public', ownerId: 3001, ownerLogin: 'octo' };
 const PACKAGE = '{"name":"private"}';
 const LOCK = '{"lockfileVersion":3,"packages":{"":{"name":"private"}}}';
 const sha256 = (value: string | Buffer) => createHash('sha256').update(value).digest('hex');
@@ -149,6 +149,19 @@ test('suspended installation and removed repository access fail closed without a
     (error: unknown) => error instanceof RepositoryBaselineError && error.code === 'installation_unavailable');
   const removed = new Gateway(); removed.createInstallationAccessToken = async () => { throw new Error('not accessible'); };
   await assert.rejects(executeSelectedRepositoryBaseline(ctx.database, auth, removed, CONFIG));
+  assert.equal((await ctx.database.select().from(repositoryBaseline)).length, 0);
+});
+
+test('baseline source acquisition rejects a repository that becomes private before archive download', async (t) => {
+  const ctx = await createTestContext(); t.after(() => ctx.client.close());
+  const auth = await context(ctx); await seed(ctx, auth);
+  const gateway = new Gateway();
+  gateway.repository = { ...gateway.repository, isPrivate: true };
+  await assert.rejects(
+    executeSelectedRepositoryBaseline(ctx.database, auth, gateway, CONFIG, { runner: async (input) => passedEvidence(input) }),
+    /private_repository_not_supported/,
+  );
+  assert.deepEqual(gateway.calls, ['installation', 'mint:one-repository:contents-read:metadata-read', 'revoke']);
   assert.equal((await ctx.database.select().from(repositoryBaseline)).length, 0);
 });
 

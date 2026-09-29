@@ -114,8 +114,15 @@ try {
       (select count(*)::int from pg_trigger where tgname in ('execution_budget_grant_mutation_guard','external_execution_semaphore_mutation_guard','external_execution_reservation_mutation_guard','external_execution_lease_mutation_guard','external_execution_event_insert_guard','external_execution_event_mutation_guard','release_acceptance_insert_guard','release_acceptance_mutation_guard','release_acceptance_revocation_mutation_guard') and not tgisinternal) as "guardCount"
   `;
   const authorityPassed = authorityFacts?.grant === 'execution_budget_grant' && authorityFacts.reservation === 'external_execution_reservation' && authorityFacts.lease === 'external_execution_lease' && authorityFacts.event === 'external_execution_event' && authorityFacts.acceptance === 'release_acceptance' && authorityFacts.semaphoreRows === 1 && authorityFacts.guardCount === 9 && authorityFacts.passedBoundaryIndex?.includes("WHERE (state = 'passed'::text)") === true;
-  if (!passed || !reviewPassed || !publicationPassed || !authorityPassed) throw new Error('clean_migration_probe_failed');
-  process.stdout.write(`${JSON.stringify({ migrations: '0000-0022', repairRunAttempt: 'present', investigation: 'present', repairCandidate: 'present', candidateVerification: 'present', aiInvestigation: 'present', aiCandidateGeneration: 'present', repairLoop: 'present', humanReview: 'present', repairPublication: 'present', externalExecutionAuthority: 'present', releaseAcceptance: 'present', constraints: 'current', result: 'passed' })}\n`);
+  const [operationalFacts] = await probe<{ heartbeat: string | null; bucket: string | null; heartbeatGuard: string | null; ledgerCount: number }[]>`
+    select to_regclass('public.operational_worker_heartbeat')::text as heartbeat,
+      to_regclass('public.http_rate_limit_bucket')::text as bucket,
+      (select tgname from pg_trigger where tgname = 'operational_worker_heartbeat_guard' and not tgisinternal) as "heartbeatGuard",
+      (select count(*)::int from drizzle.__drizzle_migrations) as "ledgerCount"
+  `;
+  const operationalPassed = operationalFacts?.heartbeat === 'operational_worker_heartbeat' && operationalFacts.bucket === 'http_rate_limit_bucket' && operationalFacts.heartbeatGuard === 'operational_worker_heartbeat_guard' && operationalFacts.ledgerCount === 24;
+  if (!passed || !reviewPassed || !publicationPassed || !authorityPassed || !operationalPassed) throw new Error('clean_migration_probe_failed');
+  process.stdout.write(`${JSON.stringify({ migrations: '0000-0023', repairRunAttempt: 'present', investigation: 'present', repairCandidate: 'present', candidateVerification: 'present', aiInvestigation: 'present', aiCandidateGeneration: 'present', repairLoop: 'present', humanReview: 'present', repairPublication: 'present', externalExecutionAuthority: 'present', releaseAcceptance: 'present', operationalReadiness: 'present', constraints: 'current', result: 'passed' })}\n`);
 } finally {
   if (probe) await probe.end();
   await admin`select pg_terminate_backend(pid) from pg_stat_activity where datname = ${databaseName} and pid <> pg_backend_pid()`;

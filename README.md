@@ -260,10 +260,11 @@ still pending, and the production publication gate remains unconditionally
 hard-closed with `live_acceptance_pending`. Deterministic test records cannot
 open it.
 
-`0022_external-execution-authority.sql` has only been exercised against
-disposable databases during this implementation. It has not been applied to
-the persistent local development database or to any deployment. No real grant
-or acceptance record was created, and no live external execution was performed.
+`0022_external-execution-authority.sql` was applied to the positively identified
+local development database during the reviewed M7.2/M7.3 workflow. That local
+fact is not a claim about arbitrary deployments. No real grant or acceptance
+record was created, effective external authority remains zero, and no live
+external execution was performed.
 
 ## Web/API shell
 
@@ -276,9 +277,20 @@ npm run dev
 
 Open `http://localhost:3000` for the landing page. `GET /api/health` is a process
 liveness signal only; it does not claim database, migration, worker, queue, or
-provider readiness. `GET /api/health/readiness` deliberately returns HTTP 503
-with those checks marked `not_checked` until Milestone 7.4 implements real local
-dependency readiness. Neither endpoint contacts an external provider.
+provider readiness. `GET /api/health/readiness` performs bounded local checks of
+PostgreSQL, the exact migration manifest, pg-boss schema and queue set,
+operational schemas, and a same-release fresh worker heartbeat. It returns 200
+only when every check passes and otherwise returns 503 with stable codes.
+Neither endpoint contacts an external provider. See
+[controlled-beta operations](docs/operations.md) for deployment, migration,
+backup/restore, incident, and data-lifecycle runbooks.
+
+Milestone 7.4 provides this local/deterministic operational layer and has not
+been deployed or live-accepted. Migration `0023_operational-readiness.sql` has
+been verified only on disposable databases and has not been applied to the
+persistent local development database or any deployment. Task 4.3 live
+acceptance remains pending, effective external execution authority remains
+zero, and publication remains hard-closed with `live_acceptance_pending`.
 
 All application, API, and authentication responses receive a baseline Content
 Security Policy, MIME-sniffing protection, frame denial, referrer policy, and

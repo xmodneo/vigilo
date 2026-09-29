@@ -18,6 +18,7 @@ import {
 } from '../../db/schema.ts';
 import type { AuthenticatedWorkspace } from '../auth/protected-context.ts';
 import type { VigiloDatabase } from '../db/types.ts';
+import { assertPublicRepositoryAuthority, RepositoryPolicyError } from '../github-repositories/policy.ts';
 import { selfCheckRepairCandidateForWorkspace } from '../repair-candidates/flow.ts';
 import { frozenBaselineProfile } from '../repository-baselines/authority.ts';
 import { canonicalRecord } from '../repair-loops/canonical.ts';
@@ -61,6 +62,7 @@ export class HumanReviewError extends Error {
     | 'idempotency_conflict'
     | 'decision_conflict'
     | 'decision_not_approved'
+    | 'private_repository_not_supported'
     | 'live_acceptance_pending') {
     super(code);
     this.name = 'HumanReviewError';
@@ -159,6 +161,8 @@ function ineligible(reason: HumanReviewIneligibleReason): SubjectLoad {
 async function loadEligibleSubject(database: ReviewDatabase, workspaceId: string, repairRunId: string): Promise<SubjectLoad> {
   const [run] = await database.select().from(repairRun).where(and(eq(repairRun.id, repairRunId), eq(repairRun.workspaceId, workspaceId))).limit(1);
   if (!run) return ineligible('authority_mismatch');
+  try { await assertPublicRepositoryAuthority(database, run.workspaceId, run.githubRepositoryId); }
+  catch (error) { if (error instanceof RepositoryPolicyError) return ineligible(error.code); throw error; }
   if (!run.baselineId) return ineligible('authority_mismatch');
   const [loop] = await database.select().from(repairLoop).where(and(eq(repairLoop.repairRunId, run.id), eq(repairLoop.workspaceId, workspaceId))).limit(1);
   if (!loop) return ineligible('repair_loop_not_verified');
@@ -394,6 +398,7 @@ export async function createHumanReviewDecision(
         throw new HumanReviewError('idempotency_conflict');
       }
       const loaded = await loadEligibleSubject(transaction as unknown as VigiloDatabase, context.workspace.id, repairRunId);
+      if (loaded.reason === 'private_repository_not_supported') throw new HumanReviewError(loaded.reason);
       if (!loaded.value) throw new HumanReviewError('human_review_ineligible');
       if (loaded.value.subjectIdentity !== input.reviewSubjectIdentity) throw new HumanReviewError('review_subject_stale');
       const [[lockedLoop], [lockedIteration]] = await Promise.all([
@@ -455,6 +460,7 @@ export async function resolveApprovedHumanReviewAuthority(
   if (!decision) throw new HumanReviewError('human_review_not_found');
   if (decision.decision !== 'approved') throw new HumanReviewError('decision_not_approved');
   const loaded = await loadEligibleSubject(database, workspaceId, decision.repairRunId);
+  if (loaded.reason === 'private_repository_not_supported') throw new HumanReviewError(loaded.reason);
   if (!loaded.value) throw new HumanReviewError('human_review_ineligible');
   const expectedDecisionIdentity = computeHumanReviewDecisionIdentity({ subjectIdentity: loaded.value.subjectIdentity, reviewerUserId: decision.reviewerUserId, decision: 'approved' });
   const exact = decision.repairLoopId === loaded.value.loop.id && decision.repairLoopIterationId === loaded.value.iteration.id &&

@@ -74,7 +74,7 @@ async function migrationRows(sql: Sql) {
 async function assertHistoricalHashes(sql: Sql) {
   const journal = JSON.parse(await readFile(join(migrationsFolder, 'meta/_journal.json'), 'utf8')) as { entries: Array<{ idx: number; tag: string }> };
   const rows = await migrationRows(sql);
-  assert.equal(rows.length, 23);
+  assert.equal(rows.length, 24);
   for (const [tag, expected] of historicalHashes) {
     const entry = journal.entries.find((candidate) => candidate.tag === tag);
     assert.ok(entry, tag);

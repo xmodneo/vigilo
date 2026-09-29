@@ -12,6 +12,17 @@ function requireValue(environment: NodeJS.ProcessEnv, name: string): string {
   return value;
 }
 
+export function readDatabaseEnvironment(
+  environment: NodeJS.ProcessEnv = process.env,
+): { databaseUrl: string } {
+  const databaseUrl = requireValue(environment, 'DATABASE_URL');
+  const databaseProtocol = new URL(databaseUrl).protocol;
+  if (databaseProtocol !== 'postgres:' && databaseProtocol !== 'postgresql:') {
+    throw new Error('invalid_environment:DATABASE_URL');
+  }
+  return { databaseUrl };
+}
+
 export function readServerEnvironment(
   environment: NodeJS.ProcessEnv = process.env,
 ): ServerEnvironment {
@@ -30,11 +41,7 @@ export function readServerEnvironment(
     throw new Error('invalid_environment:BETTER_AUTH_SECRET');
   }
 
-  const databaseUrl = requireValue(environment, 'DATABASE_URL');
-  const databaseProtocol = new URL(databaseUrl).protocol;
-  if (databaseProtocol !== 'postgres:' && databaseProtocol !== 'postgresql:') {
-    throw new Error('invalid_environment:DATABASE_URL');
-  }
+  const { databaseUrl } = readDatabaseEnvironment(environment);
 
   return {
     baseUrl: parsedBaseUrl.origin,

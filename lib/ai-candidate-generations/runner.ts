@@ -14,7 +14,7 @@ import { AI_CANDIDATE_PROPOSAL_FINALIZATION_INPUT, AI_CANDIDATE_PROPOSAL_INSTRUC
 import { buildRepairLoopFeedback, validateStoredRepairLoopFeedback } from '../repair-loops/feedback.ts';
 import type { ExternalExecutionFailureCode } from '../external-execution/types.ts';
 
-export type AiCandidateGenerationErrorCode = 'candidate_generation_authority_mismatch' | 'candidate_generation_ownership_lost' | 'invalid_model_proposal' | 'schema_mismatch' | 'invalid_operation_shape' | 'invalid_path' | 'proposal_limit_exceeded' | 'fresh_observation_missing' | 'model_limit_exceeded' | 'model_protocol_error' | 'model_timeout' | 'unread_existing_file' | 'model_provider_mismatch' | 'model_provider_failed' | 'context_source_unavailable' | ExternalExecutionFailureCode | ModelProviderFailureCode;
+export type AiCandidateGenerationErrorCode = 'private_repository_not_supported' | 'candidate_generation_authority_mismatch' | 'candidate_generation_ownership_lost' | 'invalid_model_proposal' | 'schema_mismatch' | 'invalid_operation_shape' | 'invalid_path' | 'proposal_limit_exceeded' | 'fresh_observation_missing' | 'model_limit_exceeded' | 'model_protocol_error' | 'model_timeout' | 'unread_existing_file' | 'model_provider_mismatch' | 'model_provider_failed' | 'context_source_unavailable' | ExternalExecutionFailureCode | ModelProviderFailureCode;
 
 export class AiCandidateGenerationError extends Error {
   constructor(public readonly code: AiCandidateGenerationErrorCode, public readonly retryAfterMs: number | null = null) { super(code); this.name = 'AiCandidateGenerationError'; }

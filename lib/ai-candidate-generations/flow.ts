@@ -5,12 +5,13 @@ import { and, desc, eq, inArray } from 'drizzle-orm';
 import { aiCandidateGeneration, aiCandidateGenerationEvent, aiInvestigation, executionProfile, humanReviewDecision, investigation, repairLoop, repairRun, repositoryBaseline } from '../../db/schema.ts';
 import type { AuthenticatedWorkspace } from '../auth/protected-context.ts';
 import type { VigiloDatabase } from '../db/types.ts';
+import { RepositoryPolicyError, assertPublicRepositoryAuthority } from '../github-repositories/policy.ts';
 import { AI_MODEL_ID, AI_PROVIDER_ID } from '../ai-investigations/types.ts';
 import type { TransactionalAiCandidateGenerationQueue } from '../repair-runs/queue.ts';
 import { AI_CANDIDATE_GENERATION_PROTOCOL_VERSION, type AiCandidateGenerationResult } from './types.ts';
 
 export class AiCandidateGenerationFlowError extends Error {
-  constructor(public readonly code: 'candidate_generation_active' | 'candidate_generation_not_eligible' | 'candidate_generation_not_found' | 'candidate_generation_handoff_failed' | 'candidate_generation_owned_by_repair_loop' | 'repair_run_reviewed') { super(code); this.name = 'AiCandidateGenerationFlowError'; }
+  constructor(public readonly code: 'candidate_generation_active' | 'candidate_generation_not_eligible' | 'candidate_generation_not_found' | 'candidate_generation_handoff_failed' | 'candidate_generation_owned_by_repair_loop' | 'repair_run_reviewed' | 'private_repository_not_supported') { super(code); this.name = 'AiCandidateGenerationFlowError'; }
 }
 
 function result(row: typeof aiCandidateGeneration.$inferSelect): AiCandidateGenerationResult {
@@ -27,6 +28,8 @@ export async function startAiCandidateGeneration(database: VigiloDatabase, conte
       .from(aiInvestigation).innerJoin(investigation, eq(investigation.id, aiInvestigation.investigationId)).innerJoin(repairRun, eq(repairRun.id, aiInvestigation.repairRunId)).innerJoin(repositoryBaseline, eq(repositoryBaseline.id, aiInvestigation.baselineId)).innerJoin(executionProfile, and(eq(executionProfile.githubRepositoryId, aiInvestigation.githubRepositoryId), eq(executionProfile.workspaceId, aiInvestigation.workspaceId)))
       .where(and(eq(aiInvestigation.id, aiInvestigationId), eq(aiInvestigation.workspaceId, context.workspace.id))).for('update').limit(1);
     if (!source || source.source.state !== 'completed' || source.source.conclusionStatus !== 'diagnosis_found' || source.parent.state !== 'ready' || source.run.state !== 'ready_for_investigation' || source.profile.status !== 'ready') throw new AiCandidateGenerationFlowError('candidate_generation_not_eligible');
+    try { await assertPublicRepositoryAuthority(transaction, source.source.workspaceId, source.source.githubRepositoryId); }
+    catch (error) { if (error instanceof RepositoryPolicyError) throw new AiCandidateGenerationFlowError(error.code); throw error; }
     const [review] = await transaction.select({ id: humanReviewDecision.id }).from(humanReviewDecision).where(eq(humanReviewDecision.repairRunId, source.run.id)).limit(1);
     if (review) throw new AiCandidateGenerationFlowError('repair_run_reviewed');
     const [activeLoop] = await transaction.select({ id: repairLoop.id }).from(repairLoop).where(and(eq(repairLoop.repairRunId, source.run.id), inArray(repairLoop.state, ['queued', 'running']))).limit(1);

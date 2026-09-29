@@ -38,7 +38,7 @@ class MemoryQueue implements TransactionalAiInvestigationQueue {
 
 class Gateway implements InvestigationSourceGateway {
   calls: string[] = [];
-  async createInstallationAccessToken() { this.calls.push('token'); return { accessToken: 'ephemeral-github-token', repository: { id: REPOSITORY_ID, name: 'vigilo', ownerLogin: 'xmodneo' } }; }
+  async createInstallationAccessToken() { this.calls.push('token'); return { accessToken: 'ephemeral-github-token', repository: { id: REPOSITORY_ID, name: 'vigilo', ownerLogin: 'xmodneo', isPrivate: false } }; }
   async getCommitTree(): Promise<{ commitSha: string; treeSha: string }> { throw new Error('not available to AI'); }
   async getTree(): Promise<{ entries: []; truncated: boolean }> { throw new Error('not available to AI'); }
   async getBlob(input: { blobSha: string }) { this.calls.push('blob'); assert.equal(input.blobSha, blobSha(SOURCE)); return { bytes: Buffer.from(SOURCE), sha: input.blobSha }; }
@@ -85,7 +85,7 @@ async function seedRoot(context: Awaited<ReturnType<typeof createTestContext>>) 
   await context.database.insert(account).values({ id: randomUUID(), issuer: 'local:oauth:github', accountId: '1234', providerId: 'github', userId });
   await context.database.insert(workspace).values({ id: workspaceId, ownerUserId: userId });
   await context.database.insert(githubInstallation).values({ installationId: INSTALLATION_ID, workspaceId, githubAccountId: 1234, accountLogin: 'xmodneo', accountType: 'User', status: 'active' });
-  await context.database.insert(repository).values({ githubRepositoryId: REPOSITORY_ID, workspaceId, installationId: INSTALLATION_ID, ownerId: 1234, ownerLogin: 'xmodneo', name: 'vigilo', fullName: 'xmodneo/vigilo', defaultBranch: 'main', isPrivate: true });
+  await context.database.insert(repository).values({ githubRepositoryId: REPOSITORY_ID, workspaceId, installationId: INSTALLATION_ID, ownerId: 1234, ownerLogin: 'xmodneo', name: 'vigilo', fullName: 'xmodneo/vigilo', defaultBranch: 'main', isPrivate: false });
   await context.database.insert(executionProfile).values({ githubRepositoryId: REPOSITORY_ID, workspaceId, installationId: INSTALLATION_ID, profileVersion: 2, profileIdentity: PROFILE, baseCommitSha: COMMIT, runtimeFamily: 'node', nodeMajor: 24, packageManager: 'npm', lockfileType: 'package-lock', installOperation: 'ci', typecheckScript: 'typecheck', buildScript: 'build', testScript: 'test', testRunner: 'vitest', packageJsonBlobSha: 'd'.repeat(40), packageJsonContentSha256: 'e'.repeat(64), packageLockBlobSha: 'f'.repeat(40), packageLockContentSha256: '1'.repeat(64), status: 'ready' });
   return { workspaceId, owner: owner(workspaceId) };
 }
@@ -112,6 +112,15 @@ test('durable AI investigation flow is idempotent, workspace-scoped, and authori
   await assert.rejects(context.database.update(aiInvestigation).set({ baseCommitSha: 'f'.repeat(40) }).where(eq(aiInvestigation.id, first.id)));
   const failed = await seedReady(context, root.workspaceId, 'failed');
   await assert.rejects(startAiInvestigation(context.database, root.owner, failed.investigationId, queue), (error: unknown) => error instanceof AiInvestigationFlowError && error.code === 'investigation_not_ready');
+});
+
+test('stale private repository authority blocks investigation before queueing', async (t) => {
+  const context = await createTestContext(); t.after(() => context.client.close());
+  const root = await seedRoot(context); const seeded = await seedReady(context, root.workspaceId); const queue = new MemoryQueue();
+  await context.database.update(repository).set({ isPrivate: true }).where(eq(repository.githubRepositoryId, REPOSITORY_ID));
+  await assert.rejects(startAiInvestigation(context.database, root.owner, seeded.investigationId, queue),
+    (error: unknown) => error instanceof AiInvestigationFlowError && error.code === 'private_repository_not_supported');
+  assert.equal(queue.payloads.length, 0);
 });
 
 test('terminal failure creates one race-safe historical rerun with a fresh attempt budget', async (t) => {

@@ -18,7 +18,7 @@ const sha256 = (value: string) => createHash('sha256').update(value).digest('hex
 const PACKAGE = '{"name":"fixture"}'; const LOCK = '{"lockfileVersion":3}';
 const baselineInput: FrozenBaselineInput = {
   archive: Buffer.from('archive'), archiveSha256: sha256('archive'), runId: 'run', startedAt: new Date(),
-  repository: { defaultBranch: 'main', fullName: 'o/r', id: 1, isPrivate: true, name: 'r', ownerId: 1, ownerLogin: 'o' },
+  repository: { defaultBranch: 'main', fullName: 'o/r', id: 1, isPrivate: false, name: 'r', ownerId: 1, ownerLogin: 'o' },
   profile: { workspaceId: 'workspace', githubRepositoryId: 1, installationId: 1, baseCommitSha: 'a'.repeat(40), profileIdentity: 'b'.repeat(64), profileVersion: 2, packageJsonBlobSha: gitBlobSha(PACKAGE), packageJsonContentSha256: sha256(PACKAGE), packageLockBlobSha: gitBlobSha(LOCK), packageLockContentSha256: sha256(LOCK), typecheckScript: null, buildScript: null, testScript: 'test', testRunner: 'node-test' },
 };
 
@@ -46,6 +46,17 @@ test('all registered Gemini and sandbox production gateways deny missing durable
   assert.match(worker, /processCandidateVerificationJob[\s\S]*executionAuthority/);
   assert.match(worker, /processRepairLoopJob[\s\S]*executionAuthority/);
   assert.match(worker, /GeminiInvestigationProvider[\s\S]*executionAuthority/);
+});
+
+test('private repository baseline is denied before authority reservation or sandbox transport', async (t) => {
+  let sandboxCreates = 0; let authorityCalls = 0;
+  t.mock.method(Sandbox, 'create', async () => { sandboxCreates += 1; throw new Error('transport reached'); });
+  const evidence = await runFrozenRepositoryBaseline({ ...baselineInput, repository: { ...baselineInput.repository, isPrivate: true } }, undefined, () => new Date(), undefined, {
+    authorizer: { reserve: async () => { authorityCalls += 1; throw new Error('authority reached'); } },
+    scope: { workspaceId: 'workspace', operationCategory: 'sandbox_baseline', providerId: 'vercel-sandbox' },
+  });
+  assert.equal(evidence.error?.code, 'private_repository_not_supported');
+  assert.equal(authorityCalls, 0); assert.equal(sandboxCreates, 0);
 });
 
 test('installed provider retry policy is explicit and bounded by Vigilo accounting', async () => {

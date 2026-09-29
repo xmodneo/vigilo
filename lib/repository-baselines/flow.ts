@@ -12,16 +12,23 @@ import { runFrozenRepositoryBaseline } from './runner.ts';
 import type { BaselineEvidence, GitHubBaselineGateway } from './types.ts';
 import type { SandboxLifecycleObserver } from '../../src/sandbox-boundary.ts';
 import type { ExternalExecutionAuthorizer, ExternalExecutionScope } from '../external-execution/types.ts';
+import { assertPublicRepository, RepositoryPolicyError } from '../github-repositories/policy.ts';
 
 export class RepositoryBaselineError extends Error {
-  constructor(public readonly code: 'authority_changed' | 'installation_unavailable' | 'repository_access_changed' | 'source_unavailable' | 'persistence_failed') {
+  constructor(public readonly code: 'authority_changed' | 'installation_unavailable' | 'private_repository_not_supported' | 'repository_access_changed' | 'source_unavailable' | 'persistence_failed') {
     super(code);
     this.name = 'RepositoryBaselineError';
   }
 }
 
-function sameRepository(first: { id: number; ownerId: number; ownerLogin: string; name: string }, second: { id: number; ownerId: number; ownerLogin: string; name: string }) {
-  return first.id === second.id && first.ownerId === second.ownerId && first.ownerLogin === second.ownerLogin && first.name === second.name;
+function sameRepository(first: { id: number; ownerId: number; ownerLogin: string; name: string; fullName: string; defaultBranch: string; isPrivate: boolean }, second: { id: number; ownerId: number; ownerLogin: string; name: string; fullName: string; defaultBranch: string; isPrivate: boolean }) {
+  return first.id === second.id && first.ownerId === second.ownerId && first.ownerLogin === second.ownerLogin && first.name === second.name &&
+    first.fullName === second.fullName && first.defaultBranch === second.defaultBranch && first.isPrivate === second.isPrivate;
+}
+
+function requirePublicRepository(value: { isPrivate: boolean }): void {
+  try { assertPublicRepository(value); }
+  catch (error) { if (error instanceof RepositoryPolicyError) throw new RepositoryBaselineError(error.code); throw error; }
 }
 
 export async function acquireExactRepositoryArchive(
@@ -37,7 +44,9 @@ export async function acquireExactRepositoryArchive(
     const scoped = await gateway.createInstallationAccessToken({ installationId: identity.installationId, repositoryId: identity.githubRepositoryId });
     token = scoped.accessToken;
     if (scoped.repository.id !== identity.githubRepositoryId) throw new RepositoryBaselineError('repository_access_changed');
+    requirePublicRepository(scoped.repository);
     const current = await gateway.getRepositoryMetadata(token, scoped.repository.ownerLogin, scoped.repository.name);
+    requirePublicRepository(current);
     if (!sameRepository(scoped.repository, current)) throw new RepositoryBaselineError('repository_access_changed');
     archive = await gateway.downloadRepositoryArchive({ accessToken: token, owner: current.ownerLogin, ref: identity.baseCommitSha, repository: current.name });
   } finally {

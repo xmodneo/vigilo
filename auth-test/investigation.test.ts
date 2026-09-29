@@ -149,6 +149,7 @@ class Gateway implements InvestigationSourceGateway {
   readonly blobs = new Map<string, Buffer>();
   entries: GitTreeEntry[] = [];
   providerTruncated = false;
+  tokenRepositoryPrivate = false;
   commit = COMMIT;
   add(path: string, content: string | Buffer, mode: GitTreeEntry['mode'] = '100644') {
     const bytes = Buffer.isBuffer(content) ? content : Buffer.from(content);
@@ -159,7 +160,7 @@ class Gateway implements InvestigationSourceGateway {
   addTree(path: string) { this.entries.push({ path, mode: '040000', type: 'tree', sha: 'e'.repeat(40), size: null }); }
   async createInstallationAccessToken(input: { installationId: number; repositoryId: number }) {
     this.calls.push({ operation: 'token', value: `${input.installationId}:${input.repositoryId}` });
-    return { accessToken: 'never-persist-this-token', repository: { id: input.repositoryId, name: 'vigilo', ownerLogin: 'xmodneo' } };
+    return { accessToken: 'never-persist-this-token', repository: { id: input.repositoryId, name: 'vigilo', ownerLogin: 'xmodneo', isPrivate: this.tokenRepositoryPrivate } };
   }
   async getCommitTree(input: { commitSha: string }) { this.calls.push({ operation: 'commit', value: input.commitSha }); return { commitSha: this.commit, treeSha: TREE }; }
   async getTree(input: { treeSha: string }) { this.calls.push({ operation: 'tree', value: input.treeSha }); return { entries: this.entries, truncated: this.providerTruncated }; }
@@ -282,6 +283,29 @@ test('bounded context operations read exact blobs, reject unsafe content, search
   assert.ok(events.some((event) => event.status === 'rejected' && event.failureCode === 'path_denied' && event.requestPath === null));
   assert.equal(gateway.calls.filter((call) => call.operation === 'token').length, gateway.calls.filter((call) => call.operation === 'revoke').length);
   const databaseRows = JSON.stringify({ investigations: await context.database.select().from(investigation), events }); assert.doesNotMatch(databaseRows, /never-persist-this-token/);
+});
+
+test('ready investigation context rechecks public repository policy before every source read', async (t) => {
+  const context = await createTestContext(); t.after(() => context.client.close());
+  const owner = await authenticated(context); await seedAuthority(context, owner);
+  const gateway = new Gateway(); gateway.add('README.md', 'safe');
+  const value = await prepared(context, owner, gateway);
+  await context.database.update(repository).set({ isPrivate: true }).where(eq(repository.githubRepositoryId, REPOSITORY_ID));
+  const callsBeforeDatabaseRejection = gateway.calls.length;
+  await assert.rejects(
+    readTextFile(context.database, owner, gateway, CONFIGURATION, value.investigation.id, randomUUID(), 'README.md'),
+    /private_repository_not_supported/,
+  );
+  assert.equal(gateway.calls.length, callsBeforeDatabaseRejection);
+
+  await context.database.update(repository).set({ isPrivate: false }).where(eq(repository.githubRepositoryId, REPOSITORY_ID));
+  gateway.tokenRepositoryPrivate = true;
+  await assert.rejects(
+    readTextFile(context.database, owner, gateway, CONFIGURATION, value.investigation.id, randomUUID(), 'README.md'),
+    /private_repository_not_supported/,
+  );
+  assert.equal(gateway.calls.filter((call) => call.operation === 'blob').length, 0);
+  assert.equal(gateway.calls.filter((call) => call.operation === 'token').length, gateway.calls.filter((call) => call.operation === 'revoke').length);
 });
 
 test('investigation source boundary contains no repository execution or source mutation capability', async () => {

@@ -20,9 +20,10 @@ import { runFrozenCandidateVerification } from './runner.ts';
 import { trustworthyComparableBaseline } from './classification.ts';
 import type { CandidateVerificationEvidence, CandidateVerificationGateway } from './types.ts';
 import { ZERO_EXTERNAL_EXECUTION_AUTHORITY, type ExternalExecutionAuthorizer } from '../external-execution/types.ts';
+import { assertPublicRepositoryAuthority, RepositoryPolicyError } from '../github-repositories/policy.ts';
 
 export class CandidateVerificationPreparationError extends Error {
-  constructor(public readonly code: 'candidate_artifact_invalid' | 'verification_authority_mismatch' | 'verification_source_unavailable') {
+  constructor(public readonly code: 'candidate_artifact_invalid' | 'private_repository_not_supported' | 'verification_authority_mismatch' | 'verification_source_unavailable') {
     super(code);
     this.name = 'CandidateVerificationPreparationError';
   }
@@ -60,6 +61,8 @@ export async function executeCandidateVerification(
       !matchingAuthority([verification, candidate, current, run, baseline, { ...profile, profileIdentity: profile.profileIdentity }])) {
     throw new CandidateVerificationPreparationError('verification_authority_mismatch');
   }
+  try { await assertPublicRepositoryAuthority(database, verification.workspaceId, verification.githubRepositoryId); }
+  catch (error) { if (error instanceof RepositoryPolicyError) throw new CandidateVerificationPreparationError(error.code); throw error; }
   let artifact;
   try { artifact = await selfCheckRepairCandidateForWorkspace(database, verification.workspaceId, candidate.id); }
   catch { throw new CandidateVerificationPreparationError('candidate_artifact_invalid'); }

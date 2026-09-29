@@ -2,9 +2,9 @@ import { drizzle } from 'drizzle-orm/postgres-js';
 import postgres from 'postgres';
 
 import * as schema from '../db/schema.ts';
-import { readServerEnvironment } from '../lib/auth/environment.ts';
+import { readDatabaseEnvironment } from '../lib/auth/environment.ts';
 import { GitHubApiClient } from '../lib/github-app/client.ts';
-import { readGitHubAppEnvironment, readGitHubAppPrivateKey } from '../lib/github-app/environment.ts';
+import { readGitHubAppPrivateKey, readGitHubWorkerEnvironment } from '../lib/github-app/environment.ts';
 import {
   createRepairBoss,
   AI_CANDIDATE_GENERATION_QUEUE,
@@ -36,19 +36,32 @@ import { processRepairLoopJob } from '../lib/repair-loops/worker.ts';
 import { repairPublication } from '../db/schema.ts';
 import { processRepairPublicationJob } from '../lib/repair-publications/worker.ts';
 import { DurableExternalExecutionAuthorizer } from '../lib/external-execution/authority.ts';
+import { randomUUID } from 'node:crypto';
+import { readRuntimeRelease } from '../lib/operations/release.ts';
+import { PostgresWorkerHeartbeatStore, WorkerHeartbeatLifecycle } from '../lib/operations/worker-heartbeat.ts';
 
 async function main(): Promise<void> {
-  const environment = readServerEnvironment();
-  const configuration = readGitHubAppEnvironment();
+  const environment = readDatabaseEnvironment();
+  const configuration = readGitHubWorkerEnvironment();
+  const releaseSha = readRuntimeRelease();
   const client = postgres(environment.databaseUrl, { max: 2, prepare: false });
+  const heartbeatClient = postgres(environment.databaseUrl, { max: 1, prepare: false, connect_timeout: 5, idle_timeout: 5, connection: { statement_timeout: 5_000, lock_timeout: 2_000 } });
   const database = drizzle(client, { schema });
   const executionAuthority = new DurableExternalExecutionAuthorizer(database);
   const logger = createConsoleWorkerLogger();
   const shutdown = new AbortController();
+  const heartbeat = new WorkerHeartbeatLifecycle(new PostgresWorkerHeartbeatStore(heartbeatClient), {
+    id: randomUUID(),
+    releaseSha,
+  });
   let boss: Awaited<ReturnType<typeof createRepairBoss>> | undefined;
   const workerIds: Array<{ id: string; queue: string }> = [];
+  let heartbeatStarted = false;
+  let graceful = false;
 
   try {
+    await heartbeat.start();
+    heartbeatStarted = true;
     boss = await createRepairBoss(environment.databaseUrl, 'worker');
     const gateway = new GitHubApiClient(configuration, await readGitHubAppPrivateKey(configuration.privateKeyPath));
     boss.on('error', () => logger.write({ event: 'retry_classified', code: 'queue_operation_failed' }));
@@ -154,8 +167,15 @@ async function main(): Promise<void> {
     });
     workerIds.push({ id: repairPublicationWorkerId, queue: REPAIR_PUBLICATION_QUEUE });
 
+    await heartbeat.ready();
+    heartbeat.begin();
+
     await new Promise<void>((resolve) => {
-      const stop = () => resolve();
+      const stop = () => {
+        if (graceful) return;
+        graceful = true;
+        void heartbeat.draining().catch(() => undefined).finally(resolve);
+      };
       process.once('SIGINT', stop);
       process.once('SIGTERM', stop);
     });
@@ -165,7 +185,10 @@ async function main(): Promise<void> {
       if (boss) for (const worker of workerIds) await boss.offWork(worker.queue, { id: worker.id, wait: true });
       if (boss) await boss.stop({ graceful: true, timeout: 120_000 });
     } finally {
-      await client.end();
+      if (heartbeatStarted) {
+        try { await heartbeat.stopped(graceful ? undefined : 'worker_runtime_failed'); } catch { /* DB failure is already fatal. */ }
+      }
+      await Promise.allSettled([heartbeatClient.end({ timeout: 2 }), client.end({ timeout: 2 })]);
     }
   }
 }

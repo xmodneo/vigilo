@@ -14,9 +14,11 @@ import type {
   GitHubExecutionProfileGateway,
   InstallationRepositoryMetadata,
 } from './types.ts';
+import { assertPublicRepository } from '../github-repositories/policy.ts';
 
 export type ExecutionProfileErrorCode =
   | 'installation_unavailable'
+  | 'private_repository_not_supported'
   | 'profile_unavailable'
   | 'repository_access_changed'
   | 'repository_not_selected'
@@ -68,6 +70,7 @@ async function selectedRepository(
       defaultBranch: repository.defaultBranch,
       githubRepositoryId: repository.githubRepositoryId,
       installationId: repository.installationId,
+      isPrivate: repository.isPrivate,
     })
     .from(repository)
     .innerJoin(
@@ -197,6 +200,8 @@ export async function detectSelectedRepositoryExecutionProfile(
   now = new Date(),
 ) {
   const selected = await selectedRepository(database, context);
+  try { assertPublicRepository(selected); }
+  catch { throw new ExecutionProfileError('private_repository_not_supported'); }
   let accessToken: string | undefined;
   let draft: ExecutionProfileDraft | undefined;
   let metadata: InstallationRepositoryMetadata | undefined;
@@ -214,6 +219,8 @@ export async function detectSelectedRepositoryExecutionProfile(
     if (scoped.repository.id !== selected.githubRepositoryId) {
       throw new ExecutionProfileError('repository_access_changed');
     }
+    try { assertPublicRepository(scoped.repository); }
+    catch { throw new ExecutionProfileError('private_repository_not_supported'); }
 
     const currentMetadata = await gateway.getRepositoryMetadata(
       accessToken,
@@ -226,6 +233,8 @@ export async function detectSelectedRepositoryExecutionProfile(
     ) {
       throw new ExecutionProfileError('repository_access_changed');
     }
+    try { assertPublicRepository(currentMetadata); }
+    catch { throw new ExecutionProfileError('private_repository_not_supported'); }
     metadata = currentMetadata;
 
     const baseCommitSha = await gateway.resolveBranchCommit({

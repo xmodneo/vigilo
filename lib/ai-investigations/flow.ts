@@ -5,12 +5,13 @@ import { and, desc, eq } from 'drizzle-orm';
 import { aiInvestigation, aiInvestigationEvent, executionProfile, investigation, repairRun, repositoryBaseline } from '../../db/schema.ts';
 import type { AuthenticatedWorkspace } from '../auth/protected-context.ts';
 import type { VigiloDatabase } from '../db/types.ts';
+import { RepositoryPolicyError, assertPublicRepositoryAuthority } from '../github-repositories/policy.ts';
 import { trustworthyComparableBaseline } from '../candidate-verifications/classification.ts';
 import { AI_INVESTIGATION_JOB_VERSION, type TransactionalAiInvestigationQueue } from '../repair-runs/queue.ts';
 import { AI_INVESTIGATION_PROTOCOL_VERSION, AI_MODEL_ID, AI_PROVIDER_ID, type AiInvestigationResult, type InvestigationConclusion } from './types.ts';
 
 export class AiInvestigationFlowError extends Error {
-  constructor(public readonly code: 'investigation_not_ready' | 'ai_investigation_not_found' | 'ai_investigation_handoff_failed') { super(code); this.name = 'AiInvestigationFlowError'; }
+  constructor(public readonly code: 'investigation_not_ready' | 'ai_investigation_not_found' | 'ai_investigation_handoff_failed' | 'private_repository_not_supported') { super(code); this.name = 'AiInvestigationFlowError'; }
 }
 
 function result(row: typeof aiInvestigation.$inferSelect): AiInvestigationResult {
@@ -27,6 +28,8 @@ export async function startAiInvestigation(database: VigiloDatabase, context: Au
   const created = await database.transaction(async (transaction) => {
     const [parent] = await transaction.select().from(investigation).where(and(eq(investigation.id, investigationId), eq(investigation.workspaceId, context.workspace.id))).for('update').limit(1);
     if (!parent || parent.state !== 'ready') throw new AiInvestigationFlowError('investigation_not_ready');
+    try { await assertPublicRepositoryAuthority(transaction, parent.workspaceId, parent.githubRepositoryId); }
+    catch (error) { if (error instanceof RepositoryPolicyError) throw new AiInvestigationFlowError(error.code); throw error; }
     const [sameIntent] = await transaction.select().from(aiInvestigation).where(and(eq(aiInvestigation.investigationId, investigationId), eq(aiInvestigation.idempotencyKey, idempotencyKey))).limit(1);
     if (sameIntent) return sameIntent;
     const [latest] = await transaction.select().from(aiInvestigation).where(and(eq(aiInvestigation.investigationId, investigationId), eq(aiInvestigation.workspaceId, context.workspace.id))).orderBy(desc(aiInvestigation.executionOrdinal)).limit(1);

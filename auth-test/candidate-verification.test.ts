@@ -75,7 +75,7 @@ class MemoryQueue implements TransactionalCandidateVerificationQueue {
 async function seed(context: Awaited<ReturnType<typeof createTestContext>>, owner: AuthenticatedWorkspace, baselineOutcome = 'baseline_passed') {
   const profile = profileIdentity(owner.workspace.id);
   await context.database.insert(githubInstallation).values({ installationId: INSTALLATION_ID, workspaceId: owner.workspace.id, githubAccountId: 7, accountLogin: 'owner', accountType: 'User', status: 'active', createdAt: NOW, updatedAt: NOW });
-  await context.database.insert(repository).values({ githubRepositoryId: REPOSITORY_ID, workspaceId: owner.workspace.id, installationId: INSTALLATION_ID, ownerId: 7, ownerLogin: 'owner', name: 'repo', fullName: 'owner/repo', defaultBranch: 'main', isPrivate: true, createdAt: NOW, updatedAt: NOW });
+  await context.database.insert(repository).values({ githubRepositoryId: REPOSITORY_ID, workspaceId: owner.workspace.id, installationId: INSTALLATION_ID, ownerId: 7, ownerLogin: 'owner', name: 'repo', fullName: 'owner/repo', defaultBranch: 'main', isPrivate: false, createdAt: NOW, updatedAt: NOW });
   await context.database.insert(executionProfile).values({ githubRepositoryId: REPOSITORY_ID, workspaceId: owner.workspace.id, installationId: INSTALLATION_ID, profileVersion: 2, profileIdentity: profile, baseCommitSha: COMMIT, runtimeFamily: 'node', nodeMajor: 24, packageManager: 'npm', lockfileType: 'package-lock', installOperation: 'ci', typecheckScript: 'typecheck', buildScript: 'build', testScript: 'test', testRunner: 'vitest', packageJsonBlobSha: PACKAGE_JSON_SHA, packageJsonContentSha256: PACKAGE_JSON_CONTENT, packageLockBlobSha: PACKAGE_LOCK_SHA, packageLockContentSha256: PACKAGE_LOCK_CONTENT, status: 'ready', createdAt: NOW, updatedAt: NOW });
   const baselineId = randomUUID();
   const passed = baselineOutcome === 'baseline_passed';
@@ -98,8 +98,8 @@ async function seed(context: Awaited<ReturnType<typeof createTestContext>>, owne
 class Gateway implements CandidateVerificationGateway {
   calls: string[] = [];
   async getInstallation(id: number) { this.calls.push(`installation:${id}`); return { id, appId: CONFIGURATION.appId, appSlug: CONFIGURATION.appSlug, suspendedAt: null, account: { id: 7, login: 'owner', type: 'User' as const }, permissions: { contents: 'read' as const, metadata: 'read' as const } }; }
-  async createInstallationAccessToken(input: { installationId: number; repositoryId: number }) { this.calls.push(`token:${input.installationId}:${input.repositoryId}`); return { accessToken: 'ephemeral-sentinel', repository: { id: input.repositoryId, ownerId: 7, ownerLogin: 'owner', name: 'repo', fullName: 'owner/repo', defaultBranch: 'main', isPrivate: true } }; }
-  async getRepositoryMetadata() { this.calls.push('metadata'); return { id: REPOSITORY_ID, ownerId: 7, ownerLogin: 'owner', name: 'repo', fullName: 'owner/repo', defaultBranch: 'main', isPrivate: true }; }
+  async createInstallationAccessToken(input: { installationId: number; repositoryId: number }) { this.calls.push(`token:${input.installationId}:${input.repositoryId}`); return { accessToken: 'ephemeral-sentinel', repository: { id: input.repositoryId, ownerId: 7, ownerLogin: 'owner', name: 'repo', fullName: 'owner/repo', defaultBranch: 'main', isPrivate: false } }; }
+  async getRepositoryMetadata() { this.calls.push('metadata'); return { id: REPOSITORY_ID, ownerId: 7, ownerLogin: 'owner', name: 'repo', fullName: 'owner/repo', defaultBranch: 'main', isPrivate: false }; }
   async downloadRepositoryArchive(input: { ref: string }) { this.calls.push(`archive:${input.ref}`); return Buffer.from('controlled-archive'); }
   async revokeInstallationAccessToken(token: string) { assert.equal(token, 'ephemeral-sentinel'); this.calls.push('revoke'); }
 }

@@ -5,6 +5,7 @@ import { and, eq } from 'drizzle-orm';
 import { investigation, repairIntent, repairRun, repositoryBaseline } from '../../db/schema.ts';
 import type { AuthenticatedWorkspace } from '../auth/protected-context.ts';
 import type { VigiloDatabase } from '../db/types.ts';
+import { RepositoryPolicyError, assertPublicRepositoryAuthority } from '../github-repositories/policy.ts';
 import { matchesRepairRunEvidence } from '../repair-runs/flow.ts';
 import { INVESTIGATION_JOB_VERSION, type TransactionalInvestigationQueue } from '../repair-runs/queue.ts';
 import { CONTEXT_BUDGET } from './policy.ts';
@@ -20,6 +21,7 @@ export class InvestigationError extends Error {
     | 'repair_run_not_eligible'
     | 'repair_intent_missing'
     | 'baseline_evidence_mismatch'
+    | 'private_repository_not_supported'
     | 'investigation_conflict'
     | 'investigation_handoff_failed') {
     super(code);
@@ -83,6 +85,8 @@ export async function createInvestigation(
     return await database.transaction(async (transaction) => {
       const [run] = await transaction.select().from(repairRun).where(and(eq(repairRun.id, repairRunId), eq(repairRun.workspaceId, context.workspace.id))).limit(1);
       if (!run) throw new InvestigationError('repair_run_not_found');
+      try { await assertPublicRepositoryAuthority(transaction, run.workspaceId, run.githubRepositoryId); }
+      catch (error) { if (error instanceof RepositoryPolicyError) throw new InvestigationError(error.code); throw error; }
       if (!['ready_for_investigation', 'baseline_failed'].includes(run.state) || !run.baselineId || !TRUSTWORTHY_OUTCOMES.has(run.baselineOutcome ?? '')) throw new InvestigationError('repair_run_not_eligible');
       const [[intent], [baseline]] = await Promise.all([
         transaction.select().from(repairIntent).where(and(eq(repairIntent.repairRunId, run.id), eq(repairIntent.workspaceId, context.workspace.id))).limit(1),

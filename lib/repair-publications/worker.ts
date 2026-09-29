@@ -6,6 +6,7 @@ import type { JobResult } from 'pg-boss';
 import { repairCandidateFile, repairPublication, repairPublicationAttempt, repairPublicationEvent, repository } from '../../db/schema.ts';
 import type { VigiloDatabase } from '../db/types.ts';
 import type { GitHubAppConfiguration } from '../github-app/types.ts';
+import { assertPublicRepositoryAuthority, RepositoryPolicyError } from '../github-repositories/policy.ts';
 import { HumanReviewError, resolveApprovedPublicationAuthority } from '../human-reviews/flow.ts';
 import type { ApprovedHumanReviewAuthority } from '../human-reviews/types.ts';
 import { selfCheckRepairCandidateForWorkspace } from '../repair-candidates/flow.ts';
@@ -163,6 +164,8 @@ async function verifyTargetBranch(dependencies: RepairPublicationWorkerDependenc
 
 async function execute(dependencies: RepairPublicationWorkerDependencies, initial: PublicationRow, attempt: AttemptRow, resolver: PublicationAuthorityResolver): Promise<PublicationRow> {
   let publication = initial; const now = dependencies.clock ?? (() => new Date());
+  try { await assertPublicRepositoryAuthority(dependencies.database, publication.workspaceId, publication.githubRepositoryId); }
+  catch (error) { if (error instanceof RepositoryPolicyError) throw new PublicationWorkerError(error.code, 'failed'); throw error; }
   await currentAuthority(dependencies.database, publication, resolver);
   const installation = await dependencies.gateway.getInstallation(publication.installationId);
   if (installation.id !== publication.installationId || installation.appId !== dependencies.configuration.appId || installation.appSlug !== dependencies.configuration.appSlug || installation.suspendedAt !== null || !exactPermissions(installation.permissions)) throw new PublicationWorkerError('installation_unavailable', 'failed');
@@ -171,6 +174,7 @@ async function execute(dependencies: RepairPublicationWorkerDependencies, initia
   let revocationFailed = false;
   let operationError: unknown = null;
   try {
+    if (token.repository.isPrivate) throw new PublicationWorkerError('private_repository_not_supported', 'failed');
     const prepared = await prepare(dependencies, publication, token.accessToken, owner, name, now());
     if (publication.preparedPublicationIdentity === null) {
       const preparedIdentity = computePreparedPublicationIdentity({ publicationIntentIdentity: publication.publicationIntentIdentity, targetBaseBranch: token.repository.defaultBranch, expectedBaseTreeSha: prepared.baseTreeSha, expectedTreeSha: prepared.treeSha, expectedCommitSha: prepared.commit.sha });

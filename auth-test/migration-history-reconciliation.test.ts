@@ -23,18 +23,30 @@ test('historical migration files reproduce the hashes recorded when they were ap
   }
 });
 
-test('journal orders reconciliation, RepairLoop, human review, publication, and execution-authority migrations', async () => {
+test('journal orders reconciliation, RepairLoop, review, publication, execution authority, and operations migrations', async () => {
   const journal = JSON.parse(await readFile(migrationPath('meta', '_journal.json'), 'utf8')) as {
     entries: Array<{ idx: number; when: number; tag: string }>;
   };
-  assert.deepEqual(journal.entries.slice(-5).map(({ idx, tag }) => ({ idx, tag })), [
+  assert.deepEqual(journal.entries.slice(-6).map(({ idx, tag }) => ({ idx, tag })), [
     { idx: 18, tag: '0018_historical-schema-reconciliation' },
     { idx: 19, tag: '0019_repair-loop' },
     { idx: 20, tag: '0020_human-review' },
     { idx: 21, tag: '0021_repair-publication' },
     { idx: 22, tag: '0022_external-execution-authority' },
+    { idx: 23, tag: '0023_operational-readiness' },
   ]);
   assert.ok(journal.entries.every((entry, index, entries) => index === 0 || entry.when > entries[index - 1]!.when));
+});
+
+test('operational migration contains only bounded heartbeat and rate-limit state', async () => {
+  const content = await readFile(migrationPath('0023_operational-readiness.sql'), 'utf8');
+  for (const marker of [
+    'operational_worker_heartbeat', 'http_rate_limit_bucket', 'operational_worker_heartbeat_guard',
+    'worker heartbeat identity is immutable', 'worker heartbeat transition invalid',
+    'http_rate_limit_bucket_action_check', 'http_rate_limit_bucket_expiry_idx',
+  ]) assert.ok(content.includes(marker), marker);
+  assert.equal((content.match(/CREATE TABLE/g) ?? []).length, 2);
+  assert.doesNotMatch(content, /execution_budget_grant|release_acceptance|repair_publication"\s+(?:ADD|ALTER)/);
 });
 
 test('external-execution migration installs immutable budget, fencing, and acceptance authority without rewriting history', async () => {

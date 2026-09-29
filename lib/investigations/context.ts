@@ -7,6 +7,7 @@ import { AI_LIMITS } from '../ai-investigations/types.ts';
 import { AI_CANDIDATE_GENERATION_LIMITS } from '../ai-candidate-generations/types.ts';
 import type { VigiloDatabase } from '../db/types.ts';
 import type { GitHubAppConfiguration } from '../github-app/types.ts';
+import { assertPublicRepositoryAuthority, RepositoryPolicyError } from '../github-repositories/policy.ts';
 import { CONTEXT_BUDGET, ContextPolicyError, normalizeContextPath, normalizeSearchQuery, pathDenied, searchablePath, strictUtf8 } from './policy.ts';
 import { withScopedRepositoryToken } from './source.ts';
 import type { InvestigationSourceGateway } from './types.ts';
@@ -25,6 +26,7 @@ export class InvestigationContextError extends Error {
     | 'binary_file_rejected'
     | 'content_identity_mismatch'
     | 'context_source_unavailable'
+    | 'private_repository_not_supported'
     | ContextPolicyError['code']) {
     super(code);
     this.name = 'InvestigationContextError';
@@ -95,6 +97,7 @@ async function assertActiveAiAttempt(database: VigiloDatabase, value: typeof inv
 function safeContextError(error: unknown): InvestigationContextError {
   if (error instanceof InvestigationContextError) return error;
   if (error instanceof ContextPolicyError) return new InvestigationContextError(error.code);
+  if (error instanceof RepositoryPolicyError) return new InvestigationContextError(error.code);
   return new InvestigationContextError('context_source_unavailable');
 }
 
@@ -103,6 +106,8 @@ async function readyInvestigation(database: VigiloDatabase, context: WorkspaceAu
   const [value] = await database.select().from(investigation).where(and(eq(investigation.id, investigationId), eq(investigation.workspaceId, context.workspace.id))).limit(1);
   if (!value) throw new InvestigationContextError('investigation_not_found');
   if (value.state !== 'ready') throw new InvestigationContextError('investigation_not_ready');
+  try { await assertPublicRepositoryAuthority(database, value.workspaceId, value.githubRepositoryId); }
+  catch (error) { if (error instanceof RepositoryPolicyError) throw new InvestigationContextError(error.code); throw error; }
   return value;
 }
 

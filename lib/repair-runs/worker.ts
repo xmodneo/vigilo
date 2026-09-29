@@ -18,6 +18,8 @@ import type { VigiloDatabase } from '../db/types.ts';
 import { DurableExternalExecutionAuthorizer } from '../external-execution/authority.ts';
 import type { ExternalExecutionAuthorizer } from '../external-execution/types.ts';
 import type { GitHubAppConfiguration } from '../github-app/types.ts';
+import { assertPublicRepositoryAuthority } from '../github-repositories/policy.ts';
+import { writeOperationalLog } from '../operations/logging.ts';
 import { resolveBaselineAuthority } from '../repository-baselines/authority.ts';
 import { executeSelectedRepositoryBaseline } from '../repository-baselines/flow.ts';
 import type { BaselineEvidence, BaselineOutcome, GitHubBaselineGateway } from '../repository-baselines/types.ts';
@@ -492,6 +494,8 @@ export async function processRepairJob(job: RepairQueueJob, dependencies: Repair
     dependencies.logger.write({ event: 'job_rejected', runId: payload.repairRunId, code: 'run_not_found' });
     return { id: job.id, status: 'deadletter', output: { code: 'run_not_found' } };
   }
+  try { await assertPublicRepositoryAuthority(dependencies.database, existing.workspaceId, existing.githubRepositoryId); }
+  catch { return { id: job.id, status: 'deadletter', output: { code: 'private_repository_not_supported' } }; }
   const claim = await claimAttempt(dependencies.database, existing.id, job.id, (dependencies.clock ?? (() => new Date()))(), dependencies.randomId ?? randomUUID);
   if (claim.kind === 'terminal') return { id: job.id, status: 'completed' };
   if (claim.kind === 'busy') return { id: job.id, status: 'failed', output: { code: 'active_attempt' } };
@@ -508,5 +512,11 @@ export async function processRepairJob(job: RepairQueueJob, dependencies: Repair
 }
 
 export function createConsoleWorkerLogger(stream: Pick<NodeJS.WriteStream, 'write'> = process.stdout): WorkerLogger {
-  return { write: (event) => { stream.write(`${JSON.stringify(event)}\n`); } };
+  return { write: (event) => writeOperationalLog({
+    level: 'info',
+    event: event.event,
+    service: 'vigilo-worker',
+    ...(typeof event.runId === 'string' ? { repairRunId: event.runId } : {}),
+    ...(typeof event.code === 'string' ? { failureCode: event.code } : {}),
+  }, (line) => { stream.write(`${line}\n`); }) };
 }

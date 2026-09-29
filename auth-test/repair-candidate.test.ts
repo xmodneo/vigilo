@@ -94,7 +94,7 @@ class Gateway implements CandidateSourceGateway {
     this.entries.push({ path, mode, type: mode === '160000' ? 'commit' : mode === '040000' ? 'tree' : 'blob', sha, size: ['040000', '160000'].includes(mode) ? null : bytes.byteLength });
     return sha;
   }
-  async createInstallationAccessToken(input: { installationId: number; repositoryId: number }) { this.calls.push({ operation: 'token', value: `${input.installationId}:${input.repositoryId}` }); return { accessToken: 'candidate-token-sentinel', repository: { id: input.repositoryId, name: 'vigilo', ownerLogin: 'xmodneo' } }; }
+  async createInstallationAccessToken(input: { installationId: number; repositoryId: number }) { this.calls.push({ operation: 'token', value: `${input.installationId}:${input.repositoryId}` }); return { accessToken: 'candidate-token-sentinel', repository: { id: input.repositoryId, name: 'vigilo', ownerLogin: 'xmodneo', isPrivate: false } }; }
   async getCommitTree(input: { commitSha: string }) { this.calls.push({ operation: 'commit', value: input.commitSha }); return { commitSha: this.commit, treeSha: TREE }; }
   async getTree(input: { treeSha: string }) { this.calls.push({ operation: 'tree', value: input.treeSha }); return { entries: this.entries, truncated: this.truncated }; }
   async getBlob(input: { blobSha: string; maxBytes?: number }) { this.calls.push({ operation: 'blob', value: input.blobSha }); const bytes = this.blobs.get(input.blobSha); if (!bytes || bytes.byteLength > (input.maxBytes ?? 65_536)) throw new Error('blob unavailable'); return { bytes, sha: input.blobSha }; }

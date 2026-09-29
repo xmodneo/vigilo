@@ -1,4 +1,5 @@
 import type { GitHubAppConfiguration } from '../github-app/types.ts';
+import { assertPublicRepository, RepositoryPolicyError } from '../github-repositories/policy.ts';
 import { CONTEXT_BUDGET, normalizeContextPath, pathDenied } from './policy.ts';
 import type { GitTreeEntry, InvestigationSourceGateway } from './types.ts';
 
@@ -18,11 +19,13 @@ export async function withScopedRepositoryToken<T>(
   const installation = await gateway.getInstallation(identity.installationId);
   if (installation.id !== identity.installationId || installation.appId !== configuration.appId || installation.appSlug !== configuration.appSlug || installation.suspendedAt !== null) throw new InvestigationSourceError('installation_unavailable');
   const scoped = await gateway.createInstallationAccessToken({ installationId: identity.installationId, repositoryId: identity.githubRepositoryId });
-  if (scoped.repository.id !== identity.githubRepositoryId) {
+  if (scoped.repository.id !== identity.githubRepositoryId || scoped.repository.isPrivate) {
     try { await gateway.revokeInstallationAccessToken(scoped.accessToken); }
     catch { throw new InvestigationSourceError('token_revocation_failed'); }
+    if (scoped.repository.isPrivate) throw new RepositoryPolicyError();
     throw new InvestigationSourceError('installation_unavailable');
   }
+  assertPublicRepository(scoped.repository);
   let value: T | undefined;
   let operationError: unknown;
   try {

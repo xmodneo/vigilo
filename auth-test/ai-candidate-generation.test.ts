@@ -32,7 +32,7 @@ class AiQueue implements TransactionalAiInvestigationQueue { async enqueueAiInve
 class CandidateQueue implements TransactionalAiCandidateGenerationQueue { payloads: Array<{ version: 1; proposalGenerationId: string }> = []; async enqueueAiCandidateGeneration(_transaction: never, payload: { version: 1; proposalGenerationId: string }) { this.payloads.push(structuredClone(payload)); return payload.proposalGenerationId; } }
 class Gateway implements InvestigationSourceGateway {
   calls: string[] = [];
-  async createInstallationAccessToken() { this.calls.push('token'); return { accessToken: 'candidate-token', repository: { id: REPOSITORY_ID, name: 'vigilo', ownerLogin: 'xmodneo' } }; }
+  async createInstallationAccessToken() { this.calls.push('token'); return { accessToken: 'candidate-token', repository: { id: REPOSITORY_ID, name: 'vigilo', ownerLogin: 'xmodneo', isPrivate: false } }; }
   async getCommitTree() { this.calls.push('commit'); return { commitSha: COMMIT, treeSha: TREE }; }
   async getTree() { this.calls.push('tree'); return { entries: [{ path: SOURCE_PATH, mode: '100644' as const, type: 'blob' as const, sha: blobSha(SOURCE), size: Buffer.byteLength(SOURCE) }], truncated: false }; }
   async getBlob(input: { blobSha: string }) { this.calls.push('blob'); assert.equal(input.blobSha, blobSha(SOURCE)); return { bytes: Buffer.from(SOURCE), sha: input.blobSha }; }
@@ -58,7 +58,7 @@ class EphemeralTokenGateway extends Gateway {
   async createInstallationAccessToken() {
     const accessToken = `ephemeral-${this.minted.length + 1}`;
     this.minted.push(accessToken);
-    return { accessToken, repository: { id: REPOSITORY_ID, name: 'vigilo', ownerLogin: 'xmodneo' } };
+    return { accessToken, repository: { id: REPOSITORY_ID, name: 'vigilo', ownerLogin: 'xmodneo', isPrivate: false } };
   }
   async getBlob(input: Parameters<Gateway['getBlob']>[0]) {
     const accessToken = (input as { accessToken?: unknown }).accessToken;
@@ -196,7 +196,7 @@ async function seed(context: Awaited<ReturnType<typeof createTestContext>>, stat
   await context.database.insert(account).values({ id: randomUUID(), issuer: 'local:oauth:github', accountId: '1234', providerId: 'github', userId });
   await context.database.insert(workspace).values({ id: workspaceId, ownerUserId: userId });
   await context.database.insert(githubInstallation).values({ installationId: INSTALLATION_ID, workspaceId, githubAccountId: 1234, accountLogin: 'xmodneo', accountType: 'User', status: 'active' });
-  await context.database.insert(repository).values({ githubRepositoryId: REPOSITORY_ID, workspaceId, installationId: INSTALLATION_ID, ownerId: 1234, ownerLogin: 'xmodneo', name: 'vigilo', fullName: 'xmodneo/vigilo', defaultBranch: 'main', isPrivate: true });
+  await context.database.insert(repository).values({ githubRepositoryId: REPOSITORY_ID, workspaceId, installationId: INSTALLATION_ID, ownerId: 1234, ownerLogin: 'xmodneo', name: 'vigilo', fullName: 'xmodneo/vigilo', defaultBranch: 'main', isPrivate: false });
   await context.database.insert(executionProfile).values({ githubRepositoryId: REPOSITORY_ID, workspaceId, installationId: INSTALLATION_ID, profileVersion: 2, profileIdentity: PROFILE, baseCommitSha: COMMIT, runtimeFamily: 'node', nodeMajor: 24, packageManager: 'npm', lockfileType: 'package-lock', installOperation: 'ci', typecheckScript: 'typecheck', buildScript: 'build', testScript: 'test', testRunner: 'vitest', packageJsonBlobSha: 'd'.repeat(40), packageJsonContentSha256: 'e'.repeat(64), packageLockBlobSha: 'f'.repeat(40), packageLockContentSha256: '1'.repeat(64), status: 'ready' });
   const baselineId = randomUUID(); const runId = randomUUID(); const intentId = randomUUID(); const investigationId = randomUUID();
   await context.database.insert(repositoryBaseline).values({ id: baselineId, workspaceId, githubRepositoryId: REPOSITORY_ID, installationId: INSTALLATION_ID, evidenceVersion: 1, profileIdentity: PROFILE, baseCommitSha: COMMIT, archiveSha256: '2'.repeat(64), sandboxName: 'baseline-sandbox', sandboxSessionId: 'baseline-session', sourceIdentityBefore: '3'.repeat(64), sourceIdentityAfter: '3'.repeat(64), sourceUnchanged: true, credentialsExposure: 'absent', networkPolicy: 'deny-all', installStatus: 'completed', installExitCode: 0, installTimedOut: false, typecheckStatus: 'completed', typecheckExitCode: 0, typecheckTimedOut: false, buildStatus: 'completed', buildExitCode: 0, buildTimedOut: false, testStatus: 'failed', testExitCode: 1, testTimedOut: false, executionOutcome: 'baseline_failed', overallOutcome: 'baseline_failed', cleanupStop: 'confirmed', cleanupDelete: 'confirmed', cleanupLookup: 'absent', errorPhase: 'test', errorCode: 'baseline_failed', startedAt: NOW, completedAt: NOW, durationMs: 1 });

@@ -8,6 +8,7 @@ const ineligibleMessages: Record<string, string> = {
   evidence_invalid: 'The selected verification evidence is incomplete, untrusted, or inconsistent.',
   authority_mismatch: 'The selected artifacts do not share one exact authority chain.',
   active_conflict: 'Another candidate generation or verification is still active for this Repair Run.',
+  private_repository_not_supported: 'Private repositories are not supported and their candidate content cannot be reviewed.',
 };
 
 const label = (value: string) => value.replaceAll('_', ' ');

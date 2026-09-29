@@ -1548,6 +1548,53 @@ export const releaseAcceptanceRevocation = pgTable(
   ],
 );
 
+export const operationalWorkerHeartbeat = pgTable(
+  'operational_worker_heartbeat',
+  {
+    id: text('id').primaryKey(),
+    service: text('service').notNull(),
+    releaseSha: text('release_sha').notNull(),
+    expectedSchemaVersion: text('expected_schema_version').notNull(),
+    registeredQueues: jsonb('registered_queues').notNull(),
+    state: text('state').notNull(),
+    failureCode: text('failure_code'),
+    startedAt: timestamp('started_at', { withTimezone: true }).notNull(),
+    lastHeartbeatAt: timestamp('last_heartbeat_at', { withTimezone: true }).notNull(),
+    stoppedAt: timestamp('stopped_at', { withTimezone: true }),
+  },
+  (table) => [
+    index('operational_worker_heartbeat_freshness_idx').on(table.service, table.state, table.lastHeartbeatAt),
+    index('operational_worker_heartbeat_stopped_idx').on(table.stoppedAt).where(sql`${table.state} = 'stopped'`),
+    check('operational_worker_heartbeat_uuid_check', sql`${table.id} ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'`),
+    check('operational_worker_heartbeat_service_check', sql`${table.service} = 'vigilo-worker'`),
+    check('operational_worker_heartbeat_release_check', sql`${table.releaseSha} ~ '^[0-9a-f]{40}$' and ${table.expectedSchemaVersion} = '0023'`),
+    check('operational_worker_heartbeat_queues_check', sql`jsonb_typeof(${table.registeredQueues}) = 'array' and jsonb_array_length(${table.registeredQueues}) = 7 and ${table.registeredQueues} = '["ai-candidate-generation-v1","ai-investigation-v1","candidate-verification-v1","investigation-context-v1","repair-baseline-v1","repair-loop-v1","repair-publication-v1"]'::jsonb`),
+    check('operational_worker_heartbeat_state_check', sql`${table.state} in ('starting','ready','draining','stopped')`),
+    check('operational_worker_heartbeat_failure_check', sql`${table.failureCode} is null or ${table.failureCode} ~ '^[a-z_]{1,64}$'`),
+    check('operational_worker_heartbeat_time_check', sql`${table.lastHeartbeatAt} >= ${table.startedAt} and ((${table.state} = 'stopped' and ${table.stoppedAt} is not null) or (${table.state} <> 'stopped' and ${table.stoppedAt} is null))`),
+  ],
+);
+
+export const httpRateLimitBucket = pgTable(
+  'http_rate_limit_bucket',
+  {
+    action: text('action').notNull(),
+    subjectHash: text('subject_hash').notNull(),
+    windowStartedAt: timestamp('window_started_at', { withTimezone: true }).notNull(),
+    expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
+    requestCount: integer('request_count').notNull(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    primaryKey({ name: 'http_rate_limit_bucket_pk', columns: [table.action, table.subjectHash, table.windowStartedAt] }),
+    index('http_rate_limit_bucket_expiry_idx').on(table.expiresAt),
+    check('http_rate_limit_bucket_action_check', sql`${table.action} in ('auth','oauth_callback','repository_connect','repository_select','profile_detect','repair_start','workflow_start','human_review','publication','poll','health','readiness')`),
+    check('http_rate_limit_bucket_subject_check', sql`${table.subjectHash} ~ '^[0-9a-f]{64}$'`),
+    check('http_rate_limit_bucket_count_check', sql`${table.requestCount} between 1 and 100000`),
+    check('http_rate_limit_bucket_window_check', sql`${table.expiresAt} > ${table.windowStartedAt} and ${table.updatedAt} >= ${table.windowStartedAt}`),
+  ],
+);
+
 export const authSchema = {
   account,
   executionProfile,

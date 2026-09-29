@@ -12,7 +12,8 @@ export type HumanReviewIneligibleReason =
   | 'verification_not_passed'
   | 'evidence_invalid'
   | 'authority_mismatch'
-  | 'active_conflict';
+  | 'active_conflict'
+  | 'private_repository_not_supported';
 
 export interface HumanReviewDecisionResult {
   id: string;

@@ -3,12 +3,14 @@ import { and, eq } from 'drizzle-orm';
 import { executionProfile, githubInstallation, repository } from '../../db/schema.ts';
 import type { AuthenticatedWorkspace } from '../auth/protected-context.ts';
 import type { VigiloDatabase } from '../db/types.ts';
+import { assertPublicRepository } from '../github-repositories/policy.ts';
 import { computeExecutionProfileIdentity } from '../execution-profiles/detector.ts';
 import type { FrozenBaselineProfile } from './types.ts';
 
 export class BaselineAuthorityError extends Error {
   constructor(public readonly code:
     | 'repository_not_selected'
+    | 'private_repository_not_supported'
     | 'profile_not_ready'
     | 'profile_corrupt'
     | 'repository_profile_mismatch') {
@@ -89,6 +91,8 @@ export async function resolveBaselineAuthority(
     ))
     .limit(1);
   if (!value) throw new BaselineAuthorityError('repository_not_selected');
+  try { assertPublicRepository(value.repository); }
+  catch { throw new BaselineAuthorityError('private_repository_not_supported'); }
   const profile = frozenBaselineProfile(value.profile);
   if (
     profile.githubRepositoryId !== value.repository.githubRepositoryId ||

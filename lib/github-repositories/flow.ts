@@ -15,6 +15,7 @@ import type {
   GitHubRepositoryAccessGateway,
   GitHubUserInstallationRepository,
 } from './types.ts';
+import { assertPublicRepository } from './policy.ts';
 
 const ATTEMPT_LIFETIME_MS = 10 * 60_000;
 const MAX_SNAPSHOT_BYTES = 1_000_000;
@@ -25,6 +26,7 @@ export type RepositoryAccessErrorCode =
   | 'invalid_repository'
   | 'invalid_state'
   | 'provider_failure'
+  | 'private_repository_not_supported'
   | 'repository_conflict'
   | 'repository_not_eligible';
 
@@ -273,6 +275,8 @@ async function persistSelectedRepository(
   selected: GitHubRepository,
   now: Date,
 ): Promise<void> {
+  try { assertPublicRepository(selected); }
+  catch { throw new RepositoryAccessError('private_repository_not_supported'); }
   const values = mutableRepositoryValues(selected, installationId, context.workspace.id, now);
   try {
     const [existing] = await database

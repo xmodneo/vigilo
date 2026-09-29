@@ -18,11 +18,13 @@ import {
   repairLoop,
   repairLoopEvent,
   repairLoopIteration,
+  repairRun,
 } from '../../db/schema.ts';
 import type { VigiloDatabase } from '../db/types.ts';
 import { DurableExternalExecutionAuthorizer } from '../external-execution/authority.ts';
 import { executionGrantIdentityMatches, executionReservationIdentityMatches } from '../external-execution/identity.ts';
 import { ExternalExecutionAuthorityError, type ExternalExecutionAuthorizer } from '../external-execution/types.ts';
+import { assertPublicRepositoryAuthority } from '../github-repositories/policy.ts';
 import { selfCheckRepairCandidate } from '../repair-candidates/flow.ts';
 import { AI_MODEL_ID, AI_PROVIDER_ID } from '../ai-investigations/types.ts';
 import { REPAIR_LOOP_AI_CANDIDATE_GENERATION_PROTOCOL_VERSION } from '../ai-candidate-generations/types.ts';
@@ -434,6 +436,9 @@ export async function processRepairLoopJob(job: RepairQueueJob, dependencies: Re
   const randomId = dependencies.randomId ?? randomUUID; const now = (dependencies.clock ?? (() => new Date()))();
   const [loop] = await dependencies.database.select().from(repairLoop).where(eq(repairLoop.id, payload.repairLoopId)).limit(1);
   if (!loop) return { id: job.id, status: 'deadletter', output: { code: 'repair_loop_not_found' } };
+  const [run] = await dependencies.database.select({ githubRepositoryId: repairRun.githubRepositoryId }).from(repairRun).where(eq(repairRun.id, loop.repairRunId)).limit(1);
+  try { await assertPublicRepositoryAuthority(dependencies.database, loop.workspaceId, run?.githubRepositoryId ?? 0); }
+  catch { return { id: job.id, status: 'deadletter', output: { code: 'private_repository_not_supported' } }; }
   if (!ACTIVE_LOOP_STATES.includes(loop.state as typeof ACTIVE_LOOP_STATES[number]) || loop.wakeJobId !== job.id) return { id: job.id, status: 'completed' };
   try { await dependencies.afterWakeValidated?.(); await reconcile(dependencies, loop, job.id, randomId, now); return { id: job.id, status: 'completed' }; }
   catch (error) {

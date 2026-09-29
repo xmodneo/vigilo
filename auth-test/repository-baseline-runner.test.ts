@@ -22,7 +22,7 @@ const manifest = { entries, identity: sha256(JSON.stringify(entries)) };
 function input(overrides: Partial<FrozenBaselineInput['profile']> = {}): FrozenBaselineInput {
   return {
     archive: Buffer.from('trusted-provider-archive'), archiveSha256: sha256('trusted-provider-archive'),
-    repository: { defaultBranch: 'main', fullName: 'octo/repo', id: 8101, isPrivate: true, name: 'repo', ownerId: 3001, ownerLogin: 'octo' },
+    repository: { defaultBranch: 'main', fullName: 'octo/repo', id: 8101, isPrivate: false, name: 'repo', ownerId: 3001, ownerLogin: 'octo' },
     runId: 'run-one', startedAt: new Date('2026-09-09T10:00:00Z'),
     profile: {
       baseCommitSha: 'a'.repeat(40), buildScript: 'build', githubRepositoryId: 8101, installationId: 9001,

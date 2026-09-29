@@ -41,7 +41,7 @@ const REPOSITORY: InstallationRepositoryMetadata = {
   defaultBranch: 'main',
   fullName: 'octo-org/private-app',
   id: 8101,
-  isPrivate: true,
+  isPrivate: false,
   name: 'private-app',
   ownerId: 3001,
   ownerLogin: 'octo-org',

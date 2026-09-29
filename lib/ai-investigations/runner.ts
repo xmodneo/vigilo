@@ -12,6 +12,7 @@ import { AI_LIMITS, ModelProviderError, type InvestigationConclusion, type Inves
 import type { ExternalExecutionFailureCode } from '../external-execution/types.ts';
 
 export type AiAgentErrorCode =
+  | 'private_repository_not_supported'
   | 'ai_authority_mismatch'
   | 'ai_investigation_ownership_lost'
   | 'model_protocol_error'

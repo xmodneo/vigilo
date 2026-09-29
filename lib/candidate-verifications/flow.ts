@@ -16,6 +16,7 @@ import {
 } from '../../db/schema.ts';
 import type { AuthenticatedWorkspace } from '../auth/protected-context.ts';
 import type { VigiloDatabase } from '../db/types.ts';
+import { RepositoryPolicyError, assertPublicRepositoryAuthority } from '../github-repositories/policy.ts';
 import { selfCheckRepairCandidate } from '../repair-candidates/flow.ts';
 import { frozenBaselineProfile } from '../repository-baselines/authority.ts';
 import {
@@ -34,7 +35,8 @@ export class CandidateVerificationError extends Error {
     | 'verification_handoff_failed'
     | 'verification_not_found'
     | 'verification_owned_by_repair_loop'
-    | 'repair_run_reviewed') {
+    | 'repair_run_reviewed'
+    | 'private_repository_not_supported') {
     super(code);
     this.name = 'CandidateVerificationError';
   }
@@ -113,6 +115,8 @@ export async function startCandidateVerification(
     eq(repairCandidate.id, candidateId), eq(repairCandidate.workspaceId, context.workspace.id),
   )).limit(1);
   if (!candidate) throw new CandidateVerificationError('candidate_not_found');
+  try { await assertPublicRepositoryAuthority(database, candidate.workspaceId, candidate.githubRepositoryId); }
+  catch (error) { if (error instanceof RepositoryPolicyError) throw new CandidateVerificationError(error.code); throw error; }
   if (candidate.state !== 'frozen' || !candidate.candidateIdentity) throw new CandidateVerificationError('candidate_not_frozen');
   const [ownedLoop] = await database.select({ id: repairLoop.id }).from(repairLoop)
     .where(and(eq(repairLoop.repairRunId, candidate.repairRunId), eq(repairLoop.workspaceId, context.workspace.id), inArray(repairLoop.state, ['queued', 'running']))).limit(1);

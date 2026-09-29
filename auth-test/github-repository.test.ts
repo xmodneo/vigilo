@@ -43,7 +43,7 @@ const FIRST_REPOSITORY: GitHubRepository = {
   defaultBranch: 'main',
   fullName: 'octo-org/private-app',
   id: 8101,
-  isPrivate: true,
+  isPrivate: false,
   name: 'private-app',
   ownerId: 3001,
   ownerLogin: 'octo-org',
@@ -293,6 +293,20 @@ test('selection uses a repository-scoped fresh authorization and rejects forged 
   assert.equal((await testContext.database.select().from(repository)).length, 1);
 });
 
+test('private repository selection fails before any durable selection is created', async (t) => {
+  const testContext = await createTestContext();
+  t.after(() => testContext.client.close());
+  const authenticated = await authenticatedWorkspace(testContext);
+  const gateway = new FakeRepositoryGateway();
+  gateway.repositories = [providerRepository({ ...FIRST_REPOSITORY, isPrivate: true }, { push: true })];
+  await authorize(testContext.database, authenticated.context, { operation: 'select', repositoryId: FIRST_REPOSITORY.id });
+  await assert.rejects(
+    complete(testContext.database, authenticated.context, gateway),
+    (error: unknown) => error instanceof RepositoryAccessError && error.code === 'private_repository_not_supported',
+  );
+  assert.equal((await testContext.database.select().from(repository)).length, 0);
+});
+
 test('write access lost after listing is rejected by fresh selection authorization', async (t) => {
   const testContext = await createTestContext();
   t.after(() => testContext.client.close());
@@ -491,7 +505,7 @@ test('database uniqueness prevents one repository from being selected by two wor
   );
 });
 
-test('selected private repository metadata remains scoped to its owning workspace', async (t) => {
+test('selected public repository metadata remains scoped to its owning workspace', async (t) => {
   const testContext = await createTestContext();
   t.after(() => testContext.client.close());
   const first = await authenticatedWorkspace(testContext, '2001', 'owner@example.test');

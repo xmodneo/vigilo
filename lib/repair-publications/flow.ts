@@ -5,6 +5,7 @@ import { and, asc, eq } from 'drizzle-orm';
 import { humanReviewDecision, repairCandidateFile, repairIntent, repairPublication, repairPublicationEvent, repairRun } from '../../db/schema.ts';
 import type { AuthenticatedWorkspace } from '../auth/protected-context.ts';
 import type { VigiloDatabase } from '../db/types.ts';
+import { RepositoryPolicyError, assertPublicRepositoryAuthority } from '../github-repositories/policy.ts';
 import { resolveApprovedPublicationAuthority } from '../human-reviews/flow.ts';
 import type { ApprovedHumanReviewAuthority } from '../human-reviews/types.ts';
 import { normalizeRepairObjective } from '../repair-runs/intent.ts';
@@ -22,6 +23,7 @@ export class RepairPublicationError extends Error {
     | 'publication_authority_mismatch'
     | 'publication_idempotency_conflict'
     | 'publication_invalid_request'
+    | 'private_repository_not_supported'
     | 'publication_queue_failed') {
     super(code);
     this.name = 'RepairPublicationError';
@@ -62,6 +64,8 @@ export async function reserveRepairPublicationWithAuthority(
   options: { clock?: () => Date; randomId?: () => string } = {},
 ): Promise<RepairPublicationResult> {
   if (!UUID.test(input.idempotencyKey) || !HASH.test(input.decisionIdentity) || input.decisionIdentity !== authority.humanReviewDecisionIdentity || authority.workspaceId !== context.workspace.id) throw new RepairPublicationError('publication_invalid_request');
+  try { await assertPublicRepositoryAuthority(database, authority.workspaceId, authority.githubRepositoryId); }
+  catch (error) { if (error instanceof RepositoryPolicyError) throw new RepairPublicationError(error.code); throw error; }
   const clock = options.clock ?? (() => new Date()); const randomId = options.randomId ?? randomUUID;
   const [intent] = await database.select().from(repairIntent).where(and(eq(repairIntent.repairRunId, authority.repairRunId), eq(repairIntent.workspaceId, context.workspace.id))).limit(1);
   if (!intent) throw new RepairPublicationError('publication_authority_mismatch');

@@ -59,7 +59,7 @@ async function seedVerifiedReview(
   await context.database.insert(account).values({ id: randomUUID(), issuer: 'local:oauth:github', accountId: '1001', providerId: 'github', userId });
   await context.database.insert(workspace).values({ id: workspaceId, ownerUserId: userId });
   await context.database.insert(githubInstallation).values({ installationId: INSTALLATION_ID, workspaceId, githubAccountId: 1001, accountLogin: 'reviewer', accountType: 'User', status: 'active' });
-  await context.database.insert(repository).values({ githubRepositoryId: REPOSITORY_ID, workspaceId, installationId: INSTALLATION_ID, ownerId: 1001, ownerLogin: 'reviewer', name: 'repo', fullName: 'reviewer/repo', defaultBranch: 'main', isPrivate: true });
+  await context.database.insert(repository).values({ githubRepositoryId: REPOSITORY_ID, workspaceId, installationId: INSTALLATION_ID, ownerId: 1001, ownerLogin: 'reviewer', name: 'repo', fullName: 'reviewer/repo', defaultBranch: 'main', isPrivate: false });
   const profileIdentity = computeExecutionProfileIdentity({ baseCommitSha: COMMIT, build: { script: 'build', tool: 'npm' }, githubRepositoryId: REPOSITORY_ID, install: { operation: 'ci', tool: 'npm' }, installationId: INSTALLATION_ID, lockfileType: 'package-lock', nodeMajor: 24, packageJsonBlobSha: 'd'.repeat(40), packageJsonContentSha256: 'e'.repeat(64), packageLockBlobSha: 'f'.repeat(40), packageLockContentSha256: '1'.repeat(64), packageManager: 'npm', profileVersion: 2, runtimeFamily: 'node', test: { script: 'test', tool: 'npm' }, testRunner: 'vitest', typecheck: { script: 'typecheck', tool: 'npm' }, workspaceId });
   const profile = { githubRepositoryId: REPOSITORY_ID, workspaceId, installationId: INSTALLATION_ID, profileVersion: 2, profileIdentity, baseCommitSha: COMMIT, runtimeFamily: 'node', nodeMajor: 24, packageManager: 'npm', lockfileType: 'package-lock', installOperation: 'ci', typecheckScript: 'typecheck', buildScript: 'build', testScript: 'test', testRunner: 'vitest', packageJsonBlobSha: 'd'.repeat(40), packageJsonContentSha256: 'e'.repeat(64), packageLockBlobSha: 'f'.repeat(40), packageLockContentSha256: '1'.repeat(64), status: 'ready' } as const;
   await context.database.insert(executionProfile).values(profile);
@@ -120,6 +120,7 @@ class FakePublicationGateway implements RepairPublicationGateway {
   substitutePr = false;
   conflictingPr = false;
   failRevocation = false;
+  tokenRepositoryPrivate = false;
   revoked = false;
   beforeBranchRead: (() => Promise<void>) | null = null;
   beforePullRequestList: (() => Promise<void>) | null = null;
@@ -128,9 +129,9 @@ class FakePublicationGateway implements RepairPublicationGateway {
 
   constructor(private readonly row: PublicationRow, private readonly prepared: PreparedGitPublication) {}
   async getInstallation() { this.calls.push('installation'); return { id: INSTALLATION_ID, appId: 1, appSlug: 'vigilo', suspendedAt: null, permissions: { contents: 'write', metadata: 'read', pull_requests: 'write' } }; }
-  async createPublicationAccessToken() { this.calls.push('token'); return { accessToken: 'test-token', expiresAt: new Date(NOW.getTime() + 30_000), repository: { id: REPOSITORY_ID, ownerLogin: 'reviewer', name: 'repo', fullName: 'reviewer/repo', defaultBranch: 'main', isPrivate: true } }; }
+  async createPublicationAccessToken() { this.calls.push('token'); return { accessToken: 'test-token', expiresAt: new Date(NOW.getTime() + 30_000), repository: { id: REPOSITORY_ID, ownerLogin: 'reviewer', name: 'repo', fullName: 'reviewer/repo', defaultBranch: 'main', isPrivate: this.tokenRepositoryPrivate } }; }
   async revokeInstallationAccessToken() { this.calls.push('revoke'); this.revoked = true; if (this.failRevocation) throw new Error('revocation_failed'); }
-  async getRepositoryMetadata() { return { id: REPOSITORY_ID, ownerLogin: 'reviewer', name: 'repo', fullName: 'reviewer/repo', defaultBranch: 'main', isPrivate: true }; }
+  async getRepositoryMetadata() { return { id: REPOSITORY_ID, ownerLogin: 'reviewer', name: 'repo', fullName: 'reviewer/repo', defaultBranch: 'main', isPrivate: false }; }
   async resolveBranchCommit() { this.defaultBranchReads += 1; return this.defaultBranchReads >= this.advanceDefaultAt ? '9'.repeat(40) : COMMIT; }
   async getBranchCommit() {
     const beforeRead = this.beforeBranchRead; this.beforeBranchRead = null;
@@ -410,6 +411,36 @@ test('normal rejection is immutable while unmeasured and failed verification sub
   const unmeasuredContext = await createTestContext(); t.after(() => unmeasuredContext.client.close()); const unmeasured = await seedVerifiedReview(unmeasuredContext, { loopState: 'review_required' });
   const review = await getHumanReview(unmeasuredContext.database, unmeasured.owner, unmeasured.runId);
   assert.equal(review.status, 'ineligible'); assert.equal(review.ineligibleReason, 'objective_not_measured');
+});
+
+test('human review and publication fail closed when the selected repository becomes private', async (t) => {
+  const reviewContext = await createTestContext(); t.after(() => reviewContext.client.close());
+  const reviewSeed = await seedVerifiedReview(reviewContext);
+  await reviewContext.database.update(repository).set({ isPrivate: true }).where(eq(repository.githubRepositoryId, REPOSITORY_ID));
+  const review = await getHumanReview(reviewContext.database, reviewSeed.owner, reviewSeed.runId);
+  assert.equal(review.status, 'ineligible');
+  assert.equal(review.ineligibleReason, 'private_repository_not_supported');
+  assert.equal(review.subject, null);
+  await assert.rejects(
+    createHumanReviewDecision(reviewContext.database, reviewSeed.owner, reviewSeed.runId, {
+      decision: 'approved', reviewSubjectIdentity: '9'.repeat(64), idempotencyKey: randomUUID(),
+    }),
+    (error: unknown) => error instanceof HumanReviewError && error.code === 'private_repository_not_supported',
+  );
+
+  const publicationContext = await createTestContext(); t.after(() => publicationContext.client.close());
+  const publicationSeed = await approvedPublication(publicationContext);
+  const gateway = new FakePublicationGateway(publicationSeed.row, publicationSeed.prepared);
+  gateway.tokenRepositoryPrivate = true;
+  const result = await processRepairPublicationJobForTest(
+    { id: publicationSeed.publication.id, data: { version: 1, publicationId: publicationSeed.publication.id } } as never,
+    { database: publicationContext.database, configuration: { appId: 1, clientId: 'client', appSlug: 'vigilo', baseUrl: 'https://github.com' }, gateway, logger: { write() {} }, clock: () => NOW },
+    async () => publicationSeed.authority,
+  );
+  assert.equal(result.status, 'completed');
+  assert.deepEqual(gateway.calls, ['installation', 'token', 'revoke']);
+  const [stored] = await publicationContext.database.select().from(repairPublication).where(eq(repairPublication.id, publicationSeed.publication.id));
+  assert.deepEqual({ state: stored?.state, code: stored?.failureCode }, { state: 'failed', code: 'private_repository_not_supported' });
 });
 
 test('candidate, objective-evidence, active-conflict, and missing-loop eligibility failures fail closed', async (t) => {

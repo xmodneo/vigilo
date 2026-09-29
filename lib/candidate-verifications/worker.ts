@@ -14,6 +14,7 @@ import type { VigiloDatabase } from '../db/types.ts';
 import { DurableExternalExecutionAuthorizer } from '../external-execution/authority.ts';
 import type { ExternalExecutionAuthorizer } from '../external-execution/types.ts';
 import type { GitHubAppConfiguration } from '../github-app/types.ts';
+import { assertPublicRepositoryAuthority } from '../github-repositories/policy.ts';
 import type { WorkerLogger } from '../repair-runs/worker.ts';
 import {
   parseCandidateVerificationJobPayload,
@@ -233,6 +234,8 @@ export async function processCandidateVerificationJob(job: RepairQueueJob, depen
   }
   if (claim.kind !== 'attempt') return { id: job.id, status: 'failed', output: { code: 'verification_claim_failed' } };
   const { attempt, verification } = claim;
+  try { await assertPublicRepositoryAuthority(dependencies.database, verification.workspaceId, verification.githubRepositoryId); }
+  catch { return { id: job.id, status: 'deadletter', output: { code: 'private_repository_not_supported' } }; }
   if (claim.recovered && attempt.sandboxName) {
     const cleanup = await (dependencies.recover ?? recoverSandbox)(
       { name: attempt.sandboxName, sessionId: attempt.sandboxSessionId },

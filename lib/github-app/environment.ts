@@ -9,6 +9,10 @@ export interface GitHubAppEnvironment extends GitHubApiConfiguration {
   privateKeyPath: string;
 }
 
+export interface GitHubWorkerEnvironment extends GitHubApiConfiguration {
+  privateKeyPath: string;
+}
+
 function required(environment: NodeJS.ProcessEnv, name: string): string {
   const value = environment[name]?.trim();
   if (!value || /[\u0000\r\n]/.test(value)) {
@@ -51,6 +55,30 @@ export function readGitHubAppEnvironment(
       clientId: required(environment, 'GITHUB_APP_CLIENT_ID'),
       clientSecret: required(environment, 'GITHUB_APP_CLIENT_SECRET'),
       privateKeyPath: required(environment, 'GITHUB_APP_PRIVATE_KEY_PATH'),
+    };
+  } catch {
+    throw new Error('invalid_github_app_configuration');
+  }
+}
+
+export function readGitHubWorkerEnvironment(
+  environment: NodeJS.ProcessEnv = process.env,
+): GitHubWorkerEnvironment {
+  try {
+    const appIdText = required(environment, 'GITHUB_APP_ID');
+    if (!/^[1-9][0-9]{0,18}$/.test(appIdText)) throw new Error();
+    const appId = Number(appIdText);
+    const appSlug = required(environment, 'GITHUB_APP_SLUG');
+    if (!Number.isSafeInteger(appId) || !/^[a-z0-9](?:[a-z0-9-]{0,98}[a-z0-9])?$/.test(appSlug)) throw new Error();
+    return {
+      appId,
+      appSlug,
+      clientId: required(environment, 'GITHUB_APP_CLIENT_ID'),
+      privateKeyPath: required(environment, 'GITHUB_APP_PRIVATE_KEY_PATH'),
+      // Worker code uses only GitHub App JWT/installation operations. Keeping
+      // OAuth-only fields inert avoids granting the worker OAuth credentials.
+      baseUrl: 'https://worker.invalid',
+      clientSecret: '',
     };
   } catch {
     throw new Error('invalid_github_app_configuration');

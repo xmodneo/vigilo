@@ -4,6 +4,7 @@ import { createHash } from 'node:crypto';
 import { commandEvidence, fixtureExecutor, ROOT, ExecutionFailure } from '../../src/fixture-execution.ts';
 import { ExecutionCancelled, requireNode24, SandboxBoundary, type SandboxLifecycleObserver } from '../../src/sandbox-boundary.ts';
 import { ExternalExecutionAuthorityError, ZERO_EXTERNAL_EXECUTION_AUTHORITY, type ExternalExecutionAuthorizer, type ExternalExecutionScope } from '../external-execution/types.ts';
+import { assertPublicRepository, RepositoryPolicyError } from '../github-repositories/policy.ts';
 import { ARCHIVE_LIMITS, SAFE_ARCHIVE_EXTRACTION_SCRIPT } from './archive.ts';
 import { BASELINE_EVIDENCE_VERSION, type BaselineEvidence, type BaselineOutcome, type FrozenBaselineInput } from './types.ts';
 
@@ -115,6 +116,7 @@ function safeError(error: unknown): { phase: string; code: string; outcome: Base
   }
   if (error instanceof DOMException && error.name === 'TimeoutError') return { phase: 'execution', code: 'overall_timeout', outcome: 'timed_out' };
   if (error instanceof ExternalExecutionAuthorityError) return { phase: 'execution', code: error.code, outcome: 'infrastructure_failed' };
+  if (error instanceof RepositoryPolicyError) return { phase: 'execution', code: error.code, outcome: 'infrastructure_failed' };
   return { phase: 'execution', code: error instanceof APIError ? `provider_http_${error.response.status}` : 'operation_failed', outcome: 'infrastructure_failed' };
 }
 
@@ -159,6 +161,7 @@ export async function runFrozenRepositoryBaseline(
   };
   let phase = 'sandbox';
   try {
+    assertPublicRepository(input.repository);
     await boundary.run(async (sandbox, signal) => {
       const execution = fixtureExecutor(sandbox, boundary, signal);
       phase = 'runtime';

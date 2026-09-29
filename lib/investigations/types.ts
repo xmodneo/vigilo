@@ -12,7 +12,7 @@ export interface GitTreeEntry {
 export interface InvestigationSourceGateway {
   createInstallationAccessToken(input: { installationId: number; repositoryId: number }): Promise<{
     accessToken: string;
-    repository: { id: number; name: string; ownerLogin: string };
+    repository: { id: number; isPrivate: boolean; name: string; ownerLogin: string };
   }>;
   getCommitTree(input: { accessToken: string; owner: string; repository: string; commitSha: string }): Promise<{ commitSha: string; treeSha: string }>;
   getTree(input: { accessToken: string; owner: string; repository: string; treeSha: string }): Promise<{ entries: GitTreeEntry[]; truncated: boolean }>;

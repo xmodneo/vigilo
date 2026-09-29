@@ -16,6 +16,7 @@ import {
 } from '../../db/schema.ts';
 import type { AuthenticatedWorkspace } from '../auth/protected-context.ts';
 import type { VigiloDatabase } from '../db/types.ts';
+import { RepositoryPolicyError, assertPublicRepositoryAuthority } from '../github-repositories/policy.ts';
 import { AI_MODEL_ID, AI_PROVIDER_ID } from '../ai-investigations/types.ts';
 import { REPAIR_LOOP_AI_CANDIDATE_GENERATION_PROTOCOL_VERSION } from '../ai-candidate-generations/types.ts';
 import {
@@ -32,7 +33,7 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-
 export interface RepairLoopQueues extends TransactionalAiCandidateGenerationQueue, TransactionalRepairLoopQueue {}
 
 export class RepairLoopFlowError extends Error {
-  constructor(public readonly code: 'repair_loop_not_eligible' | 'repair_loop_not_found' | 'repair_loop_handoff_failed') {
+  constructor(public readonly code: 'repair_loop_not_eligible' | 'repair_loop_not_found' | 'repair_loop_handoff_failed' | 'private_repository_not_supported') {
     super(code);
     this.name = 'RepairLoopFlowError';
   }
@@ -81,6 +82,8 @@ export async function startRepairLoop(
     created = await database.transaction(async (transaction) => {
       const [run] = await transaction.select().from(repairRun).where(and(eq(repairRun.id, repairRunId), eq(repairRun.workspaceId, context.workspace.id))).for('update').limit(1);
       if (!run) throw new RepairLoopFlowError('repair_loop_not_eligible');
+      try { await assertPublicRepositoryAuthority(transaction, run.workspaceId, run.githubRepositoryId); }
+      catch (error) { if (error instanceof RepositoryPolicyError) throw new RepairLoopFlowError(error.code); throw error; }
       const [existing] = await transaction.select().from(repairLoop).where(eq(repairLoop.repairRunId, run.id)).limit(1);
       if (existing) return existing;
       if (run.state !== 'ready_for_investigation' || !run.baselineId) throw new RepairLoopFlowError('repair_loop_not_eligible');

@@ -10,6 +10,7 @@ import { parseAiInvestigationJobPayload, REPAIR_JOB_MAX_ATTEMPTS, type RepairQue
 import { AiAgentError, runAiInvestigation, type AiAgentErrorCode, type AiAgentExecution } from './runner.ts';
 import { ModelProviderError, type InvestigationModelProvider } from './types.ts';
 import { ExternalExecutionAuthorityError } from '../external-execution/types.ts';
+import { assertPublicRepositoryAuthority, RepositoryPolicyError } from '../github-repositories/policy.ts';
 
 const LEASE_MS = 4 * 60_000;
 const HEARTBEAT_MS = 30_000;
@@ -17,6 +18,7 @@ type Attempt = typeof aiInvestigationAttempt.$inferSelect;
 type Row = typeof aiInvestigation.$inferSelect;
 type JobResult = { id: string; status: 'completed' | 'failed' | 'deadletter'; output?: { code: string } };
 const NON_RETRYABLE_FAILURES = new Set<AiAgentErrorCode>([
+  'private_repository_not_supported',
   'ai_authority_mismatch',
   'ai_investigation_ownership_lost',
   'fabricated_evidence_reference',
@@ -140,13 +142,14 @@ export async function processAiInvestigationJob(job: RepairQueueJob, dependencie
   job.signal?.addEventListener('abort', abort, { once: true }); dependencies.shutdownSignal?.addEventListener('abort', abort, { once: true });
   const interval = setInterval(() => { void heartbeat(dependencies.database, attempt, clock()).then((owned) => { if (!owned) controller.abort(); }).catch(() => controller.abort()); }, HEARTBEAT_MS);
   try {
+    await assertPublicRepositoryAuthority(dependencies.database, row.workspaceId, row.githubRepositoryId);
     const provider = dependencies.createProvider();
     if (provider.providerId !== row.providerId || provider.modelId !== row.modelId) throw new AiAgentError('model_provider_mismatch');
     const execution = await (dependencies.executor ?? runAiInvestigation)(dependencies.database, dependencies.gateway, dependencies.configuration, provider, { aiInvestigationId: row.id, aiInvestigationAttemptId: attempt.id, ownershipToken: attempt.ownershipToken, investigationId: row.investigationId, workspaceId: row.workspaceId, baseCommitSha: row.baseCommitSha, profileIdentity: row.profileIdentity, baselineId: row.baselineId }, { signal: controller.signal, randomId });
     await dependencies.afterExecution?.();
     return await complete(dependencies.database, row, attempt, execution, clock(), randomId) ? { id: job.id, status: 'completed' } : { id: job.id, status: 'failed', output: { code: 'ai_investigation_ownership_lost' } };
   } catch (error) {
-    const code: AiAgentErrorCode = error instanceof AiAgentError ? error.code : error instanceof ModelProviderError ? error.code : error instanceof ExternalExecutionAuthorityError ? error.code : controller.signal.aborted ? 'model_timeout' : 'model_provider_failed';
+    const code: AiAgentErrorCode = error instanceof RepositoryPolicyError ? 'private_repository_not_supported' : error instanceof AiAgentError ? error.code : error instanceof ModelProviderError ? error.code : error instanceof ExternalExecutionAuthorityError ? error.code : controller.signal.aborted ? 'model_timeout' : 'model_provider_failed';
     const normalized = error instanceof ModelProviderError ? new AiAgentError(error.code, error.retryAfterMs) : error;
     const outcome = await failAttempt(dependencies.database, row, attempt, code, retryableFailure(normalized, code), clock(), randomId);
     if (outcome === 'failed') return { id: job.id, status: 'completed' };

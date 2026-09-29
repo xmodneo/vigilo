@@ -12,11 +12,12 @@ import { CandidatePolicyError } from '../repair-candidates/policy.ts';
 import { parseAiCandidateGenerationJobPayload, REPAIR_JOB_MAX_ATTEMPTS, type RepairQueueJob } from '../repair-runs/queue.ts';
 import { AiCandidateGenerationError, runAiCandidateGeneration, type AiCandidateGenerationErrorCode, type AiCandidateGenerationExecution } from './runner.ts';
 import { ExternalExecutionAuthorityError } from '../external-execution/types.ts';
+import { assertPublicRepositoryAuthority, RepositoryPolicyError } from '../github-repositories/policy.ts';
 
 const LEASE_MS = 4 * 60_000; const HEARTBEAT_MS = 30_000;
 type Row = typeof aiCandidateGeneration.$inferSelect; type Attempt = typeof aiCandidateGenerationAttempt.$inferSelect;
 type JobResult = { id: string; status: 'completed' | 'failed' | 'deadletter'; output?: { code: string } };
-const NON_RETRYABLE = new Set<AiCandidateGenerationErrorCode>(['candidate_generation_authority_mismatch', 'candidate_generation_ownership_lost', 'invalid_model_proposal', 'schema_mismatch', 'invalid_operation_shape', 'invalid_path', 'proposal_limit_exceeded', 'fresh_observation_missing', 'model_limit_exceeded', 'model_protocol_error', 'model_provider_mismatch', 'provider_configuration_failed', 'provider_quota_exhausted', 'unread_existing_file', 'context_source_unavailable', 'execution_authority_missing', 'execution_authority_expired', 'execution_budget_exhausted', 'execution_authority_mismatch', 'provider_attempt_ambiguous', 'sandbox_cleanup_unresolved']);
+const NON_RETRYABLE = new Set<AiCandidateGenerationErrorCode>(['private_repository_not_supported', 'candidate_generation_authority_mismatch', 'candidate_generation_ownership_lost', 'invalid_model_proposal', 'schema_mismatch', 'invalid_operation_shape', 'invalid_path', 'proposal_limit_exceeded', 'fresh_observation_missing', 'model_limit_exceeded', 'model_protocol_error', 'model_provider_mismatch', 'provider_configuration_failed', 'provider_quota_exhausted', 'unread_existing_file', 'context_source_unavailable', 'execution_authority_missing', 'execution_authority_expired', 'execution_budget_exhausted', 'execution_authority_mismatch', 'provider_attempt_ambiguous', 'sandbox_cleanup_unresolved']);
 
 function candidatePolicyFailureCode(code: string | null): AiCandidateGenerationErrorCode {
   if (['invalid_path', 'denied_path', 'package_manifest_change_not_allowed', 'unsupported_file_type'].includes(String(code))) return 'invalid_path';
@@ -131,6 +132,7 @@ export async function processAiCandidateGenerationJob(job: RepairQueueJob, depen
   const { row, attempt } = claimed; const controller = new AbortController(); const abort = () => controller.abort(); job.signal?.addEventListener('abort', abort, { once: true }); dependencies.shutdownSignal?.addEventListener('abort', abort, { once: true });
   const interval = setInterval(() => { void heartbeat(dependencies.database, attempt, clock()).then((owned) => { if (!owned) controller.abort(); }).catch(() => controller.abort()); }, HEARTBEAT_MS);
   try {
+    await assertPublicRepositoryAuthority(dependencies.database, row.workspaceId, row.githubRepositoryId);
     const [persisted] = await dependencies.database.select().from(repairCandidate).where(and(eq(repairCandidate.investigationId, row.investigationId), eq(repairCandidate.proposalKey, row.id))).limit(1);
     if (persisted?.state === 'frozen') return await complete(dependencies.database, row, attempt, persisted.id, { inputTokens: row.inputTokens, outputTokens: row.outputTokens, toolCallCount: row.toolCallCount, modelTurnCount: row.modelTurnCount }, clock(), randomId) ? { id: job.id, status: 'completed' } : { id: job.id, status: 'failed', output: { code: 'candidate_generation_ownership_lost' } };
     if (persisted?.state === 'rejected') {
@@ -146,7 +148,7 @@ export async function processAiCandidateGenerationJob(job: RepairQueueJob, depen
     await dependencies.afterCandidateFrozen?.();
     return await complete(dependencies.database, row, attempt, candidate.id, execution.usage, clock(), randomId) ? { id: job.id, status: 'completed' } : { id: job.id, status: 'failed', output: { code: 'candidate_generation_ownership_lost' } };
   } catch (error) {
-    const code: AiCandidateGenerationErrorCode = error instanceof AiCandidateGenerationError ? error.code : error instanceof ModelProviderError ? error.code : error instanceof ExternalExecutionAuthorityError ? error.code : error instanceof CandidatePolicyError ? candidatePolicyFailureCode(error.code) : error instanceof RepairCandidateError ? repairCandidateFailureCode(error) : controller.signal.aborted ? 'model_timeout' : 'model_provider_failed';
+    const code: AiCandidateGenerationErrorCode = error instanceof RepositoryPolicyError ? 'private_repository_not_supported' : error instanceof AiCandidateGenerationError ? error.code : error instanceof ModelProviderError ? error.code : error instanceof ExternalExecutionAuthorityError ? error.code : error instanceof CandidatePolicyError ? candidatePolicyFailureCode(error.code) : error instanceof RepairCandidateError ? repairCandidateFailureCode(error) : controller.signal.aborted ? 'model_timeout' : 'model_provider_failed';
     const retryable = !NON_RETRYABLE.has(code) && (code !== 'provider_rate_limited' || (error instanceof AiCandidateGenerationError && error.retryAfterMs !== null && error.retryAfterMs >= 1_000 && error.retryAfterMs <= 60_000));
     const outcome = await fail(dependencies.database, row, attempt, code, retryable, clock(), randomId);
     if (outcome === 'failed') return { id: job.id, status: 'completed' };
