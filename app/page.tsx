@@ -25,33 +25,47 @@ export default function Home() {
           <span>Vigilo</span>
         </a>
         <div className="site-actions">
-          <span className="release-label">Development preview</span>
+          <span className="release-label">Controlled beta</span>
           <a className="header-action" href="/sign-in">Sign in with GitHub</a>
         </div>
       </header>
 
       <section className="hero" aria-labelledby="hero-title">
         <div className="hero-copy">
-          <p className="eyebrow">Autonomous software maintenance</p>
-          <h1 id="hero-title">Repairs built inside a boundary you can trust.</h1>
+          <p className="eyebrow">Evidence-backed repair workflow</p>
+          <h1 id="hero-title">A repair garage for AI builders.</h1>
           <p className="hero-summary">
-            Vigilo is a sandbox-first software maintenance platform. It prepares
-            focused repairs and has them independently verified before publication.
+            Vigilo diagnoses a reproducible problem, prepares an exact repair candidate,
+            checks it in a fresh verification environment, and presents the evidence for human review.
           </p>
+          <p><strong>Controlled beta limitations apply.</strong></p>
         </div>
 
         <aside className="status-panel" aria-labelledby="status-title">
-          <p className="status-kicker">Current status</p>
-          <h2 id="status-title">Milestone 1 complete</h2>
+          <p className="status-kicker">Release scope</p>
+          <h2 id="status-title">Public Node.js repositories</h2>
           <p>
-            The isolated repair and fresh-verification boundary is proven against
-            a deterministic fixture.
+            The controlled beta supports eligible public, single-package Node.js 24/npm repositories.
+            Repairs may be inconclusive, fail verification, or require reconciliation.
           </p>
           <div className="next-step">
             <span className="status-dot" aria-hidden="true" />
-            <span>Repository selection available; execution setup comes next</span>
+            <span>No automatic merge or deployment; draft publication remains unavailable pending independent live acceptance</span>
           </div>
         </aside>
+      </section>
+
+      <section className="safeguards" aria-labelledby="first-run-title">
+        <div className="section-heading">
+          <p className="eyebrow">How it works</p>
+          <h2 id="first-run-title">From reproducible problem to reviewed evidence</h2>
+        </div>
+        <ol className="first-run-list">
+          <li>Connect GitHub.</li><li>Choose an eligible public repository.</li>
+          <li>Describe the problem and start an authorized repair.</li><li>Vigilo measures the frozen baseline and diagnoses the problem.</li>
+          <li>Vigilo prepares an exact candidate.</li><li>A fresh verifier checks that candidate.</li>
+          <li>Review the diagnosis, changed files, and measured evidence.</li><li>Separately publish a draft PR only when publication authority is available.</li>
+        </ol>
       </section>
 
       <section className="safeguards" aria-labelledby="safeguards-title">
@@ -74,7 +88,7 @@ export default function Home() {
 
       <footer>
         <span>Vigilo</span>
-        <span>Human approval remains the final gate.</span>
+        <span>Human approval is required and never merges or deploys code.</span>
       </footer>
     </main>
   );

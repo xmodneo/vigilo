@@ -182,5 +182,5 @@ test('provider dependency and development privacy decision are explicit', () => 
   assert.equal(packageJson.dependencies['@google/genai'], '2.22.0'); assert.equal(packageJson.dependencies.openai, undefined);
   assert.match(readme, /gemini-3\.1-flash-lite[\s\S]*development[\s\S]*live acceptance/i);
   assert.match(readme, /not[\s\S]*final production model/i);
-  assert.match(readme, /Free Tier[\s\S]*public Vigilo/); assert.match(readme, /may\s+be used to improve Google products/); assert.match(readme, /not approved[\s\S]*private customer/);
+  assert.match(readme, /Free\s+Tier[\s\S]*public Vigilo/); assert.match(readme, /may\s+be used to\s+improve Google products/); assert.match(readme, /not approved[\s\S]*private customer/);
 });

@@ -24,6 +24,20 @@ export interface HumanReviewDecisionResult {
 }
 
 export interface HumanReviewSubject {
+  assessment?: {
+    summary: string;
+    proposedApproach: string;
+    confidence: 'low' | 'medium' | 'high';
+  } | null;
+  baseline?: {
+    outcome: string;
+    phases: {
+      install: { status: string; exitCode: number | null; timedOut: boolean };
+      typecheck: { status: string | null; exitCode: number | null; timedOut: boolean | null };
+      build: { status: string | null; exitCode: number | null; timedOut: boolean | null };
+      test: { status: string; exitCode: number | null; timedOut: boolean };
+    };
+  };
   authority: {
     workspaceId: string;
     repairRunId: string;

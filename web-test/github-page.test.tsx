@@ -6,9 +6,12 @@ import { renderToStaticMarkup } from 'react-dom/server';
 import { GitHubConnectionView } from '../app/app/github/github-connection-view.js';
 import { RepairRunStatus } from '../app/app/github/repair-run-status.js';
 import { AiInvestigationStatus } from '../app/app/github/ai-investigation-status.js';
+import { CandidateVerificationStatus } from '../app/app/github/candidate-verification-status.js';
+import { RepairCandidateStatus } from '../app/app/github/repair-candidate-status.js';
 import { RepairLoopStatus } from '../app/app/github/repair-loop-status.js';
 import { HumanReviewStatus } from '../app/app/github/human-review-status.js';
 import { publicationAcceptanceLabel, publicationGateOpen, RepairPublicationStatus } from '../app/app/github/repair-publication-status.js';
+import { createPollingLifetime, durablePollingMessage, terminalTransitionNeedsRefresh } from '../app/app/github/durable-polling.js';
 
 test('GitHub connection page renders the disconnected installation action', () => {
   const html = renderToStaticMarkup(
@@ -19,7 +22,7 @@ test('GitHub connection page renders the disconnected installation action', () =
   assert.match(html, /Not connected/);
   assert.match(html, /action="\/api\/github\/installations"/);
   assert.match(html, /method="post"/);
-  assert.match(html, /Repository selection follows installation/);
+  assert.match(html, /Public repositories only/);
 });
 
 test('GitHub connection page renders only stable connected installation facts', () => {
@@ -50,8 +53,45 @@ test('GitHub connection page renders only stable connected installation facts', 
   assert.match(html, /active/);
   assert.match(html, /Select a repository/);
   assert.match(html, /octo-org\/private-app/);
-  assert.match(html, /name="repositoryId" value="8101"/);
+  assert.match(html, /Private — not supported in this beta/);
+  assert.doesNotMatch(html, /name="repositoryId" value="8101"|Select octo-org\/private-app/);
   assert.doesNotMatch(html, /access[_ -]?token|private[_ -]?key|client[_ -]?secret/i);
+});
+
+test('a stale selected private repository hides source, authority, and workflow actions', () => {
+  const html = renderToStaticMarkup(
+    <GitHubConnectionView
+      executionAvailability="available"
+      executionProfile={{
+        baseRevision: 'a'.repeat(40), build: null, install: { operation: 'ci', tool: 'npm' }, nodeMajor: 24,
+        packageManager: 'npm', profileIdentity: 'b'.repeat(64), profileVersion: 2, runtimeFamily: 'node', status: 'ready',
+        test: { script: 'test', tool: 'npm' }, testRunner: 'node-test', typecheck: null,
+      }}
+      installation={{ accountLogin: 'octo-org', accountType: 'Organization', installationId: 7001, status: 'active' }}
+      selectedRepository={{ defaultBranch: 'main', fullName: 'octo-org/private-app', id: 8101, isPrivate: true }}
+      repairRequestId="11111111-1111-4111-8111-111111111111"
+      workspaceId="workspace-1"
+    />,
+  );
+
+  assert.match(html, /Private — not supported in this beta/);
+  assert.match(html, /will not inspect source, reserve execution authority, or start repair work/);
+  assert.match(html, /Refresh access/);
+  assert.doesNotMatch(html, /api\/(?:repair-runs|ai-investigations|ai-candidate-generations|candidate-verifications|repair-loops)|Check eligibility|Start repair/);
+});
+
+test('workflow loading failure is distinct from repository access and withholds actions', () => {
+  const html = renderToStaticMarkup(<GitHubConnectionView
+    executionAvailability="available"
+    installation={{ accountLogin: 'octo-org', accountType: 'Organization', installationId: 7001, status: 'active' }}
+    selectedRepository={{ defaultBranch: 'main', fullName: 'octo-org/public-app', id: 8101, isPrivate: false }}
+    workflowError="unavailable"
+    repairRequestId="11111111-1111-4111-8111-111111111111"
+    workspaceId="workspace-1"
+  />);
+  assert.match(html, /Repair history could not be loaded safely/);
+  assert.doesNotMatch(html, /Repository access could not be verified/);
+  assert.doesNotMatch(html, /Check eligibility|Start repair|api\/repair-runs|api\/ai-investigations|api\/candidate-verifications/);
 });
 
 test('connected installation requires temporary GitHub App authorization before listing', () => {
@@ -96,10 +136,10 @@ test('GitHub connection page shows selected repository and unconfigured executio
   assert.match(html, /Connected repository/);
   assert.match(html, /xmodneo\/vigilo/);
   assert.match(html, /Execution profile/);
-  assert.match(html, /Not configured yet/);
-  assert.match(html, /Detect execution profile/);
+  assert.match(html, /Eligibility not checked/);
+  assert.match(html, /Check eligibility/);
   assert.match(html, /action="\/api\/github\/repositories\/profile"/);
-  assert.match(html, /Refresh repository access/);
+  assert.match(html, /Refresh access/);
 });
 
 test('selected repository renders a Ready allowlisted execution profile', () => {
@@ -123,6 +163,7 @@ test('selected repository renders a Ready allowlisted execution profile', () => 
         baseRevision: 'a'.repeat(40), build: 'completed', cleanup: 'confirmed', install: 'completed',
         networkIsolation: 'confirmed', outcome: 'baseline_passed', test: 'completed', typecheck: 'completed',
       }}
+      executionAvailability="available"
       installation={{
         accountLogin: 'xmodneo',
         accountType: 'User',
@@ -150,11 +191,11 @@ test('selected repository renders a Ready allowlisted execution profile', () => 
   assert.match(html, /Start repair/);
   assert.match(html, /action="\/api\/repair-runs"/);
   assert.match(html, /Execution evidence/);
-  assert.match(html, /baseline_passed/);
-  assert.match(html, /Network isolation.*confirmed/);
-  assert.match(html, /Cleanup.*confirmed/);
+  assert.match(html, /Outcome.*Passed/);
+  assert.match(html, /Network isolation.*Confirmed/);
+  assert.match(html, /Cleanup.*Confirmed/);
   assert.match(html, /aaaaaaaaaaaa/);
-  assert.doesNotMatch(html, /node --test|ghs_|package-lock.*content/i);
+  assert.doesNotMatch(html, /node --test|ghs_|package-lock\.json could not be validated/i);
 });
 
 test('unsupported profile renders only its safe classification reason', () => {
@@ -184,7 +225,7 @@ test('unsupported profile renders only its safe classification reason', () => {
   );
   assert.match(html, /Unsupported/);
   assert.match(html, /Competing package-manager lockfiles were found/);
-  assert.match(html, /Recompute execution profile/);
+  assert.match(html, /Check eligibility again/);
 });
 
 test('repository page renders durable Repair Run state without exposing authority controls', () => {
@@ -206,7 +247,7 @@ test('repository page renders durable Repair Run state without exposing authorit
       workspaceId="workspace-1"
     />,
   );
-  assert.match(html, /Repair Run/); assert.match(html, /aaaaaaaaaaaa/); assert.match(html, /Baseline.*Passed/); assert.match(html, /ready for investigation/);
+  assert.match(html, /Repair Run/); assert.match(html, /aaaaaaaaaaaa/); assert.match(html, /Baseline.*Passed/); assert.match(html, /Ready for investigation/);
   assert.doesNotMatch(html, /name="(?:state|commit|profile|repository|workspace)/);
 });
 
@@ -216,8 +257,12 @@ test('active Repair Run renders honest worker-owned progress and queued cancella
     baseline: null, failure: null, createdAt: '2026-09-09T00:00:00.000Z', completedAt: null, stateChangedAt: '2026-09-09T00:00:00.000Z',
   } as const;
   const queued = renderToStaticMarkup(<RepairRunStatus initialRun={{ ...common, state: 'created', baselineStartedAt: null }} />);
-  assert.match(queued, /Waiting for worker/);
+  assert.match(queued, /Queued/);
   assert.match(queued, /Cancel queued run/);
+  assert.match(queued, /aria-busy="false"/);
+  assert.match(queued, /data-pending-label="Cancelling…"/);
+  assert.match(queued, /aria-live="polite"/);
+  assert.match(queued, /<section[^>]+aria-busy="true"/);
   assert.match(queued, /action="\/api\/repair-runs\/11111111-1111-4111-8111-111111111111\/cancel"/);
   assert.doesNotMatch(queued, /Start repair/);
 
@@ -227,21 +272,21 @@ test('active Repair Run renders honest worker-owned progress and queued cancella
 });
 
 test('ready investigation exposes only the bounded AI investigation start intent', () => {
-  const html = renderToStaticMarkup(<AiInvestigationStatus investigationId="11111111-1111-4111-8111-111111111111" initialAiInvestigation={null} startRequestId="44444444-4444-4444-8444-444444444444" initialAiCandidateGeneration={null} candidateGenerationRequestId="66666666-6666-4666-8666-666666666666" />);
+  const html = renderToStaticMarkup(<AiInvestigationStatus actionAvailable investigationId="11111111-1111-4111-8111-111111111111" initialAiInvestigation={null} startRequestId="44444444-4444-4444-8444-444444444444" initialAiCandidateGeneration={null} candidateGenerationRequestId="66666666-6666-4666-8666-666666666666" />);
   assert.match(html, /AI Investigation/); assert.match(html, /Start AI investigation/); assert.match(html, /action="\/api\/ai-investigations"/); assert.match(html, /name="investigationId"/); assert.match(html, /name="idempotencyKey" value="44444444-4444-4444-8444-444444444444"/);
   assert.doesNotMatch(html, /shell|write file|apply fix|create candidate|api key/i);
 });
 
 test('failed AI investigation offers a new execution while completed results do not', () => {
   const base = { id: '22222222-2222-4222-8222-222222222222', investigationId: '11111111-1111-4111-8111-111111111111', executionOrdinal: 1, revision: 'a'.repeat(40), provider: 'google', model: 'gemini-3.1-flash-lite', completionReason: null, conclusion: null, usage: { inputTokens: 0, outputTokens: 0, toolCallCount: 0, modelTurnCount: 0 } } as const;
-  const failed = renderToStaticMarkup(<AiInvestigationStatus investigationId={base.investigationId} initialAiInvestigation={{ ...base, state: 'failed', failureCode: 'provider_quota_exhausted' }} startRequestId="44444444-4444-4444-8444-444444444444" initialAiCandidateGeneration={null} candidateGenerationRequestId="66666666-6666-4666-8666-666666666666" />);
-  assert.match(failed, /Previous execution 1/); assert.match(failed, /Provider quota exhausted/); assert.match(failed, /Retry AI investigation/); assert.match(failed, /name="idempotencyKey"/);
+  const failed = renderToStaticMarkup(<AiInvestigationStatus actionAvailable investigationId={base.investigationId} initialAiInvestigation={{ ...base, state: 'failed', failureCode: 'provider_quota_exhausted' }} startRequestId="44444444-4444-4444-8444-444444444444" initialAiCandidateGeneration={null} candidateGenerationRequestId="66666666-6666-4666-8666-666666666666" />);
+  assert.match(failed, /Previous execution 1/); assert.match(failed, /provider quota is exhausted/i); assert.match(failed, /Retry AI investigation/); assert.match(failed, /name="idempotencyKey"/);
   const completed = renderToStaticMarkup(<AiInvestigationStatus investigationId={base.investigationId} initialAiInvestigation={{ ...base, state: 'completed', completionReason: 'budget_exhausted', conclusion: { status: 'insufficient_evidence', summary: 'Bounded.', suspectedFiles: [], evidence: [], proposedApproach: 'Review.', confidence: 'low' }, failureCode: null }} startRequestId="55555555-5555-4555-8555-555555555555" initialAiCandidateGeneration={null} candidateGenerationRequestId="66666666-6666-4666-8666-666666666666" />);
   assert.doesNotMatch(completed, /Retry AI investigation|Start AI investigation/);
 });
 
 test('completed AI investigation renders structured text and only the bounded candidate-generation intent', () => {
-  const html = renderToStaticMarkup(<AiInvestigationStatus investigationId="11111111-1111-4111-8111-111111111111" startRequestId="44444444-4444-4444-8444-444444444444" initialAiCandidateGeneration={null} candidateGenerationRequestId="66666666-6666-4666-8666-666666666666" initialAiInvestigation={{
+  const html = renderToStaticMarkup(<AiInvestigationStatus actionAvailable investigationId="11111111-1111-4111-8111-111111111111" startRequestId="44444444-4444-4444-8444-444444444444" initialAiCandidateGeneration={null} candidateGenerationRequestId="66666666-6666-4666-8666-666666666666" initialAiInvestigation={{
     id: '22222222-2222-4222-8222-222222222222', investigationId: '11111111-1111-4111-8111-111111111111', executionOrdinal: 1, state: 'completed', revision: 'a'.repeat(40), provider: 'google', model: 'gemini-3.1-flash-lite', completionReason: 'model_conclusion',
     conclusion: { status: 'diagnosis_found', summary: '<script>unsafe()</script>', suspectedFiles: [{ path: 'src/shipping.ts', reason: 'Threshold check.' }], evidence: [{ kind: 'file', reference: '33333333-3333-4333-8333-333333333333' }], proposedApproach: 'Review the comparison.', confidence: 'high' },
     usage: { inputTokens: 10, outputTokens: 5, toolCallCount: 1, modelTurnCount: 2 }, failureCode: null,
@@ -266,6 +311,8 @@ test('human review renders exact escaped artifacts, distinct gates, and only the
     repairRunId: '11111111-1111-4111-8111-111111111111', status: 'awaiting_decision', ineligibleReason: null,
     reviewSubjectIdentity: 'f'.repeat(64), liveAcceptanceStatus: 'pending', decision: null,
     subject: {
+      assessment: { summary: 'The threshold comparison is inconsistent.', proposedApproach: 'Use the documented inclusive boundary.', confidence: 'medium' },
+      baseline: { outcome: 'test_failed', phases: { install: { status: 'completed', exitCode: 0, timedOut: false }, typecheck: { status: 'completed', exitCode: 0, timedOut: false }, build: { status: 'completed', exitCode: 0, timedOut: false }, test: { status: 'failed', exitCode: 1, timedOut: false } } },
       authority: { workspaceId: 'workspace-1', repairRunId: '11111111-1111-4111-8111-111111111111', repairLoopId: '22222222-2222-4222-8222-222222222222', repairLoopIterationId: '33333333-3333-4333-8333-333333333333', aiCandidateGenerationId: '44444444-4444-4444-8444-444444444444', githubRepositoryId: 8101, installationId: 7001, baselineId: '55555555-5555-4555-8555-555555555555', baseCommitSha: 'a'.repeat(40), profileIdentity: 'b'.repeat(64) },
       candidate: { id: '66666666-6666-4666-8666-666666666666', identity: 'c'.repeat(64), files: [{ path: 'src/repaired.ts', operation: 'add', baseBlobSha: null, baseContentSha256: null, resultContentSha256: 'd'.repeat(64), resultByteLength: 34, resultingContent: '<script>unsafe()</script>\nfixed();\n' }] },
       verification: { id: '88888888-8888-4888-8888-888888888888', evidenceId: '99999999-9999-4999-8999-999999999999', state: 'completed', verificationContract: 'checks_passed', baselineComparison: 'previous_baseline_failure_resolved', executionOutcome: 'checks_passed', networkIsolation: 'confirmed', cleanup: 'confirmed', phases: { install: { status: 'completed', exitCode: 0, timedOut: false }, typecheck: { status: 'completed', exitCode: 0, timedOut: false }, build: { status: 'completed', exitCode: 0, timedOut: false }, test: { status: 'completed', exitCode: 0, timedOut: false } } },
@@ -274,7 +321,11 @@ test('human review renders exact escaped artifacts, distinct gates, and only the
     history: { truncated: false, items: [{ kind: 'candidate_verification_attempt', id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', state: 'succeeded', ordinal: 1, createdAt: new Date('2032-02-03T04:05:06.000Z'), failureCode: null }] },
   }} />);
   assert.match(html, /Candidate frozen/); assert.match(html, /Verification passed/); assert.match(html, /Technical objective satisfied/);
-  assert.match(html, /Human decision.*Awaiting/); assert.match(html, /Task 4.3 live acceptance.*Pending/);
+  assert.match(html, /Human decision.*Awaiting/); assert.match(html, /Independent live acceptance.*Pending/);
+  assert.match(html, /AI assessment, not proof/); assert.match(html, /The threshold comparison is inconsistent/);
+  assert.match(html, /What changed/); assert.match(html, /What was measured/); assert.match(html, /Baseline result.*test failed/);
+  assert.match(html, /Approval is immutable/); assert.match(html, /Rejection is permanent for this candidate/);
+  assert.ok(html.indexOf('Review decision controls') < html.indexOf('Technical provenance and attempt history'));
   assert.match(html, /src\/repaired.ts/); assert.match(html, /&lt;script&gt;unsafe\(\)&lt;\/script&gt;/);
   assert.match(html, /action="\/api\/repair-runs\/11111111-1111-4111-8111-111111111111\/human-review-decisions"/);
   assert.equal((html.match(/name="decision"/g) ?? []).length, 2);
@@ -284,7 +335,7 @@ test('human review renders exact escaped artifacts, distinct gates, and only the
   assert.doesNotMatch(html, /sandboxName|sandboxSessionId|action="[^"]*(?:publish|pull-request)|>\s*(?:Publish|Create PR|Merge|Deploy)\s*</i);
 });
 
-test('draft publication UI keeps the independent gate disabled and exposes no merge or deployment action', () => {
+test('draft publication UI omits the form while the independent gate is closed', () => {
   const review = {
     repairRunId: '11111111-1111-4111-8111-111111111111', status: 'decided' as const, ineligibleReason: null,
     reviewSubjectIdentity: 'a'.repeat(64), liveAcceptanceStatus: 'pending' as const, subject: null,
@@ -292,15 +343,14 @@ test('draft publication UI keeps the independent gate disabled and exposes no me
     history: { items: [], truncated: false },
   };
   const closed = renderToStaticMarkup(<RepairPublicationStatus review={review} publication={null} events={[]} idempotencyKey="44444444-4444-4444-8444-444444444444" />);
-  assert.match(closed, /Publication unavailable: Task 4.3 live acceptance is not passed/i);
-  assert.match(closed, /disabled=""/);
-  assert.match(closed, /action="\/api\/repair-runs\/11111111-1111-4111-8111-111111111111\/publications"/);
-  assert.deepEqual([...closed.matchAll(/name="([^"]+)"/g)].map((match) => match[1]), ['confirmation', 'decisionIdentity', 'idempotencyKey']);
+  assert.match(closed, /Draft publication is unavailable while independent live acceptance remains pending/i);
+  assert.doesNotMatch(closed, /action="\/api\/repair-runs\/11111111-1111-4111-8111-111111111111\/publications"|name="confirmation"/);
   assert.doesNotMatch(closed, /name="(?:repositoryId|candidateId|verificationId|branch|installationId)"/);
   assert.doesNotMatch(closed, />\s*(?:Merge|Deploy|Ready for review|Delete branch)\s*</i);
   const published = renderToStaticMarkup(<RepairPublicationStatus review={review} publication={{ id: '55555555-5555-4555-8555-555555555555', repairRunId: review.repairRunId, state: 'published', checkpoint: 'completed', targetBranch: `vigilo/repair/${'c'.repeat(64)}`, targetBaseBranch: 'main', expectedCommitSha: 'd'.repeat(40), remoteBranchCommitSha: 'd'.repeat(40), pullRequest: { id: 7, number: 9, nodeId: 'PR_node', url: 'https://github.com/example/repo/pull/9' }, failureCode: null, createdAt: new Date('2032-02-03T04:05:06.000Z'), completedAt: new Date('2032-02-03T04:06:06.000Z') }} events={[{ id: '66666666-6666-4666-8666-666666666666', eventType: 'completed', checkpoint: 'completed', toState: 'published', failureCode: null, createdAt: new Date('2032-02-03T04:06:06.000Z') }]} idempotencyKey="44444444-4444-4444-8444-444444444444" />);
   assert.match(published, /href="https:\/\/github.com\/example\/repo\/pull\/9"/);
-  assert.match(published, /Publication history/);
+  assert.match(published, /Technical publication history/);
+  assert.match(published, /Open draft pull request/);
 });
 
 test('draft publication UI gate recognizes only the explicit passed acceptance state', () => {
@@ -314,6 +364,120 @@ test('draft publication UI gate recognizes only the explicit passed acceptance s
   for (const value of [undefined, null, '', 'PASSED', 'unknown', 0, false, {}, []]) {
     assert.equal(publicationAcceptanceLabel(value), 'Unavailable');
   }
+  const revoked = renderToStaticMarkup(<RepairPublicationStatus review={{
+    repairRunId: '11111111-1111-4111-8111-111111111111', status: 'decided', ineligibleReason: null,
+    reviewSubjectIdentity: 'a'.repeat(64), liveAcceptanceStatus: 'revoked', subject: null,
+    decision: { id: '22222222-2222-4222-8222-222222222222', decision: 'approved', reviewerUserId: '33333333-3333-4333-8333-333333333333', decisionIdentity: 'b'.repeat(64), createdAt: new Date() },
+    history: { items: [], truncated: false },
+  }} publication={null} events={[]} idempotencyKey="44444444-4444-4444-8444-444444444444" />);
+  assert.match(revoked, /acceptance is not passed/);
+  assert.doesNotMatch(revoked, /acceptance remains pending/);
+});
+
+test('publication form is rendered only for exact passed acceptance and ambiguous state has no retry', () => {
+  const review = {
+    repairRunId: '11111111-1111-4111-8111-111111111111', status: 'decided' as const, ineligibleReason: null,
+    reviewSubjectIdentity: 'a'.repeat(64), liveAcceptanceStatus: 'passed' as const, subject: null,
+    decision: { id: '22222222-2222-4222-8222-222222222222', decision: 'approved' as const, reviewerUserId: '33333333-3333-4333-8333-333333333333', decisionIdentity: 'b'.repeat(64), createdAt: new Date('2032-02-03T04:05:06.000Z') },
+    history: { items: [], truncated: false },
+  };
+  const ready = renderToStaticMarkup(<RepairPublicationStatus review={review} publication={null} events={[]} idempotencyKey="44444444-4444-4444-8444-444444444444" />);
+  assert.match(ready, /Ready to publish draft PR/);
+  assert.match(ready, /action="\/api\/repair-runs\/11111111-1111-4111-8111-111111111111\/publications"/);
+  const ambiguous = renderToStaticMarkup(<RepairPublicationStatus review={review} publication={{ id: '55555555-5555-4555-8555-555555555555', repairRunId: review.repairRunId, state: 'review_required', checkpoint: 'pr_create_requested', targetBranch: `vigilo/repair/${'c'.repeat(64)}`, targetBaseBranch: 'main', expectedCommitSha: 'd'.repeat(40), remoteBranchCommitSha: null, pullRequest: null, failureCode: 'publication_remote_ambiguous', createdAt: new Date(), completedAt: new Date() }} events={[]} idempotencyKey="44444444-4444-4444-8444-444444444444" />);
+  assert.match(ambiguous, /Publication needs reconciliation/);
+  assert.doesNotMatch(ambiguous, /Retry|Publish exact candidate/);
+});
+
+test('terminal durable transitions refresh the server-rendered route without refreshing active polls', () => {
+  assert.equal(terminalTransitionNeedsRefresh(true, false), true);
+  assert.equal(terminalTransitionNeedsRefresh(true, true), false);
+  assert.equal(terminalTransitionNeedsRefresh(false, false), false);
+});
+
+test('durable polling exposes stored-progress and bounded degradation messages', () => {
+  assert.equal(durablePollingMessage(true, 0, null), 'Safe to refresh; progress is stored.');
+  assert.equal(durablePollingMessage(true, 3, null), 'Live updates paused; refresh to check durable status.');
+  assert.equal(durablePollingMessage(false, 0, 'Durable status updated.'), 'Durable status updated.');
+  assert.equal(durablePollingMessage(false, 0, null), null);
+  const lifetime = createPollingLifetime();
+  assert.equal(lifetime.canApply(), true);
+  lifetime.dispose();
+  assert.equal(lifetime.signal.aborted, true);
+  assert.equal(lifetime.canApply(), false);
+});
+
+test('malformed future workflow values never expose terminal actions', () => {
+  const common = {
+    executionProfile: { baseRevision: 'a'.repeat(40), build: null, install: { operation: 'ci' as const, tool: 'npm' as const }, nodeMajor: 24, packageManager: 'npm', profileIdentity: 'b'.repeat(64), profileVersion: 2, runtimeFamily: 'node', status: 'ready' as const, test: { script: 'test' as const, tool: 'npm' as const }, testRunner: 'node-test', typecheck: null },
+    installation: { accountLogin: 'xmodneo', accountType: 'User', installationId: 7001, status: 'active' },
+    selectedRepository: { defaultBranch: 'main', fullName: 'xmodneo/vigilo', id: 8101, isPrivate: false },
+    repairRequestId: '11111111-1111-4111-8111-111111111111', workspaceId: 'workspace-1',
+  };
+  const malformedRepairRun = renderToStaticMarkup(<GitHubConnectionView {...common} executionAvailability="available" repairRun={{
+    id: '11111111-1111-4111-8111-111111111111', state: 'future_state' as never, repositoryId: 8101,
+    revision: 'a'.repeat(40), profileIdentity: 'b'.repeat(64), repairObjective: 'Repair objective', baseline: null, failure: null,
+    createdAt: '2032-02-03T04:05:06.000Z', baselineStartedAt: null, completedAt: null, stateChangedAt: '2032-02-03T04:05:06.000Z',
+  }} />);
+  assert.match(malformedRepairRun, /Baseline unavailable/);
+  assert.doesNotMatch(malformedRepairRun, /action="\/api\/repair-runs"|Start repair/);
+
+  const malformedCandidate = renderToStaticMarkup(<RepairCandidateStatus actionAvailable candidate={{
+    id: '44444444-4444-4444-8444-444444444444', investigationId: '33333333-3333-4333-8333-333333333333',
+    ordinal: 1, state: 'future_state' as never, candidateIdentity: 'd'.repeat(64), changedFileCount: 1,
+    totalResultBytes: 10, rejectionCode: null, createdAt: '2032-02-03T04:05:06.000Z', completedAt: null,
+  }} />);
+  assert.match(malformedCandidate, /Operational failure/);
+  assert.doesNotMatch(malformedCandidate, /Verify candidate|action="\/api\/candidate-verifications"/);
+
+  const malformedVerification = renderToStaticMarkup(<CandidateVerificationStatus initialVerification={{
+    id: '55555555-5555-4555-8555-555555555555', candidateId: '44444444-4444-4444-8444-444444444444',
+    state: 'future_state' as never, revision: 'a'.repeat(40), candidateIdentity: 'd'.repeat(64), artifactIntegrity: null,
+    regressionChecks: null, baselineComparison: null, repairObjectiveEvidence: 'not_measured', executionOutcome: null,
+    failingPhase: null, networkIsolation: 'unconfirmed', cleanup: 'unconfirmed', evidenceId: null, failureCode: null,
+    createdAt: '2032-02-03T04:05:06.000Z', completedAt: null,
+  }} />);
+  assert.match(malformedVerification, /Operational failure/);
+  assert.doesNotMatch(malformedVerification, /Verify candidate again|action="\/api\/candidate-verifications"/);
+
+  const malformedReview = renderToStaticMarkup(<HumanReviewStatus idempotencyKey="77777777-7777-4777-8777-777777777777" review={{
+    repairRunId: '11111111-1111-4111-8111-111111111111', status: 'awaiting_decision', ineligibleReason: null,
+    reviewSubjectIdentity: 'f'.repeat(64), liveAcceptanceStatus: 'pending', subject: null, decision: null,
+    history: { items: [], truncated: false },
+  }} />);
+  assert.doesNotMatch(malformedReview, /human-review-decisions|Confirm approval|Confirm rejection/);
+
+  const malformedPublication = renderToStaticMarkup(<RepairPublicationStatus review={{
+    repairRunId: '11111111-1111-4111-8111-111111111111', status: 'decided', ineligibleReason: null,
+    reviewSubjectIdentity: 'a'.repeat(64), liveAcceptanceStatus: 'passed', subject: null,
+    decision: { id: '22222222-2222-4222-8222-222222222222', decision: 'approved', reviewerUserId: '33333333-3333-4333-8333-333333333333', decisionIdentity: 'b'.repeat(64), createdAt: new Date() },
+    history: { items: [], truncated: false },
+  }} publication={{
+    id: '55555555-5555-4555-8555-555555555555', repairRunId: '11111111-1111-4111-8111-111111111111',
+    state: 'future_state' as never, checkpoint: 'completed', targetBranch: 'vigilo/repair/test', targetBaseBranch: 'main',
+    expectedCommitSha: 'd'.repeat(40), remoteBranchCommitSha: 'd'.repeat(40),
+    pullRequest: { id: 7, number: 9, nodeId: 'PR_node', url: 'https://github.com/example/repo/pull/9' },
+    failureCode: null, createdAt: new Date(), completedAt: new Date(),
+  }} events={[]} idempotencyKey="44444444-4444-4444-8444-444444444444" />);
+  assert.match(malformedPublication, /Operational failure/);
+  assert.doesNotMatch(malformedPublication, /Open draft pull request/);
+});
+
+test('zero or unknown execution authority withholds provider-backed repair actions', () => {
+  const common = {
+    executionProfile: { baseRevision: 'a'.repeat(40), build: null, install: { operation: 'ci' as const, tool: 'npm' as const }, nodeMajor: 24, packageManager: 'npm', profileIdentity: 'b'.repeat(64), profileVersion: 2, runtimeFamily: 'node', status: 'ready' as const, test: { script: 'test' as const, tool: 'npm' as const }, testRunner: 'node-test', typecheck: null },
+    installation: { accountLogin: 'xmodneo', accountType: 'User', installationId: 7001, status: 'active' },
+    selectedRepository: { defaultBranch: 'main', fullName: 'xmodneo/vigilo', id: 8101, isPrivate: false },
+    repairRequestId: '11111111-1111-4111-8111-111111111111', workspaceId: 'workspace-1',
+  };
+  for (const executionAvailability of ['no_authority', 'unknown'] as const) {
+    const html = renderToStaticMarkup(<GitHubConnectionView {...common} executionAvailability={executionAvailability} />);
+    assert.doesNotMatch(html, /action="\/api\/repair-runs"/);
+    assert.match(html, /External execution unavailable/);
+  }
+  const available = renderToStaticMarkup(<GitHubConnectionView {...common} executionAvailability="available" />);
+  assert.match(available, /During an authorized repair, selected public repository source/);
+  assert.match(available, /Starting repair…/);
 });
 
 test('eligible Repair Run renders its objective and bounded investigation status', () => {
@@ -324,6 +488,7 @@ test('eligible Repair Run renders its objective and bounded investigation status
     createdAt: '2026-09-09T00:00:00.000Z', baselineStartedAt: '2026-09-09T00:00:01.000Z', completedAt: '2026-09-09T00:01:00.000Z', stateChangedAt: '2026-09-09T00:01:00.000Z',
   };
   const common = {
+    executionAvailability: 'available' as const,
     executionProfile: {
       baseRevision: 'a'.repeat(40), build: null, install: { operation: 'ci' as const, tool: 'npm' as const }, nodeMajor: 24,
       packageManager: 'npm', profileIdentity: 'b'.repeat(64), profileVersion: 2 as const, runtimeFamily: 'node', status: 'ready' as const,
@@ -380,8 +545,8 @@ test('eligible Repair Run renders its objective and bounded investigation status
     createdAt: repairRun.createdAt, completedAt: repairRun.completedAt,
   }} />);
   assert.match(verified, /Candidate verification/); assert.match(verified, /Artifact integrity.*Passed/); assert.match(verified, /Regression checks.*Failed/);
-  assert.match(verified, /Baseline comparison.*regression detected/); assert.match(verified, /Repair objective proof.*Not measured/);
-  assert.match(verified, /Execution outcome.*test failed/); assert.match(verified, /Failing phase.*Tests/);
-  assert.match(verified, /Network isolation.*confirmed/); assert.match(verified, /Cleanup.*confirmed/); assert.match(verified, /Verify candidate again/);
+  assert.match(verified, /Baseline comparison.*Regression detected/); assert.match(verified, /Repair objective proof.*Not measured/);
+  assert.match(verified, /Execution outcome.*Test failed/); assert.match(verified, /Failing phase.*Tests/);
+  assert.match(verified, /Network isolation.*Confirmed/); assert.match(verified, /Cleanup.*Confirmed/); assert.match(verified, /Verify candidate again/);
   assert.doesNotMatch(verified, /Approve|Publish|Create PR/);
 });

@@ -31,6 +31,14 @@ a {
   color: inherit;
 }
 
+a:focus-visible,
+button:focus-visible,
+textarea:focus-visible,
+summary:focus-visible {
+  outline: 3px solid var(--accent-dark);
+  outline-offset: 0.2rem;
+}
+
 main {
   width: min(100% - 2rem, 76rem);
   margin: 0 auto;
@@ -225,6 +233,13 @@ h1 {
   font-size: 0.9375rem;
 }
 
+.first-run-list {
+  display: grid;
+  gap: 0.75rem;
+  margin: 0;
+  padding-left: 1.5rem;
+}
+
 footer {
   display: flex;
   justify-content: space-between;
@@ -354,6 +369,35 @@ footer span:first-child {
   border-top: 1px solid var(--border);
 }
 
+.repository-panel pre {
+  max-width: 100%;
+  overflow: auto;
+  padding: 1rem;
+  background: var(--background);
+  white-space: pre;
+}
+
+.repository-panel code,
+.workspace-card code {
+  overflow-wrap: anywhere;
+}
+
+.repository-panel form + form,
+.repository-panel details + form,
+.repository-panel p + form {
+  margin-top: 1rem;
+}
+
+.data-use-disclosure,
+.empty-state,
+.workflow-live-message {
+  color: var(--muted);
+}
+
+.workflow-live-message {
+  font-size: 0.875rem;
+}
+
 .repository-panel h2 {
   font-size: 1.5rem;
 }
@@ -456,6 +500,17 @@ footer span:first-child {
 
   footer {
     flex-direction: column;
+  }
+
+  .repository-list li,
+  .workspace-header {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .repository-list form,
+  .repository-list button {
+    width: 100%;
   }
 }
 

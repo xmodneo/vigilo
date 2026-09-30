@@ -1,595 +1,153 @@
 # Vigilo
 
-Vigilo is a sandbox-first software maintenance platform. Milestone 1 proves its
-isolated repair boundary: reproduce a failure, freeze exact candidate bytes,
-verify those bytes in a fresh sandbox, produce structured evidence, and clean up.
-Task 2 adds GitHub identity, workspace ownership, verified GitHub App repository
-selection, frozen execution-profile detection, and safe baseline execution.
-Task 3 moves that baseline into a durable Repair Run executed by a separate
-PostgreSQL-backed worker and prepares bounded, exact-revision investigation
-context without calling a model.
+Vigilo is a repair garage for AI builders. It diagnoses a reproducible problem,
+prepares an exact repair candidate, checks that candidate in a fresh verification
+environment, and presents the measured evidence for human review.
 
-## Durable Repair Runs and investigation context
+Vigilo is a controlled beta. It does not guarantee a repair, automatically merge
+code, deploy software, or establish that a repository is production-ready.
 
-An authenticated user can start a Repair Run from the selected repository page.
-The server binds the run permanently to the workspace, stable GitHub repository
-ID, verified installation, exact commit SHA, and frozen execution-profile
-identity. PostgreSQL records every allowed transition and links the run to its
-existing sanitized baseline evidence. Reloading the page reads that state back
-from PostgreSQL.
+## Controlled-beta scope and limitations
 
-Task 3.2 keeps the web/API and worker as two process roles in the same modular
-monolith. Starting a run commits its immutable record and a minimal
-`repair-baseline-v1` pg-boss job in the same PostgreSQL transaction, then returns
-without opening a sandbox. The browser reads PostgreSQL-backed state and polls
-every three seconds while the run is waiting or active.
+Vigilo currently supports eligible public, single-package Node.js 24/npm repositories.
+Repairs may be inconclusive, fail verification, or end in a
+review-required state. Vigilo does not automatically merge or deploy code. Draft
+pull request publication remains unavailable until independent Task 4.3 live
+acceptance is completed. Production hosting, managed backup/PITR, and monitoring
+have not yet been selected or validated.
 
-Start both local process roles in separate terminals after applying migrations:
+Private repositories are unsupported and code-enforced at every source, model,
+sandbox, verification, review, and publication boundary. This beta is not
+approved for private customer repository processing.
 
-```sh
-npm run dev
-npm run worker:dev
-```
+## Supported repository contract
 
-The worker resolves all repository authority from PostgreSQL, conditionally
-claims `created → baseline_running`, and calls the existing Task 2.6 executor.
-Its bounded execution attempts use a database lease and record only safe
-operational facts. A redelivered job reconciles matching evidence written before
-a crash without rerunning repository code. When an expired attempt recorded a
-sandbox, the worker first confirms explicit provider cleanup; it will not open a
-replacement sandbox while that cleanup is unresolved. Vercel's provider expiry
-remains the final fallback.
+An eligible repository has:
 
-A queued run can be cancelled before a worker claims it. Cross-process
-cancellation after baseline execution starts is not implemented in Task 3.2.
-Recovery is driven by pg-boss redelivery and the worker's startup retry pass;
-there is no general monitoring or sweeper subsystem. If the worker is offline,
-the durable run and job remain waiting.
+- public visibility;
+- a root `package.json` and committed root `package-lock.json`;
+- npm and Node.js 24 compatibility;
+- one package, with no workspace or monorepo layout;
+- a supported root test script with safe script delegation; and
+- optional root typecheck and build scripts, which Vigilo runs when present.
 
-Task 3.3 adds an immutable repair objective of at most 3,000 characters and
-3,072 UTF-8 bytes. A trustworthy passing baseline or customer-code baseline
-failure can proceed to investigation; infrastructure failures remain blocking.
-Investigation preparation runs through a second pg-boss queue and indexes only
-bounded Git tree metadata for the Repair Run's exact commit. GitHub access uses
-a temporary token restricted to the selected repository with Contents read and
-Metadata read, and Vigilo revokes it before persisting the prepared result.
+The repository profile is checked against one exact commit. Stale access,
+ambiguous scripts, conflicting lockfiles, unsupported package managers or test
+runners, and malformed metadata fail closed.
 
-The protected context boundary supports bounded path listing, exact Git blob
-text reads, literal search, and sanitized baseline summaries. V1 indexes at most
-2,000 paths, reads at most 64 KiB per file, allows 1 MiB across 50 audited
-operations, and scans at most 50 files or 256 KiB per search with 25 matches.
-It excludes links, submodules, build output, dependency trees, obvious binary
-formats, archives, `.env` variants, private keys, and common credential files.
-The database stores paths, object hashes, sizes, counts, query hashes, and safe
-outcomes; it does not store file contents, search results, or GitHub tokens.
-No AI/model call, source modification, candidate, verification, or pull-request
-behavior exists in Task 3.3.
+## Repair workflow
 
-## Bounded AI investigation
+1. Connect GitHub and choose an eligible public repository.
+2. Describe a reproducible problem and start a separately authorized Repair Run.
+3. Vigilo measures the frozen baseline and prepares bounded read-only context.
+4. A bounded AI investigation records a structured assessment.
+5. Vigilo freezes the exact proposed changed-file artifact.
+6. A fresh sandbox reconstructs and verifies that exact candidate.
+7. A reviewer sees the AI assessment, stored candidate content, baseline,
+   verification evidence, measurable objective result, and bounded attempt history.
+8. Approval or rejection immutably binds that exact candidate and evidence.
+9. Draft pull-request publication is a separate action and is available only when
+   its independent server-derived acceptance and authority gates pass.
 
-Task 4.1 adds a durable AI investigator for a ready Investigation. The web
-process commits a minimal `ai-investigation-v1` pg-boss job and returns; the
-worker alone loads `GEMINI_API_KEY` and calls the pinned Google GenAI SDK through a
-small provider-neutral interface. The key is never sent to the browser,
-database, GitHub, a sandbox, an audit event, or a model prompt.
+Approval does not publish, merge, or deploy. Publication can create only a draft
+pull request; it cannot mark a pull request ready, merge, deploy, force-push, or
+delete a branch.
 
-The model can call only `listPaths`, `readTextFile`, `searchText`, and
-`readBaselineSummary`. Each call resolves the exact workspace, repository,
-installation, commit, profile, and baseline from PostgreSQL and uses the
-existing context policy and audit trail. Repository and objective text are
-explicitly delimited as untrusted data. There is no shell, network, sandbox,
-write, candidate, or GitHub API tool.
+## Data use and provider resources
 
-One investigation permits at most eight model turns and 20 total tool calls.
-At most six tool-bearing investigation rounds are permitted; one separate,
-tool-free request is reserved for finalization, so a bounded run consumes at
-most seven provider requests. The finalization request can use only the current
-AI execution's already observed context. Each AI execution also has a 128 KiB
-context-result budget inside (and stricter than) the parent Investigation's
-unchanged 1 MiB budget.
-Per-tool caps remain 2 path listings, 10 file reads, 5 searches, and 2
-baseline reads. Existing context limits of 50 operations and 1 MiB remain the
-outer authority. A model run has a 180-second deadline and a 2,500-token output
-limit per provider response. Budget exhaustion produces a low-confidence `insufficient_evidence`
-conclusion; it never expands a limit or claims a diagnosis. Provider failures
-retry through the durable worker at most three times. Valid low-confidence or
-not-reproduced conclusions complete without retry.
+Before repository selection: Vigilo currently supports public repositories only.
+Selecting a repository lets Vigilo inspect its metadata and, when explicitly
+authorized, read source from an exact revision.
 
-Task 4.1 uses Google Gemini Developer API model `gemini-3.1-flash-lite` as its
-current development and live-acceptance model, with explicit medium thinking
-and stateless interactions (`store: false`). This does not establish it as
-Vigilo's final production model. The Gemini Free Tier is used only for
-development and live acceptance against the public Vigilo repository. Google's
-current Free Tier terms state that submitted content may be used to improve Google products.
-This configuration is not approved for future private customer
-repository processing without a separate provider, privacy, quality, and cost
-decision.
+During an authorized repair, selected public repository source and the repair
+objective may be sent to configured AI and sandbox providers. Vigilo may retain
+the repair objective, frozen candidate contents, verification evidence, and audit
+history. External execution remains separately server-authorized.
 
-For local model-backed use, set `GEMINI_API_KEY` in ignored `.env.local` and
-restart `npm run worker:dev`. Do not paste the value into chat or commit it.
-The UI polls durable state and renders React-escaped structured fields only.
-Task 4.1 does not modify source, create a Repair Candidate, run a sandbox, or
-write to GitHub.
+Execution is bounded by durable Vigilo server-side grants, exact operation scopes,
+attempt limits, leases, and provider-call ceilings. Application budgets limit
+resource use but do not guarantee a provider bill or dollar amount. With no valid
+grant, effective external execution authority is zero and history remains read-only.
 
-Task 3.4 adds durable, immutable Repair Candidates without executing proposed
-code. An internal proposer may request at most 16 text-file additions,
-modifications, or deletions. Vigilo derives repository authority from the ready
-Investigation, validates every base path and Git blob against the exact frozen
-commit with a repository-scoped read-only GitHub token, revokes that token, and
-then stores only the changed resulting text and bounded identity metadata.
+The development and live acceptance model is Google Gemini
+`gemini-3.1-flash-lite`; this is not the final production model. The Gemini Free
+Tier is used only for development and live acceptance against the public Vigilo
+repository. Current Free Tier terms state that submitted content may be used to
+improve Google products. It is not approved for private customer source.
 
-Candidate files are limited to 128 KiB each and 512 KiB in total. Environment
-files, credentials, links, submodules, executable files, generated paths,
-package manifests, and package-manager lockfiles are rejected. Candidate
-identity is a deterministic SHA-256 over the immutable repository revision,
-execution profile, and canonical path-sorted file operations. A persisted
-artifact self-check recomputes content and candidate identities before later
-consumers may trust it. The web UI shows read-only candidate metadata; there is
-no browser source-edit endpoint. Freezing does not run npm, tests, builds,
-sandboxes, or models and does not claim that a candidate repairs the problem.
+## Local development
 
-## Bounded autonomous repair loop
+Requirements:
 
-Task 4.3 adds a durable RepairLoop that can coordinate at most two candidate
-generation and fresh verification iterations. Every iteration remains bound to
-the original workspace, repository, installation, commit, execution profile,
-baseline, Investigation, and AiInvestigation. A candidate can be selected only
-from exact, newly persisted verification evidence for that candidate; evidence
-from another candidate or historical run is never interchangeable. Database
-constraints and authority triggers enforce provenance, legal state transitions,
-terminal immutability, and the two-iteration ceiling across retries and worker
-restarts.
+- Node.js 24;
+- npm 11;
+- PostgreSQL reachable through the ignored local `DATABASE_URL`; and
+- local credentials only in ignored `.env.local` / `.secrets/` paths.
 
-The deterministic implementation and final security/concurrency review are
-complete. Six Important review findings were corrected with regression coverage.
-Historical migration SQL was restored to its originally applied bytes, the
-forward-only `0018_historical-schema-reconciliation.sql` reconciles documented
-historical schema states, and `0019_repair-loop.sql` installs the RepairLoop
-schema and authority guards. Both persistent migrations were applied
-successfully to the verified local development database without changing the
-identities or counts of historical application records.
-
-Task 4.3 live acceptance is pending. Existing RepairRuns have no trustworthy,
-measurable failing required baseline phase, and the closest controlled run can
-only reach `review_required`; it cannot prove `verified`. Deterministic tests are
-not live verification. The following live behaviors therefore remain unproven:
-
-- Real protocol-v4 generation followed by a fresh verification.
-- Real sandbox evidence reconciliation.
-- Live verified recovery.
-- A live second repair iteration.
-- Real-provider crash/restart recovery.
-
-Future live acceptance requires a genuine controlled RepairRun with a
-trustworthy, measurable failing required baseline phase; an enforced execution
-budget that covers SDK-internal retries; confirmed zero-cost execution or
-separately approved bounded financial exposure; and explicit approval before
-any Gemini, GitHub source, or Vercel Sandbox operation. No RepairLoop was started
-during Task 4.3 review or planning.
-
-## Human review and approval
-
-Milestone 5 adds one immutable human decision for an eligible, terminal
-`verified` RepairLoop. The server reconstructs the exact selected iteration,
-protocol-v4 generation, frozen candidate, verification, evidence, baseline,
-revision, execution profile, and measurable objective result. It recomputes the
-candidate, evidence, review-subject, and decision identities; the browser may
-submit only the decision, review-subject identity, and idempotency key.
-
-The private review view shows the exact frozen resulting file content, available
-base identities, selected verification facts, objective evidence, and bounded
-safe attempt history. It labels technical verification, human decision, and
-Task 4.3 live acceptance independently. A RepairLoop in `review_required` has
-unmeasured evidence and is not eligible for approval; it is not the same state
-as an eligible repair awaiting a human decision. Approval does not publish,
-create a branch or pull request, or perform any GitHub write.
-
-`0020_human-review.sql` installs restrictive provenance foreign keys,
-idempotency and one-decision uniqueness, immutable decision guards, and
-post-decision child-write guards. Application code performs the cryptographic
-identity calculations; SQL independently enforces the relational authority it
-can verify. Task 4.3 live acceptance remains pending and is an independent
-release prerequisite for any future Milestone 6 consumer. Its server-side gate
-is hard-closed while pending and cannot be opened by caller-supplied state.
-The publication-authority resolver cannot return while that gate is closed.
-Migration 0020 was applied to the positively identified local development
-database during the reviewed Milestone 5 workflow. Other environments must
-establish their own migration ledger and apply it through the documented
-forward-only migration process; this local fact is not a deployment guarantee.
-
-## Safe draft pull request publication
-
-Milestone 6 deterministically prepares one publication intent from an exact
-approved human-review decision. The intent freezes the RepairRun, RepairLoop,
-candidate and candidate identity, verification and evidence identities,
-repository and installation, original revision, execution profile, baseline,
-technical objective evidence, bounded repair objective, publishing user,
-deterministic branch, draft pull-request metadata, and expected Git object
-identities. The browser supplies only an explicit `publish_draft` confirmation,
-the decision identity as a stale-page assertion, and an idempotency key.
-
-Publication uses a dedicated, single-repository installation token with exactly
-`contents:write`, `metadata:read`, and `pull_requests:write`. The worker can
-create and verify blobs, one tree, one single-parent commit, one new dedicated
-branch, and one draft pull request. It has no ref-update, force-push, ref-delete,
-merge, ready-for-review, deployment, workflow-dispatch, or sandbox capability.
-Durable checkpoints reconcile exact object, branch, and pull-request identities;
-ambiguous remote outcomes stop in `review_required` rather than guessing.
-
-The Task 4.3 live-acceptance gate remains hard-closed, so production publication
-reservation and worker execution cannot reach a GitHub write. Milestone 6 has
-only deterministic fake-transport and disposable-database verification; no live
-branch or pull request has been created. `0021_repair-publication.sql` is not
-evidence of production readiness. It was applied to the positively identified
-local development database during the reviewed Milestone 6 workflow. Arbitrary
-deployments must independently verify and apply their own migration ledger.
-Managed SaaS production readiness has not been established.
-
-## Durable external execution authority and release acceptance
-
-Milestones 7.2 and 7.3 add a single durable, zero-by-default authority boundary
-for Gemini requests, Vercel Sandbox work, baseline and candidate verification,
-RepairLoop iterations, and future one-shot live acceptance. Immutable grants bind
-the exact workspace, run, repository revision, operation, provider/model,
-expiration, issuer, resource class, and integer execution limits. Reservations
-consume both operation and account-wide budgets conservatively; ambiguous
-provider outcomes are not refunded. A PostgreSQL semaphore, expiring leases,
-and monotonically increasing fences coordinate all queues and server entry
-points rather than relying on process memory.
-
-The installed Gemini SDK is invoked with its retry strategy disabled. The
-installed Vercel Sandbox SDK does not expose an equivalent global retry switch,
-so Vigilo injects a metered transport and reserves a conservative raw-request
-allowance before sandbox activity. The 96-attempt allowance is a hard outbound
-transport ceiling, not a claim that every internal SDK recovery path is proven
-to complete within 96 requests; exhaustion fails closed. Existing Vercel OIDC
-credentials are passed explicitly after local claim/expiry validation so the
-SDK cannot refresh them through an unmetered transport. Sandbox creation
-explicitly selects the smallest supported `vcpu_1` resource class, disables
-persistence, bounds runtime,
-and preserves the existing deny-before-repository-code policy. This SDK does
-not expose an independently enforceable memory setting, so Vigilo does not
-claim one.
-
-Immutable release-acceptance records support repair-loop, human-review,
-draft-publication, and security/cost-control evidence. Boundary commit,
-protocol, provider, model, provenance, and canonical identity mismatches fail
-closed; revocation is a separate append-only record. This implementation only
-provides the future resolver and data authority. Task 4.3 live acceptance is
-still pending, and the production publication gate remains unconditionally
-hard-closed with `live_acceptance_pending`. Deterministic test records cannot
-open it.
-
-`0022_external-execution-authority.sql` was applied to the positively identified
-local development database during the reviewed M7.2/M7.3 workflow. That local
-fact is not a claim about arbitrary deployments. No real grant or acceptance
-record was created, effective external authority remains zero, and no live
-external execution was performed.
-
-## Web/API shell
-
-Install the pinned dependencies and start local development:
+Install without lifecycle scripts, start the existing local PostgreSQL service
+using the operator-approved mechanism for that environment, verify `DATABASE_URL`
+targets it, apply the checked migration ledger, and start the web app:
 
 ```sh
 npm ci --ignore-scripts
-npm run dev
-```
-
-Open `http://localhost:3000` for the landing page. `GET /api/health` is a process
-liveness signal only; it does not claim database, migration, worker, queue, or
-provider readiness. `GET /api/health/readiness` performs bounded local checks of
-PostgreSQL, the exact migration manifest, pg-boss schema and queue set,
-operational schemas, and a same-release fresh worker heartbeat. It returns 200
-only when every check passes and otherwise returns 503 with stable codes.
-Neither endpoint contacts an external provider. See
-[controlled-beta operations](docs/operations.md) for deployment, migration,
-backup/restore, incident, and data-lifecycle runbooks.
-
-Milestone 7.4 provides this local/deterministic operational layer and has not
-been deployed or live-accepted. Migration `0023_operational-readiness.sql` has
-been verified only on disposable databases and has not been applied to the
-persistent local development database or any deployment. Task 4.3 live
-acceptance remains pending, effective external execution authority remains
-zero, and publication remains hard-closed with `live_acceptance_pending`.
-
-All application, API, and authentication responses receive a baseline Content
-Security Policy, MIME-sniffing protection, frame denial, referrer policy, and
-permissions policy. HSTS and insecure-request upgrading are emitted only for a
-production build whose configured `BETTER_AUTH_URL` uses HTTPS. Next.js currently
-requires inline hydration scripts and styles, so the CSP retains `unsafe-inline`
-for those directives; development additionally permits `unsafe-eval` and WebSocket
-connections for the framework development runtime. No third-party script, style,
-frame, object, or general network origin is allowed.
-
-## Local authentication and PostgreSQL
-
-Task 2.2 uses Better Auth for GitHub OAuth and server-side sessions. Create a
-GitHub OAuth App with:
-
-- Homepage URL: `http://localhost:3000`
-- Authorization callback URL: `http://localhost:3000/api/auth/callback/github`
-
-Copy `.env.example` to the ignored `.env.local` file and set `DATABASE_URL`,
-`BETTER_AUTH_SECRET`, `BETTER_AUTH_URL`, `GITHUB_CLIENT_ID`, and
-`GITHUB_CLIENT_SECRET`. Generate the auth secret locally with
-`openssl rand -base64 32`; do not commit or paste any secret into reports or
-chat. The OAuth App is identity-only and uses Better Auth's default GitHub scopes
-(`read:user` and `user:email`). Its token is never used for repository discovery
-or authorization. The separate GitHub App is the authority for Vigilo's
-repository access.
-
-Apply the checked-in PostgreSQL migration explicitly, then start the app:
-
-```sh
 npm run db:migrate
 npm run dev
 ```
 
-Visit `http://localhost:3000/sign-in`. A successful GitHub sign-in creates one
-database-backed Vigilo session and idempotently provisions exactly one private
-workspace. `/app` and `/api/workspace` validate the session against PostgreSQL
-and resolve that workspace on the server for every request. Signing out deletes
-the active session. OAuth tokens are encrypted at rest by Better Auth and are
-never returned by the workspace endpoint.
-
-The reviewable schema is in `db/schema.ts`; SQL migrations and Drizzle snapshots
-are under `drizzle/`. Production startup never mutates the schema automatically.
-Authentication tests run the same PostgreSQL migration against an ephemeral
-PGlite PostgreSQL engine, so normal tests need neither live GitHub OAuth nor a
-separately managed test database.
-
-## Local GitHub App installation
-
-Task 2.3 keeps identity OAuth and repository authorization separate. The OAuth
-App described above answers who signed in. A distinct GitHub App records what
-repository access the user grants to Vigilo. The GitHub App requests only:
-
-- Metadata: read
-- Contents: read and write
-- Pull requests: read and write
-
-The current installation flow uses `/api/github/installations/setup` as the App
-setup URL and `/api/github/installations/callback` as its OAuth callback. GitHub
-documents that the `installation_id` in a setup redirect can be spoofed. Vigilo
-therefore binds the installation attempt to the current database session and
-workspace with a short-lived, single-use state value, then uses a transient
-GitHub App user authorization to confirm that the signed-in GitHub user can
-access the installation. It independently verifies the installation with an App
-JWT before storing stable installation facts. The transient user grant is
-revoked immediately. No installation access token is minted or stored.
-
-After creating the local development GitHub App, configure the additional
-`GITHUB_APP_*` values from `.env.example`. Save the downloaded private key at
-`.secrets/vigilo-dev.pem` with file mode `0600`; `.secrets/` is ignored. Never
-paste the PEM into source, chat, or an environment value. Apply the explicit
-migration with `npm run db:migrate`, restart the web process, sign in, and visit
-`http://localhost:3000/app/github`.
-
-GitHub App setup is intentionally manual for this local milestone. Task 2.4 uses
-a short-lived, single-use state and PKCE flow to obtain a temporary GitHub App
-user access token. With that token, Vigilo verifies the signed-in GitHub user,
-checks access to the workspace's verified installation, and calls GitHub's
-user-installation repository endpoint. That endpoint supplies the intersection
-of repositories accessible to both the user and the App installation. Vigilo
-keeps only entries with explicit push or admin permission and immediately
-revokes the temporary token before storing bounded repository metadata.
-
-Apply the latest migration, then visit `http://localhost:3000/app/github`.
-Loading repositories requires a brief GitHub App authorization. Selecting one
-starts a fresh authorization whose token exchange is restricted to the selected
-stable repository ID, and the server revalidates eligibility before persistence.
-The token is never sent to browser JavaScript, logged, or stored. A selected
-repository stores only its stable ID and bounded metadata; no clone, source read,
-repository write, or execution-profile detection occurs in Task 2.4.
-
-Current API sources:
-
-- GitHub App user access tokens and PKCE: https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/generating-a-user-access-token-for-a-github-app
-- User-accessible installations and repositories: https://docs.github.com/en/rest/apps/installations
-- GitHub App token revocation: https://docs.github.com/en/rest/apps/oauth-applications
-
-Build and run the production server with:
+Start the multi-queue worker separately only when the intended operation has
+explicit external-execution authority:
 
 ```sh
-npm run build
-npm start
+npm run worker:dev
 ```
 
-`npm run build` compiles the existing Milestone 1 commands before building the
-Next.js application. `npm test` runs the Milestone 1 tests followed by the focused
-web tests. The sandbox demonstrations remain independently available through
-`npm run demo` and `npm run demo:failure`.
-
-## Milestone 1 execution boundary
-
-Task 1.1 proves the disposable Node.js 24 Vercel Sandbox boundary. Task 1.2 adds
-a separate [controlled broken fixture](fixtures/README.md). Task 1.3 runs its
-[original failing baseline in a real sandbox](docs/baseline.md). Task 1.4
-[applies and freezes the predetermined candidate](docs/candidate.md). Task 1.5
-[verifies those frozen bytes in a fresh sandbox](docs/verification.md). Task 1.6 generates an offline
-[structured evidence report](docs/evidence-report.md) from recorded execution
-results and the frozen candidate artifact.
-Task 1.7 exercises [failure cleanup and provider expiry](docs/failure-cleanup.md)
-with controlled live sandbox failures.
-
-## Milestone 1 demonstration
-
-Milestone 1 proves the complete execution boundary with one controlled fixture.
-The happy path uses one repair sandbox to reproduce the known bug and create the
-candidate, followed by a different fresh verifier sandbox that receives only the
-pristine base and frozen candidate bytes. Run it with:
+Useful deterministic checks:
 
 ```sh
-npm run demo
-```
-
-The command builds Vigilo, validates the committed fixture, reproduces the
-2-passed/1-failed threshold regression, applies only the pinned repair, freezes
-the exact candidate under `.vigilo/candidates/`, and confirms repair-sandbox
-cleanup. It then provisions a fresh verifier, independently installs dependencies,
-confirms deny-all networking before fixture scripts, and requires typecheck,
-build, and all three tests to pass without source mutation. Finally it writes a
-content-addressed execution record and versioned report under
-`.vigilo/evidence/`. The final JSON exits successfully only when every identity,
-result, separation, credential, and cleanup proof agrees.
-
-Exercise the existing Task 1.7 dependency-installation failure with:
-
-```sh
-npm run demo:failure
-```
-
-Expected failure-demo output classifies `dependency_installation_failure`, retains
-bounded diagnostic hashes/counts and the allowlisted npm code, starts no later
-work, and confirms stop, deletion, and absence. This controlled failure is a
-successful demonstration, so the command exits zero only when that failure and
-its cleanup are observed exactly.
-
-## Prerequisites and pinned dependencies
-
-- Local Node.js **24.13.0** (`.nvmrc`); the probe rejects other Node majors.
-- npm **11.6.2** (`packageManager`).
-- `@vercel/sandbox` **3.2.1**.
-- TypeScript **7.0.2**, `@types/node` **24.13.3**, and
-  `@types/async-retry` **1.4.9** (required by the SDK's public declarations).
-- `package-lock.json` pins the resolved dependency tree. Install with `npm ci`.
-
-Tests use Node's built-in runner. Authentication integration tests use PGlite's
-embedded PostgreSQL engine and do not use SQLite.
-
-## Local credentials
-
-Use an existing Vercel project with Sandbox access. Supply either:
-
-- `VERCEL_OIDC_TOKEN`, or
-- all of `VERCEL_TOKEN`, `VERCEL_TEAM_ID`, and `VERCEL_PROJECT_ID`.
-
-Set these in the local process environment or an ignored `.env.local` file.
-The probe loads `.env.local` using Node's native environment-file support.
-Do not commit credentials or paste them into reports. An incomplete access-token
-configuration fails explicitly, rather than falling back to another project.
-
-Vercel documents obtaining a development OIDC token by linking an existing
-project and pulling its environment with the Vercel CLI. That CLI is not a
-dependency of this project. Development OIDC tokens expire; renew them when
-necessary. Do not create a new Vercel project just to run the probe without
-reviewing that choice.
-
-Source: https://vercel.com/docs/sandbox/concepts/authentication
-
-## Run
-
-```sh
-npm ci --ignore-scripts
 npm run typecheck
 npm test
-npm run probe
+npm run build
 ```
 
-`npm test` builds the TypeScript first. Alternatively, run `npm run build` before
-`npm run probe`. The live probe creates a billable sandbox and is intentionally
-separate from the local tests. It exits zero only when all checks and cleanup
-are confirmed. Exit one means failed, blocked, or inconclusive acceptance.
+`GET /api/health` is dependency-free liveness only. `GET
+/api/health/readiness` checks the database ledger, queue registration,
+operational schemas, and a fresh same-release worker heartbeat. Neither health
+endpoint contacts an external provider.
 
-## What the real probe checks
+## Current release and acceptance state
 
-1. The local runtime is Node 24 and credentials are configured.
-2. `Sandbox.create()` uses a unique name, `image: "vercel/sandbox/node:24"`,
-   `persistent: false`, `timeout: 120000`, `networkPolicy: "allow-all"`, and no
-   exposed ports. No local environment is forwarded to the sandbox.
-3. Provider-returned persistence, network policy, and timeout match the request.
-   Record the VM session identifier; it must remain unchanged during the probe.
-4. Sandbox commands report a Node 24 version and verify the four Vercel
-   credential/configuration variables are absent without printing their values.
-   Another command writes a fixed file in `/tmp`, reads it back, and removes it.
-5. A HEAD request to `https://example.com/` **inside this sandbox** must complete
-   TCP/TLS connection and return HTTP 2xx within 10 seconds. This is the positive
-   control. Failure leaves the task inconclusive and triggers cleanup.
-6. Call `sandbox.update({ networkPolicy: "deny-all" }, { signal })`. Read the
-   policy back with `Sandbox.get({ name, resume: false })`; require `deny-all`
-   and the same still-running VM session before proceeding.
-7. Repeat the identical HTTPS request in a fresh Node process in that same VM.
-   Both requests use `agent: false` to avoid connection reuse. Record TCP/TLS
-   connection progress and the actual failure category, error name, and code.
-   Only a passed positive control plus a confirmed transition plus failure to
-   establish communication qualifies as `blocked`. An HTTP response or any
-   TCP/TLS connection after denial counts as `not_blocked`. A timeout by itself,
-   failed control, missing observation, or failed transition is inconclusive.
-8. A `finally` block calls `stop()` and then `delete()`. Deletion is attempted
-   even if stopping fails. A subsequent `Sandbox.get({ name, resume: false })`
-   must return HTTP 404 before absence is confirmed.
+- The checked clean-install migration ledger is `0000` through `0023`.
+- Migration `0023_operational-readiness.sql` has been applied to the positively
+  identified local development database. This local fact says nothing about
+  production, staging, shared databases, or arbitrary deployments.
+- `0020_human-review.sql`, `0021_repair-publication.sql`, and
+  `0022_external-execution-authority.sql` were likewise applied only to the
+  positively identified local development database during their reviewed
+  workflows.
+- Arbitrary deployments must independently verify and apply their own migration ledger through the forward-only migration process.
+- Task 4.3 live acceptance remains pending. The real protocol-v4 generation to
+  fresh verification, real sandbox evidence reconciliation, live verified
+  recovery, live second iteration, and real-provider crash/restart recovery are
+  not live-validated.
+- The production publication resolver therefore cannot reach a GitHub write;
+  publication remains hard-closed with `live_acceptance_pending`.
+- Effective external execution authority is zero. No current UI state creates a
+  grant or acceptance.
+- Milestone 7.4 operational readiness is local and deterministic, not deployed
+  production acceptance. Managed SaaS production readiness has not been established.
 
-The initial JSON event prints the unique requested sandbox name before creation,
-so an ambiguous creation response still leaves an identifier. The final JSON
-report contains requested settings, sandbox/session identity, runtime, filesystem,
-`credentialsExposure`, `outboundPositiveControl`, `networkPolicyTransition`,
-`outboundAfterDeny`, cleanup outcomes, and a safe error code. Checks not reached
-are marked `not_run`/`not_checked`; outbound denial defaults to `inconclusive`.
-Raw SDK errors/headers/tokens are never printed.
+## Architecture and operations
 
-## Cleanup and limitations
+- [Controlled-beta operations](docs/operations.md): deployment topology,
+  readiness, migrations, backup/restore, incidents, and data lifecycle.
+- [Baseline boundary](docs/baseline.md)
+- [Candidate artifact](docs/candidate.md)
+- [Fresh verification](docs/verification.md)
+- [Evidence report](docs/evidence-report.md)
+- [Failure cleanup](docs/failure-cleanup.md)
 
-- Work has a 90-second client deadline. The sandbox has a 120-second provider
-  deadline. SIGINT/SIGTERM abort work and enter cleanup. Each cleanup call uses
-  a fresh bounded signal, independent of the cancelled work.
-- Stop and deletion outcomes are reported separately. Deletion requests orphan
-  snapshot cleanup as an extra safeguard; this probe never requests a snapshot.
-- If creation fails ambiguously, the probe looks up its unique name without
-  resuming it and attempts cleanup if found. A failed lookup is not proof that
-  no resource was created. Keep the printed name for manual inspection.
-- SIGKILL, host loss, and provider outages can prevent client cleanup. The
-  provider deadline bounds execution but does not prove the sandbox record was
-  deleted. Inspect unresolved resources in Vercel; there is no cleanup service
-  in Task 1.1.
-- Current APIs distinguish stopping a session from deleting a named sandbox.
-  Persistence is explicitly disabled. Networking intentionally starts at
-  `allow-all` for this trusted, credential-free A/B probe, then changes to
-  `deny-all`. No repository or third-party code is executed during this window.
-  The legacy `runtime: "node24"` selector is deprecated in favor of `image`;
-  `updateNetworkPolicy()` is deprecated in favor of `update({ networkPolicy })`.
-- The managed `node:24` image receives nightly updates. Its major version is
-  selected, but its OS and Node patch version are not digest-pinned. The actual
-  runtime version is recorded. No reproducible application environment is
-  claimed by this first probe.
-- This is a same-VM A/B acceptance test of one endpoint and protocol, not a
-  comprehensive network penetration test. It does not assume the provider
-  guarantees any particular denial error. Error codes are evidence, not the
-  acceptance rule; connection progress and the A/B prerequisites decide it.
-- Local tests cover result classification and failure handling, including a
-  narrowly mocked SDK failure path. They do **not** prove real VM isolation or
-  satisfy acceptance. Task 1.1 requires a successful real `npm run probe`.
-- The Milestone 1 demo is intentionally limited to the committed single-package
-  Node.js 24/npm/Vitest fixture and one predetermined patch. It does not clone
-  GitHub repositories, invoke an AI agent, persist durable jobs, or publish pull
-  requests. The managed sandbox image pins Node's major version rather than an OS
-  digest, so each report records the observed runtime. `.vigilo/` artifacts are
-  local, ignored, unsigned evidence; the trusted host can replace them.
-
-## Official API sources checked for this task
-
-- Creation, commands, live policy updates, stop, delete, and non-resuming lookup:
-  https://vercel.com/docs/sandbox/sdk-reference
-- Node 24 managed image and update behavior:
-  https://vercel.com/docs/sandbox/concepts/images
-- Deny-all blocks outbound access, including DNS:
-  https://vercel.com/docs/sandbox/concepts/firewall
-- Published SDK 3.2.1 TypeScript declarations also confirm `networkPolicy`,
-  `persistent`, `timeout`, and `delete({ deleteOrphanSnapshots: true })`.
-  SDK source: https://github.com/vercel/sandbox/tree/main/packages/vercel-sandbox
-- Node's built-in test runner:
-  https://nodejs.org/docs/latest-v24.x/api/test.html
-
-## Acceptance status
-
-The real A/B probe passed on 2026-09-04 with `success: true`:
-
-- Sandbox: `vigilo-probe-d976ac7b-045a-4ef2-b598-945dd9e91dba`.
-- VM session: `sbx_IGyzsLiFE8CYpnFw04HG3EKMDEEr`; Node `v24.19.0`.
-- Filesystem passed; credential variables absent.
-- Positive control: HTTP 200 with TCP/TLS connected.
-- Policy transition: `deny-all` read back, same running session confirmed.
-- After denial: `AggregateError` / `ETIMEDOUT`; neither TCP nor TLS connected.
-- Cleanup: stop and deletion confirmed; subsequent lookup returned 404.
-
-Local tests are separate evidence. Future runs must independently satisfy every
-acceptance condition; this recorded result must never override a failed run.
+The system is a modular monolith: a stateless Next.js web service, one
+multi-queue worker, and PostgreSQL for durable application, queue, authority,
+audit, and operational state. Production startup never mutates schema
+automatically. Credentials remain server-side and are never returned by the
+workspace UI.

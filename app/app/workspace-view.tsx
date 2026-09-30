@@ -21,7 +21,7 @@ export function WorkspaceView({ githubUserId, user, workspaceId }: WorkspaceView
       </header>
 
       <section className="workspace-card" aria-labelledby="workspace-title">
-        <p className="eyebrow">Private workspace</p>
+        <p className="eyebrow">Controlled beta workspace</p>
         <h1 id="workspace-title">Welcome, {user.name}</h1>
         <dl>
           <div>
@@ -38,8 +38,8 @@ export function WorkspaceView({ githubUserId, user, workspaceId }: WorkspaceView
           </div>
         </dl>
         <p className="workspace-next">
-          <a href="/app/github">Connect a GitHub App installation</a> to prepare for
-          repository selection.
+          <a href="/app/github">Open repository workspace</a> to connect GitHub, choose an eligible
+          public repository, and inspect durable repair history. Provider-backed work remains unavailable without separate server authorization.
         </p>
       </section>
     </main>

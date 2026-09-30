@@ -1,6 +1,8 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { PendingSubmitButton } from '../pending-submit-button.tsx';
+import { presentError, presentWorkflowStatus } from '../../../lib/presentation/policy.ts';
+import { DurableLiveMessage, useDurablePolling } from './durable-polling.tsx';
 
 export interface CandidateVerificationSummary {
   id: string;
@@ -23,33 +25,29 @@ export interface CandidateVerificationSummary {
 }
 
 const active = new Set<CandidateVerificationSummary['state']>(['created', 'queued', 'verifying']);
-const label = (value: string | null) => value ? value.replaceAll('_', ' ') : 'Pending';
+const reverifiable = new Set<CandidateVerificationSummary['state']>(['completed', 'infrastructure_failed', 'cancelled']);
+const label = (value: string | null) => value ? `${value.charAt(0).toUpperCase()}${value.slice(1).replaceAll('_', ' ')}` : 'Pending';
 const artifactLabel = (value: CandidateVerificationSummary['artifactIntegrity']) => value === 'valid' ? 'Passed' : value === 'invalid' ? 'Failed' : 'Pending';
 const checksLabel = (value: CandidateVerificationSummary['regressionChecks']) => value === 'checks_passed' ? 'Passed' : value === 'checks_failed' ? 'Failed' : label(value);
 
 export function CandidateVerificationStatus({ initialVerification, allowReverify = true }: { initialVerification: CandidateVerificationSummary; allowReverify?: boolean }) {
-  const [verification, setVerification] = useState(initialVerification);
-  useEffect(() => {
-    if (!active.has(verification.state)) return;
-    const timer = window.setInterval(async () => {
-      try {
-        const response = await fetch(`/api/candidate-verifications/${encodeURIComponent(verification.id)}`, { cache: 'no-store', credentials: 'same-origin' });
-        if (!response.ok) return;
-        const body = await response.json() as { candidateVerification?: CandidateVerificationSummary };
-        if (body.candidateVerification?.id === verification.id) setVerification(body.candidateVerification);
-      } catch {
-        // PostgreSQL remains authoritative; a later poll can recover the view.
-      }
-    }, 3_000);
-    return () => window.clearInterval(timer);
-  }, [verification.id, verification.state]);
+  const { value: verification, liveMessage } = useDurablePolling({
+    initialValue: initialVerification,
+    isActive: (state) => active.has(state),
+    resourceKey: 'candidateVerification',
+    endpoint: (id) => `/api/candidate-verifications/${encodeURIComponent(id)}`,
+  });
+  const status = active.has(verification.state) ? 'verifying'
+    : verification.state === 'completed' && verification.regressionChecks === 'checks_passed' ? 'verification_passed'
+      : verification.state === 'completed' ? 'repair_failed_verification' : 'operational_failure';
+  const presentation = presentWorkflowStatus(status);
 
   return (
-    <section className="repository-panel" aria-labelledby="candidate-verification-title">
+    <section className="repository-panel" aria-labelledby="candidate-verification-title" aria-busy={active.has(verification.state)}>
       <p className="eyebrow">Fresh sandbox evidence</p>
       <h3 id="candidate-verification-title">Candidate verification</h3>
       <dl>
-        <div><dt>Status</dt><dd>{label(verification.state)}</dd></div>
+        <div><dt>Status</dt><dd>{presentation.label}</dd></div>
         <div><dt>Artifact integrity</dt><dd>{artifactLabel(verification.artifactIntegrity)}</dd></div>
         <div><dt>Revision</dt><dd><code>{verification.revision.slice(0, 12)}</code></dd></div>
         <div><dt>Regression checks</dt><dd>{checksLabel(verification.regressionChecks)}</dd></div>
@@ -60,12 +58,14 @@ export function CandidateVerificationStatus({ initialVerification, allowReverify
         <div><dt>Network isolation</dt><dd>{label(verification.networkIsolation)}</dd></div>
         <div><dt>Cleanup</dt><dd>{label(verification.cleanup)}</dd></div>
       </dl>
-      {verification.failureCode && <div className="repository-notice" role="status">Verification stopped safely: {verification.failureCode}</div>}
-      {allowReverify && !active.has(verification.state) && (
+      <p>{presentation.explanation}</p>
+      <DurableLiveMessage message={liveMessage} />
+      {verification.failureCode && <div className="repository-notice" role="alert">{presentError(verification.failureCode).message}</div>}
+      {allowReverify && reverifiable.has(verification.state) && (
         <form action="/api/candidate-verifications" method="post">
           <input type="hidden" name="candidateId" value={verification.candidateId} />
           <input type="hidden" name="intent" value="reverify" />
-          <button className="secondary-action" type="submit">Verify candidate again</button>
+          <PendingSubmitButton className="secondary-action" pendingLabel="Starting verification…">Verify candidate again</PendingSubmitButton>
         </form>
       )}
     </section>

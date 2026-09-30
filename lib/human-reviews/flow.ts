@@ -5,6 +5,7 @@ import { and, desc, eq, inArray, ne } from 'drizzle-orm';
 import {
   aiCandidateGeneration,
   aiCandidateGenerationAttempt,
+  aiInvestigation,
   candidateVerification,
   candidateVerificationAttempt,
   candidateVerificationEvidence,
@@ -184,6 +185,7 @@ async function loadEligibleSubject(database: ReviewDatabase, workspaceId: string
     database.select().from(executionProfile).where(and(eq(executionProfile.workspaceId, workspaceId), eq(executionProfile.githubRepositoryId, run.githubRepositoryId), eq(executionProfile.profileIdentity, run.profileIdentity))).limit(1),
   ]);
   if (!baseline || !profile) return ineligible('authority_mismatch');
+  const [assessment] = await database.select().from(aiInvestigation).where(eq(aiInvestigation.id, generation.aiInvestigationId)).limit(1);
 
   const exactIds = iteration.decision === 'verified' && iteration.objectiveEvidence === 'satisfied' &&
     iteration.candidateVerificationId === verification.id && generation.repairCandidateId === candidate.id &&
@@ -300,6 +302,19 @@ async function loadEligibleSubject(database: ReviewDatabase, workspaceId: string
       verification,
       evidence,
       subject: {
+        assessment: assessment?.state === 'completed' && assessment.conclusionStatus === 'diagnosis_found'
+          && assessment.summary && assessment.proposedApproach && ['low', 'medium', 'high'].includes(assessment.confidence ?? '')
+          ? { summary: assessment.summary, proposedApproach: assessment.proposedApproach, confidence: assessment.confidence as 'low' | 'medium' | 'high' }
+          : null,
+        baseline: {
+          outcome: baseline.overallOutcome,
+          phases: {
+            install: { status: baseline.installStatus, exitCode: baseline.installExitCode, timedOut: baseline.installTimedOut },
+            typecheck: { status: baseline.typecheckStatus, exitCode: baseline.typecheckExitCode, timedOut: baseline.typecheckTimedOut },
+            build: { status: baseline.buildStatus, exitCode: baseline.buildExitCode, timedOut: baseline.buildTimedOut },
+            test: { status: baseline.testStatus, exitCode: baseline.testExitCode, timedOut: baseline.testTimedOut },
+          },
+        },
         authority: {
           workspaceId,
           repairRunId: run.id,

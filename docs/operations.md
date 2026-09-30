@@ -113,3 +113,14 @@ acceptance, live draft publication, real-provider crash recovery, and guaranteed
 repair quality are not validated. The local operational snapshot is not a
 monitoring service. No paid monitoring, hosted PostgreSQL, or secret manager is
 selected by Milestone 7.4.
+
+`undici@7.29.0` is installed transitively through `@vercel/sandbox`. The current
+npm audit groups several advisories under one high-severity transitive finding,
+including optional WebSocket, interceptor/cache, BalancedPool, and HTTP response
+decompression behavior. Vigilo does not invoke the SDK's interactive WebSocket,
+cache, dump, RetryHandler, or BalancedPool APIs. Its supported sandbox boundary
+does use the SDK's authenticated HTTP client and Agent, so the transitive HTTP
+response-handling dependency remains tracked rather than being described as
+unreachable. Current execution authority is zero and Task 4.3 live acceptance is
+pending. This is not evidence that unreviewed SDK paths are safe; upgrading the
+sandbox dependency remains separate reviewed work.

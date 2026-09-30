@@ -96,3 +96,22 @@ test('release documentation keeps local migration facts separate from production
   assert.match(readme, /Task 4\.3 live acceptance remains pending/i);
   assert.match(readme, /production publication[\s\S]*cannot reach a GitHub write/i);
 });
+
+test('README presents the truthful controlled-beta contract', async () => {
+  const readme = await readFile('README.md', 'utf8');
+  assert.match(readme, /eligible public, single-package Node\.js 24\/npm repositories/i);
+  assert.match(readme, /does not automatically merge or deploy/i);
+  assert.match(readme, /0023_operational-readiness\.sql` has been applied to the positively\s+identified local development database/i);
+  assert.match(readme, /Task 4\.3 live acceptance remains pending/i);
+  assert.match(readme, /publication remains hard-closed with `live_acceptance_pending`/i);
+  assert.match(readme, /Application budgets[\s\S]*do not guarantee a provider bill or dollar amount/i);
+  assert.match(readme, /Managed SaaS production readiness has not been\s+established/i);
+});
+
+test('release accessibility styles preserve keyboard focus and narrow-screen content', async () => {
+  const css = await readFile('app/globals.css', 'utf8');
+  assert.match(css, /a:focus-visible,[\s\S]*button:focus-visible,[\s\S]*textarea:focus-visible,[\s\S]*summary:focus-visible[\s\S]*outline:/);
+  assert.match(css, /\.repository-panel pre[\s\S]*overflow: auto/);
+  assert.match(css, /\.repository-panel code,[\s\S]*\.workspace-card code[\s\S]*overflow-wrap: anywhere/);
+  assert.match(css, /@media \(max-width: 32rem\)[\s\S]*\.repository-list li,[\s\S]*\.workspace-header[\s\S]*flex-direction: column/);
+});

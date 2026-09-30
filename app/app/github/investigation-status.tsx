@@ -1,6 +1,7 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { presentError, presentWorkflowStatus } from '../../../lib/presentation/policy.ts';
+import { DurableLiveMessage, useDurablePolling } from './durable-polling.tsx';
 
 export interface InvestigationSummary {
   id: string;
@@ -23,43 +24,34 @@ export interface InvestigationSummary {
 
 const activeStates = new Set<InvestigationSummary['state']>(['created', 'context_preparing']);
 
-function statusLabel(state: InvestigationSummary['state']): string {
-  if (state === 'created') return 'Waiting for worker';
-  if (state === 'context_preparing') return 'Preparing bounded context';
-  return state;
-}
-
 export function InvestigationStatus({ initialInvestigation }: { initialInvestigation: InvestigationSummary }) {
-  const [investigation, setInvestigation] = useState(initialInvestigation);
-
-  useEffect(() => {
-    if (!activeStates.has(investigation.state)) return;
-    const timer = window.setInterval(async () => {
-      try {
-        const response = await fetch(`/api/investigations/${encodeURIComponent(investigation.id)}`, { cache: 'no-store', credentials: 'same-origin' });
-        if (!response.ok) return;
-        const body = await response.json() as { investigation?: InvestigationSummary };
-        if (body.investigation?.id === investigation.id) setInvestigation(body.investigation);
-      } catch {
-        // Persisted state remains authoritative; a later poll may succeed.
-      }
-    }, 3_000);
-    return () => window.clearInterval(timer);
-  }, [investigation.id, investigation.state]);
+  const { value: investigation, liveMessage } = useDurablePolling({
+    initialValue: initialInvestigation,
+    isActive: (state) => activeStates.has(state),
+    resourceKey: 'investigation',
+    endpoint: (id) => `/api/investigations/${encodeURIComponent(id)}`,
+  });
+  const presentation = presentWorkflowStatus(
+    investigation.state === 'ready' ? 'context_ready'
+      : activeStates.has(investigation.state) ? 'preparing_context'
+        : 'operational_failure',
+  );
 
   return (
-    <section className="repository-panel" aria-labelledby="investigation-title">
+    <section className="repository-panel" aria-labelledby="investigation-title" aria-busy={activeStates.has(investigation.state)}>
       <p className="eyebrow">Bounded repository context</p>
       <h3 id="investigation-title">Investigation</h3>
       <dl>
-        <div><dt>Status</dt><dd>{statusLabel(investigation.state)}</dd></div>
+        <div><dt>Status</dt><dd>{presentation.label}</dd></div>
         <div><dt>Revision</dt><dd><code>{investigation.revision.slice(0, 12)}</code></dd></div>
         <div><dt>Paths indexed</dt><dd>{investigation.indexedPathCount}</dd></div>
         <div><dt>Baseline evidence</dt><dd>{investigation.baselineAvailable ? 'Available' : 'Unavailable'}</dd></div>
         <div><dt>Context budget</dt><dd>{investigation.contextBudget.maxCumulativeBytes.toLocaleString()} bytes across {investigation.contextBudget.maxOperations} operations</dd></div>
       </dl>
+      <p>{presentation.explanation}</p>
+      <DurableLiveMessage message={liveMessage} />
       {investigation.treeTruncated && <p className="workspace-next">The repository tree exceeded the bounded context index.</p>}
-      {investigation.failureCode && <div className="repository-notice" role="status">Context preparation failed safely: {investigation.failureCode}</div>}
+      {investigation.failureCode && <div className="repository-notice" role="alert">{presentError(investigation.failureCode).message}</div>}
     </section>
   );
 }

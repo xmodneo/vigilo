@@ -27,9 +27,12 @@ import { getRepairLoopForContext } from '../../../lib/repair-loops/server';
 import { publicRepairLoop } from '../../../lib/repair-loops/handlers';
 import { getHumanReviewForContext } from '../../../lib/human-reviews/server';
 import { getRepairPublicationForContext } from '../../../lib/repair-publications/server';
+import { resolveExecutionAvailability } from '../../../lib/external-execution/availability';
+import type { ExecutionAvailabilityStatus } from '../../../lib/presentation/policy';
+import { getReadinessResult } from '../../../lib/operations/readiness';
 import { GitHubConnectionView } from './github-connection-view';
 
-export default async function GitHubConnectionPage() {
+export default async function GitHubConnectionPage({ searchParams }: { searchParams?: Promise<{ error?: string | string[] }> }) {
   try {
     const requestHeaders = await headers();
     const context = await resolveRequestWorkspace(requestHeaders);
@@ -39,6 +42,7 @@ export default async function GitHubConnectionPage() {
     );
     let repositories = undefined;
     let repositoryError: 'unavailable' | undefined;
+    let workflowError: 'unavailable' | undefined;
     let selectedRepository = undefined;
     let executionProfile = undefined;
     let baseline = undefined;
@@ -51,6 +55,7 @@ export default async function GitHubConnectionPage() {
     let repairLoop = undefined;
     let humanReview = undefined;
     let repairPublication = undefined;
+    let executionAvailability: ExecutionAvailabilityStatus = 'unknown';
     if (installation) {
       try {
         const overview = await getRepositoryOverviewForContext(context);
@@ -63,47 +68,75 @@ export default async function GitHubConnectionPage() {
               isPrivate: overview.selected.isPrivate,
             }
           : null;
-        executionProfile = overview.selected
-          ? publicExecutionProfile(await getExecutionProfileForContext(context))
-          : null;
-        baseline = overview.selected
-          ? publicBaseline(await getRepositoryBaselineForContext(context))
-          : null;
-        repairRun = overview.selected
-          ? publicRepairRun(await getLatestRepairRunForContext(context, overview.selected.githubRepositoryId))
-          : null;
-        investigation = repairRun
-          ? publicInvestigation(await getInvestigationForContext(context, repairRun.id))
-          : null;
-        aiInvestigation = investigation
-          ? publicAiInvestigation(await getAiInvestigationForContext(context, investigation.id))
-          : null;
-        aiCandidateGeneration = aiInvestigation
-          ? publicAiCandidateGeneration(await getAiCandidateGenerationForContext(context, aiInvestigation.id))
-          : null;
-        repairCandidate = investigation
-          ? publicRepairCandidate(await getLatestRepairCandidateForContext(context, investigation.id))
-          : null;
-        candidateVerification = repairCandidate
-          ? publicCandidateVerification(await getCandidateVerificationForContext(context, repairCandidate.id))
-          : null;
-        repairLoop = repairRun
-          ? publicRepairLoop(await getRepairLoopForContext(context, repairRun.id))
-          : null;
-        humanReview = repairRun && repairLoop
-          ? await getHumanReviewForContext(context, repairRun.id)
-          : null;
-        repairPublication = repairRun
-          ? await getRepairPublicationForContext(context, repairRun.id)
-          : null;
+        const publicSelection = overview.selected && !overview.selected.isPrivate ? overview.selected : null;
+        try {
+          executionProfile = publicSelection
+            ? publicExecutionProfile(await getExecutionProfileForContext(context))
+            : null;
+          baseline = publicSelection
+            ? publicBaseline(await getRepositoryBaselineForContext(context))
+            : null;
+          repairRun = publicSelection
+            ? publicRepairRun(await getLatestRepairRunForContext(context, publicSelection.githubRepositoryId))
+            : null;
+          investigation = repairRun
+            ? publicInvestigation(await getInvestigationForContext(context, repairRun.id))
+            : null;
+          aiInvestigation = investigation
+            ? publicAiInvestigation(await getAiInvestigationForContext(context, investigation.id))
+            : null;
+          aiCandidateGeneration = aiInvestigation
+            ? publicAiCandidateGeneration(await getAiCandidateGenerationForContext(context, aiInvestigation.id))
+            : null;
+          repairCandidate = investigation
+            ? publicRepairCandidate(await getLatestRepairCandidateForContext(context, investigation.id))
+            : null;
+          candidateVerification = repairCandidate
+            ? publicCandidateVerification(await getCandidateVerificationForContext(context, repairCandidate.id))
+            : null;
+          repairLoop = repairRun
+            ? publicRepairLoop(await getRepairLoopForContext(context, repairRun.id))
+            : null;
+          humanReview = repairRun && repairLoop
+            ? await getHumanReviewForContext(context, repairRun.id)
+            : null;
+          repairPublication = repairRun
+            ? await getRepairPublicationForContext(context, repairRun.id)
+            : null;
+          if (publicSelection) {
+            const authority = await resolveExecutionAvailability(getAuthDatabase(), context.workspace.id, { operationalReady: true });
+            executionAvailability = authority.status;
+            if (executionAvailability === 'available') {
+              const readiness = await getReadinessResult();
+              if (readiness.status !== 200) executionAvailability = 'operational_unavailable';
+            }
+          }
+        } catch {
+          workflowError = 'unavailable';
+          executionAvailability = 'unknown';
+          executionProfile = undefined;
+          baseline = undefined;
+          repairRun = undefined;
+          investigation = undefined;
+          repairCandidate = undefined;
+          candidateVerification = undefined;
+          aiInvestigation = undefined;
+          aiCandidateGeneration = undefined;
+          repairLoop = undefined;
+          humanReview = undefined;
+          repairPublication = undefined;
+        }
       } catch {
         repositoryError = 'unavailable';
       }
     }
 
+    const parameters = await searchParams;
+    const notice = Array.isArray(parameters?.error) ? parameters.error[0] : parameters?.error;
     return (
       <GitHubConnectionView
         installation={installation}
+        executionAvailability={executionAvailability}
         aiInvestigationRequestId={randomUUID()}
         aiCandidateGenerationRequestId={randomUUID()}
         repairLoopRequestId={randomUUID()}
@@ -124,6 +157,8 @@ export default async function GitHubConnectionPage() {
         repairRequestId={randomUUID()}
         {...(repairRun !== undefined ? { repairRun } : {})}
         {...(repositoryError ? { repositoryError } : {})}
+        {...(workflowError ? { workflowError } : {})}
+        {...(notice ? { noticeCode: notice } : {})}
         {...(selectedRepository !== undefined ? { selectedRepository } : {})}
         workspaceId={context.workspace.id}
       />
@@ -132,6 +167,15 @@ export default async function GitHubConnectionPage() {
     if (error instanceof AccessDeniedError && error.code === 'unauthorized') {
       redirect('/sign-in');
     }
-    throw error;
+    return (
+      <main className="workspace-shell">
+        <section className="workspace-card" aria-labelledby="workspace-unavailable-title">
+          <p className="eyebrow">Controlled beta workspace</p>
+          <h1 id="workspace-unavailable-title">Workspace unavailable</h1>
+          <p role="alert">Vigilo could not load durable workspace state safely. No external operation was started.</p>
+          <a className="primary-action button-link" href="/app/github">Try again</a>
+        </section>
+      </main>
+    );
   }
 }

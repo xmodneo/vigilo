@@ -8,6 +8,13 @@ import { HumanReviewStatus } from './human-review-status.tsx';
 import type { HumanReviewResult } from '../../../lib/human-reviews/types.ts';
 import { RepairPublicationStatus } from './repair-publication-status.tsx';
 import type { RepairPublicationResult } from '../../../lib/repair-publications/types.ts';
+import { PendingSubmitButton } from '../pending-submit-button.tsx';
+import {
+  presentError,
+  presentExecutionAvailability,
+  presentRepositoryEligibility,
+  type ExecutionAvailabilityStatus,
+} from '../../../lib/presentation/policy.ts';
 
 type RepairPublicationHistory = {
   publication: RepairPublicationResult | null;
@@ -61,24 +68,24 @@ interface BaselineSummary {
   typecheck: string | null;
 }
 
-const unsupportedReasons: Record<string, string> = {
-  ambiguous_test_runner: 'Multiple test runners were detected.',
-  conflicting_lockfiles: 'Competing package-manager lockfiles were found.',
-  invalid_package_lock: 'package-lock.json could not be validated.',
-  invalid_script_graph: 'The test script delegation graph is unsafe or ambiguous.',
-  malformed_package_json: 'package.json could not be validated.',
-  missing_package_json: 'A root package.json is required.',
-  missing_package_lock: 'A committed root package-lock.json is required.',
-  missing_test_script: 'A root test script is required.',
-  unsupported_monorepo: 'Workspaces and monorepo layouts are not supported in V1.',
-  unsupported_node_version: 'The repository must support Node.js 24.',
-  unsupported_package_manager: 'The repository must use npm.',
-  unsupported_test_runner: 'Use Node test, Vitest, or Jest for V1.',
-};
-
 function npmEntrypoint(script: string): string {
   return script === 'test' ? 'npm test' : `npm run ${script}`;
 }
+
+function evidenceLabel(value: string | null): string {
+  if (!value) return 'Not configured';
+  if (value === 'completed' || value === 'baseline_passed') return 'Passed';
+  if (['failed', 'baseline_failed', 'typecheck_failed', 'build_failed', 'test_failed'].includes(value)) return 'Failed';
+  if (value === 'not_run') return 'Not run';
+  return 'Unavailable';
+}
+
+const restartableRepairRunStates = new Set<RepairRunSummary['state']>([
+  'ready_for_investigation',
+  'baseline_failed',
+  'infrastructure_failed',
+  'cancelled',
+]);
 
 export interface GitHubConnectionViewProps {
   aiInvestigation?: AiInvestigationSummary | null;
@@ -87,6 +94,7 @@ export interface GitHubConnectionViewProps {
   aiCandidateGenerationRequestId?: string;
   baseline?: BaselineSummary | null;
   executionProfile?: ExecutionProfileSummary | null;
+  executionAvailability?: ExecutionAvailabilityStatus;
   installation: InstallationSummary | null;
   investigation?: InvestigationSummary | null;
   investigationRequestId?: string;
@@ -102,6 +110,8 @@ export interface GitHubConnectionViewProps {
   repairPublication?: RepairPublicationHistory | null;
   repairPublicationRequestId?: string;
   repositoryError?: 'unavailable';
+  workflowError?: 'unavailable';
+  noticeCode?: string;
   selectedRepository?: RepositorySummary | null;
   workspaceId: string;
 }
@@ -113,6 +123,7 @@ export function GitHubConnectionView({
   aiCandidateGenerationRequestId,
   baseline = null,
   executionProfile = null,
+  executionAvailability = 'unknown',
   installation,
   investigation = null,
   investigationRequestId,
@@ -128,10 +139,14 @@ export function GitHubConnectionView({
   repairPublication = null,
   repairPublicationRequestId,
   repositoryError,
+  workflowError,
+  noticeCode,
   selectedRepository = null,
   workspaceId,
 }: GitHubConnectionViewProps) {
   const repairLoopActive = repairLoop?.state === 'queued' || repairLoop?.state === 'running';
+  const executionPresentation = presentExecutionAvailability(executionAvailability);
+  const executionAllowed = executionPresentation.actionAvailable && !selectedRepository?.isPrivate && !workflowError;
   return (
     <main className="workspace-shell">
       <header className="workspace-header">
@@ -148,6 +163,7 @@ export function GitHubConnectionView({
         <p className={`connection-status ${installation ? 'is-connected' : ''}`}>
           {installation ? 'Connected' : 'Not connected'}
         </p>
+        {noticeCode && <div className="repository-notice" role="alert">{presentError(noticeCode).message}</div>}
 
         {installation ? (
           <>
@@ -171,12 +187,24 @@ export function GitHubConnectionView({
             </dl>
             {repositoryError === 'unavailable' ? (
               <div className="repository-notice" role="alert">
-                Repository access could not be verified. Try again before making a selection.
+                <p>Repository access could not be verified. No execution action is available.</p>
+                <a className="secondary-action button-link" href="/app/github">Try again</a>
               </div>
             ) : selectedRepository ? (
               <section className="repository-panel" aria-labelledby="selected-repository-title">
                 <p className="eyebrow">Connected repository</p>
                 <h2 id="selected-repository-title">{selectedRepository.fullName}</h2>
+                {selectedRepository.isPrivate && (
+                  <div className="repository-notice" role="alert">
+                    {presentRepositoryEligibility('private_unsupported').label}. Vigilo will not inspect source, reserve execution authority, or start repair work for this repository.
+                  </div>
+                )}
+                {workflowError === 'unavailable' && (
+                  <div className="repository-notice" role="alert">
+                    <p>Repair history could not be loaded safely. No workflow action is available.</p>
+                    <a className="secondary-action button-link" href="/app/github">Refresh status</a>
+                  </div>
+                )}
                 <dl>
                   <div>
                     <dt>Visibility</dt>
@@ -189,16 +217,27 @@ export function GitHubConnectionView({
                   <div>
                     <dt>Execution profile</dt>
                     <dd>
-                      {executionProfile?.status === 'ready'
+                      {selectedRepository.isPrivate
+                        ? presentRepositoryEligibility('private_unsupported').label
+                        : executionProfile?.status === 'ready'
                         ? 'Ready'
                         : executionProfile?.status === 'unsupported'
                           ? 'Unsupported'
-                          : 'Not configured yet'}
+                          : presentRepositoryEligibility('not_checked').label}
                     </dd>
                   </div>
                 </dl>
-                {executionProfile?.status === 'ready' && (
+                {!selectedRepository.isPrivate && executionProfile?.status === 'ready' && (
                   <>
+                    <section aria-labelledby="eligibility-title">
+                      <h3 id="eligibility-title">Repository eligibility</h3>
+                      <p><strong>{presentRepositoryEligibility('eligible_for_inspection').label}</strong></p>
+                      <ul>
+                        <li>Public repository</li><li>Root <code>package.json</code></li><li>Committed <code>package-lock.json</code></li>
+                        <li>npm with Node.js 24 compatibility</li><li>Single-package layout without workspaces or monorepos</li>
+                        <li>Supported root test script with safe script delegation</li><li>Optional typecheck and build scripts are used when present</li>
+                      </ul>
+                    </section>
                     <dl>
                       <div><dt>Runtime</dt><dd>Node.js {executionProfile.nodeMajor}</dd></div>
                       <div><dt>Package manager</dt><dd>{executionProfile.packageManager}</dd></div>
@@ -209,66 +248,71 @@ export function GitHubConnectionView({
                       <div><dt>Test</dt><dd>{npmEntrypoint(executionProfile.test.script)}</dd></div>
                       <div><dt>Test runner</dt><dd>{executionProfile.testRunner === 'node-test' ? 'Node built-in test runner' : executionProfile.testRunner}</dd></div>
                     </dl>
-                    {(!repairRun || !['created', 'baseline_running'].includes(repairRun.state)) && (
+                    <div className="repository-notice" role="status">
+                      <strong>{executionPresentation.label}.</strong> {executionPresentation.explanation}
+                    </div>
+                    {executionAllowed && (!repairRun || restartableRepairRunStates.has(repairRun.state)) && (
+                      <>
+                      <p className="data-use-disclosure">During an authorized repair, selected public repository source and your repair objective may be sent to configured AI and sandbox providers. Vigilo may retain the repair objective, frozen candidate contents, verification evidence, and audit history. External execution remains separately server-authorized.</p>
                       <form className="repair-intent-form" action="/api/repair-runs" method="post">
                         <input type="hidden" name="idempotencyKey" value={repairRequestId} />
                         <label htmlFor="repair-objective">Repair objective</label>
-                        <textarea id="repair-objective" name="objective" required maxLength={3000} rows={4} placeholder="Describe the software behavior that needs investigation." />
-                        <button className="primary-action" type="submit">Start repair</button>
+                        <textarea id="repair-objective" name="objective" required maxLength={3000} rows={4} placeholder="Example: Checkout should offer free shipping when the order total reaches the documented threshold." />
+                        <PendingSubmitButton className="primary-action" pendingLabel="Starting repair…">Start repair</PendingSubmitButton>
                       </form>
+                      </>
                     )}
+                    {!repairRun && !executionAllowed && <p className="empty-state">Your first repair starts with a specific reproducible objective. Existing history remains viewable while external execution is unavailable.</p>}
                     {repairRun && <RepairRunStatus initialRun={repairRun} />}
                     {repairRun?.repairObjective && investigationRequestId && ['ready_for_investigation', 'baseline_failed'].includes(repairRun.state) && !investigation && (
                       <form action={`/api/repair-runs/${encodeURIComponent(repairRun.id)}/investigation`} method="post">
                         <input type="hidden" name="idempotencyKey" value={investigationRequestId} />
-                        <button className="primary-action" type="submit">Prepare investigation</button>
+                        <PendingSubmitButton className="primary-action" pendingLabel="Preparing investigation…">Prepare investigation</PendingSubmitButton>
                       </form>
                     )}
                     {investigation && <InvestigationStatus initialInvestigation={investigation} />}
-                    {investigation?.state === 'ready' && aiInvestigationRequestId && aiCandidateGenerationRequestId && <AiInvestigationStatus investigationId={investigation.id} initialAiInvestigation={aiInvestigation} startRequestId={aiInvestigationRequestId} initialAiCandidateGeneration={aiCandidateGeneration} candidateGenerationRequestId={aiCandidateGenerationRequestId} suppressCandidateActions={repairLoopActive} />}
-                    {aiInvestigation?.state === 'completed' && aiInvestigation.conclusion?.status === 'diagnosis_found' && repairRun && repairLoopRequestId && !repairLoop && (
+                    {investigation?.state === 'ready' && aiInvestigationRequestId && aiCandidateGenerationRequestId && <AiInvestigationStatus investigationId={investigation.id} initialAiInvestigation={aiInvestigation} startRequestId={aiInvestigationRequestId} initialAiCandidateGeneration={aiCandidateGeneration} candidateGenerationRequestId={aiCandidateGenerationRequestId} suppressCandidateActions={repairLoopActive} actionAvailable={executionAllowed} />}
+                    {executionAllowed && aiInvestigation?.state === 'completed' && aiInvestigation.conclusion?.status === 'diagnosis_found' && repairRun && repairLoopRequestId && !repairLoop && (
                       <form action="/api/repair-loops" method="post">
                         <input type="hidden" name="repairRunId" value={repairRun.id} />
                         <input type="hidden" name="idempotencyKey" value={repairLoopRequestId} />
-                        <button className="primary-action" type="submit">Start bounded repair loop</button>
+                        <PendingSubmitButton className="primary-action" pendingLabel="Starting bounded repair…">Start bounded repair loop</PendingSubmitButton>
                       </form>
                     )}
                     {repairLoop && <RepairLoopStatus initialLoop={repairLoop} />}
                     {repairLoop && humanReview && humanReviewRequestId && <HumanReviewStatus review={humanReview} idempotencyKey={humanReviewRequestId} />}
                     {repairLoop && humanReview && repairPublicationRequestId && <RepairPublicationStatus review={humanReview} publication={repairPublication?.publication ?? null} events={repairPublication?.events ?? []} idempotencyKey={repairPublicationRequestId} />}
-                    {investigation?.state === 'ready' && <RepairCandidateStatus candidate={repairCandidate} verification={candidateVerification} workflowOwned={repairLoopActive} />}
+                    {investigation?.state === 'ready' && <RepairCandidateStatus candidate={repairCandidate} verification={candidateVerification} workflowOwned={repairLoopActive} actionAvailable={executionAllowed} />}
                     {baseline && (
                       <section className="repository-panel" aria-labelledby="baseline-title">
                         <p className="eyebrow">Execution evidence</p>
                         <h3 id="baseline-title">Baseline</h3>
                         <dl>
                           <div><dt>Revision</dt><dd><code>{baseline.baseRevision.slice(0, 12)}</code></dd></div>
-                          <div><dt>Install</dt><dd>{baseline.install}</dd></div>
-                          <div><dt>Typecheck</dt><dd>{baseline.typecheck ?? 'Not configured'}</dd></div>
-                          <div><dt>Build</dt><dd>{baseline.build ?? 'Not configured'}</dd></div>
-                          <div><dt>Tests</dt><dd>{baseline.test}</dd></div>
-                          <div><dt>Network isolation</dt><dd>{baseline.networkIsolation}</dd></div>
-                          <div><dt>Cleanup</dt><dd>{baseline.cleanup}</dd></div>
-                          <div><dt>Outcome</dt><dd>{baseline.outcome}</dd></div>
+                          <div><dt>Install</dt><dd>{evidenceLabel(baseline.install)}</dd></div>
+                          <div><dt>Typecheck</dt><dd>{evidenceLabel(baseline.typecheck)}</dd></div>
+                          <div><dt>Build</dt><dd>{evidenceLabel(baseline.build)}</dd></div>
+                          <div><dt>Tests</dt><dd>{evidenceLabel(baseline.test)}</dd></div>
+                          <div><dt>Network isolation</dt><dd>{baseline.networkIsolation === 'confirmed' ? 'Confirmed' : 'Unconfirmed'}</dd></div>
+                          <div><dt>Cleanup</dt><dd>{baseline.cleanup === 'confirmed' ? 'Confirmed' : 'Unconfirmed'}</dd></div>
+                          <div><dt>Outcome</dt><dd>{evidenceLabel(baseline.outcome)}</dd></div>
                         </dl>
                       </section>
                     )}
                   </>
                 )}
-                {executionProfile?.status === 'unsupported' && (
+                {!selectedRepository.isPrivate && executionProfile?.status === 'unsupported' && (
                   <div className="repository-notice" role="status">
-                    {unsupportedReasons[executionProfile.reason ?? ''] ?? 'The repository does not meet the V1 execution contract.'}
+                    <strong>{presentRepositoryEligibility('unsupported').label}.</strong> {executionProfile.reason ? presentError(executionProfile.reason).message : 'The repository does not meet the V1 execution contract.'}
                   </div>
                 )}
-                <form action="/api/github/repositories/profile" method="post">
-                  <button className="primary-action" type="submit">
-                    {executionProfile ? 'Recompute execution profile' : 'Detect execution profile'}
-                  </button>
-                </form>
+                {!selectedRepository.isPrivate && !workflowError && <form action="/api/github/repositories/profile" method="post">
+                  <PendingSubmitButton className="primary-action" pendingLabel="Checking eligibility…">
+                    {executionProfile ? 'Check eligibility again' : 'Check eligibility'}
+                  </PendingSubmitButton>
+                </form>}
                 <form action="/api/github/repositories/authorize" method="post">
-                  <button className="secondary-action" type="submit">
-                    Refresh repository access
-                  </button>
+                  <PendingSubmitButton className="secondary-action" pendingLabel="Refreshing access…">Refresh access</PendingSubmitButton>
                 </form>
               </section>
             ) : repositories === undefined ? (
@@ -278,16 +322,16 @@ export function GitHubConnectionView({
                 <p className="workspace-next">
                   Authorize the GitHub App briefly to load repositories where you have write access.
                 </p>
+                <p className="data-use-disclosure">Vigilo currently supports public repositories only. Selecting a repository lets Vigilo inspect its metadata and, when explicitly authorized, read source from an exact revision.</p>
                 <form action="/api/github/repositories/authorize" method="post">
-                  <button className="primary-action" type="submit">
-                    Load repositories
-                  </button>
+                  <PendingSubmitButton className="primary-action" pendingLabel="Loading repositories…">Load repositories</PendingSubmitButton>
                 </form>
               </section>
             ) : (
               <section className="repository-panel" aria-labelledby="repository-list-title">
                 <p className="eyebrow">Repository access</p>
                 <h2 id="repository-list-title">Select a repository</h2>
+                <p className="data-use-disclosure">Vigilo currently supports public repositories only. Selecting a repository lets Vigilo inspect its metadata and, when explicitly authorized, read source from an exact revision.</p>
                 {repositories.length === 0 ? (
                   <p className="workspace-next">
                     No repositories currently meet both installation and user write-access requirements.
@@ -299,13 +343,13 @@ export function GitHubConnectionView({
                         <div>
                           <strong>{repository.fullName}</strong>
                           <span>
-                            {repository.isPrivate ? 'Private' : 'Public'} · {repository.defaultBranch ?? 'No default branch'}
+                            {presentRepositoryEligibility(repository.isPrivate ? 'private_unsupported' : 'not_checked').label} · {repository.defaultBranch ?? 'No default branch'}
                           </span>
                         </div>
-                        <form action="/api/github/repositories" method="post">
+                        {!repository.isPrivate && <form action="/api/github/repositories" method="post">
                           <input type="hidden" name="repositoryId" value={repository.id} />
-                          <button className="secondary-action" type="submit">Select</button>
-                        </form>
+                          <PendingSubmitButton className="secondary-action" pendingLabel="Selecting…">Select {repository.fullName}</PendingSubmitButton>
+                        </form>}
                       </li>
                     ))}
                   </ul>
@@ -315,10 +359,10 @@ export function GitHubConnectionView({
           </>
         ) : (
           <form action="/api/github/installations" method="post">
-            <button className="primary-action" type="submit">Connect GitHub</button>
+            <PendingSubmitButton className="primary-action" pendingLabel="Connecting…">Connect GitHub</PendingSubmitButton>
           </form>
         )}
-        {!installation && <p className="workspace-next">Repository selection follows installation.</p>}
+        {!installation && <p className="workspace-next">Connect GitHub to list repositories where the installation and your user both have access. Public repositories only.</p>}
       </section>
     </main>
   );
