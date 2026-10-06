@@ -162,7 +162,7 @@ async function main(): Promise<void> {
     workerIds.push({ id: repairLoopWorkerId, queue: REPAIR_LOOP_QUEUE });
     const repairPublicationWorkerId = await boss.work<unknown, { code?: string }, typeof workOptions>(REPAIR_PUBLICATION_QUEUE, workOptions, async (jobs) => {
       const job = jobs[0]; if (!job) return [];
-      try { return [await processRepairPublicationJob(job, { configuration, database, gateway, logger, shutdownSignal: shutdown.signal })]; }
+      try { return [await processRepairPublicationJob(job, { configuration, database, gateway, logger, shutdownSignal: shutdown.signal, executionAuthority })]; }
       catch { return [{ id: job.id, status: 'failed' as const, output: { code: 'repair_publication_worker_failed' } }]; }
     });
     workerIds.push({ id: repairPublicationWorkerId, queue: REPAIR_PUBLICATION_QUEUE });

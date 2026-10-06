@@ -1,4 +1,4 @@
-import { and, eq, inArray } from 'drizzle-orm';
+import { and, eq, inArray, ne } from 'drizzle-orm';
 
 import {
   aiCandidateGeneration,
@@ -6,6 +6,8 @@ import {
   candidateVerificationAttempt,
   candidateVerificationEvidence,
   executionBudgetGrant,
+  executionBudgetGrantRevocation,
+  externalExecutionEvent,
   externalExecutionLease,
   externalExecutionReservation,
   humanReviewDecision,
@@ -17,8 +19,7 @@ import {
   repairPublication,
 } from '../../db/schema.ts';
 import type { VigiloDatabase } from '../db/types.ts';
-import { evidenceIdentityInput } from '../human-reviews/flow.ts';
-import { computeVerificationEvidenceIdentity } from '../human-reviews/identity.ts';
+import { computeVerificationEvidenceIdentity, evidenceIdentityInput } from '../human-reviews/identity.ts';
 import { computeReleaseAcceptanceIdentity, executionGrantIdentityMatches, executionReservationIdentityMatches } from '../external-execution/identity.ts';
 
 export type AcceptanceFailureCode = 'acceptance_missing' | 'acceptance_revoked' | 'acceptance_boundary_mismatch';
@@ -72,6 +73,49 @@ export function acceptanceIdentityPayload(row: typeof releaseAcceptance.$inferSe
   };
 }
 
+/** Recomputes the immutable execution audit; a terminal lease alone proves no transport. */
+export async function verifyAcceptanceExecutionAudit(database: VigiloDatabase, reservationIds: readonly string[]): Promise<boolean> {
+  if (new Set(reservationIds).size !== reservationIds.length) return false;
+  if (reservationIds.length === 0) return true;
+  const reservations = await database.select().from(externalExecutionReservation).where(inArray(externalExecutionReservation.id, [...reservationIds]));
+  const leases = await database.select().from(externalExecutionLease).where(inArray(externalExecutionLease.reservationId, [...reservationIds]));
+  const events = await database.select().from(externalExecutionEvent).where(inArray(externalExecutionEvent.reservationId, [...reservationIds]));
+  const grantIds = [...new Set(reservations.flatMap((reservation) => [reservation.grantId, reservation.accountGrantId]))];
+  const grants = grantIds.length ? await database.select().from(executionBudgetGrant).where(inArray(executionBudgetGrant.id, grantIds)) : [];
+  const revocations = grantIds.length ? await database.select().from(executionBudgetGrantRevocation).where(inArray(executionBudgetGrantRevocation.grantId, grantIds)) : [];
+  if (reservations.length !== reservationIds.length || leases.length !== reservationIds.length ||
+      grants.length !== grantIds.length || revocations.length !== 0 || grants.some((grant) => !executionGrantIdentityMatches(grant))) return false;
+  return reservations.every((reservation) => {
+    const grant = grants.find((value) => value.id === reservation.grantId);
+    const account = grants.find((value) => value.id === reservation.accountGrantId);
+    const lease = leases.find((value) => value.reservationId === reservation.id);
+    if (!grant || !account || !lease || !executionReservationIdentityMatches(reservation) || account.scope !== 'account' ||
+        !['operation', 'one_shot'].includes(grant.scope) || grant.workspaceId !== reservation.workspaceId ||
+        grant.repairRunId !== reservation.repairRunId || grant.githubRepositoryId !== reservation.githubRepositoryId ||
+        grant.baseCommitSha !== reservation.baseCommitSha || grant.operationCategory !== reservation.operationCategory ||
+        grant.providerId !== reservation.providerId || grant.modelId !== reservation.modelId ||
+        grant.acceptancePurpose !== reservation.acceptancePurpose || grant.sandboxResourceClass !== reservation.sandboxResourceClass ||
+        lease.fence !== reservation.fence || !['succeeded', 'failed'].includes(lease.state) || !lease.completedAt ||
+        lease.completedAt < reservation.createdAt || lease.completedAt >= lease.leaseExpiresAt ||
+        grant.expiresAt <= lease.completedAt || account.expiresAt <= lease.completedAt) return false;
+    const audit = events.filter((event) => event.reservationId === reservation.id);
+    const completedAt = lease.completedAt;
+    const reserved = audit.filter((event) => event.eventType === 'reserved');
+    const terminal = audit.filter((event) => ['completed', 'failed', 'expired'].includes(event.eventType));
+    const started = audit.filter((event) => event.eventType === 'attempt_started').sort((a, b) => a.attemptOrdinal! - b.attemptOrdinal!);
+    const outcomes = audit.filter((event) => ['attempt_succeeded', 'attempt_failed', 'attempt_ambiguous'].includes(event.eventType));
+    if (reserved.length !== 1 || terminal.length !== 1 || terminal[0]!.eventType !== (lease.state === 'succeeded' ? 'completed' : 'failed') ||
+        terminal[0]!.createdAt.getTime() !== completedAt.getTime() || started.length > reservation.reservedProviderAttempts ||
+        started.length !== outcomes.length ||
+        (reservation.reservedProviderAttempts > 0 && started.length === 0) ||
+        (lease.state === 'succeeded' && started.length > 0 && !outcomes.some((event) => event.eventType === 'attempt_succeeded')) ||
+        started.some((event, index) => event.attemptOrdinal !== index + 1 || outcomes.filter((outcome) => outcome.attemptOrdinal === event.attemptOrdinal).length !== 1) ||
+        outcomes.some((event) => event.eventType === 'attempt_ambiguous' || event.createdAt < reservation.createdAt || event.createdAt > completedAt)) return false;
+    return outcomes.reduce((sum, event) => sum + (event.inputTokens ?? 0), 0) <= reservation.reservedInputTokens &&
+      outcomes.reduce((sum, event) => sum + (event.outputTokens ?? 0), 0) <= reservation.reservedOutputTokens;
+  });
+}
+
 async function verifyRepairLoopEvidence(database: VigiloDatabase, row: typeof releaseAcceptance.$inferSelect): Promise<boolean> {
   if (!row.repairLoopId || !row.repairLoopIterationId || !row.aiCandidateGenerationId || !row.repairCandidateId ||
       !row.candidateVerificationId || !row.verificationEvidenceId || !row.candidateIdentity ||
@@ -95,13 +139,22 @@ async function verifyRepairLoopEvidence(database: VigiloDatabase, row: typeof re
   const boundLeases = reservationIds.length === 0 ? [] : await database.select().from(externalExecutionLease)
     .where(inArray(externalExecutionLease.reservationId, reservationIds));
   const allRunReservations = await database.select({ id: externalExecutionReservation.id }).from(externalExecutionReservation)
-    .where(and(eq(externalExecutionReservation.workspaceId, row.workspaceId), eq(externalExecutionReservation.repairRunId, row.repairRunId!)));
+    .where(and(
+      eq(externalExecutionReservation.workspaceId, row.workspaceId),
+      eq(externalExecutionReservation.repairRunId, row.repairRunId!),
+      ne(externalExecutionReservation.operationCategory, 'release_acceptance_one_shot'),
+    ));
   const sandboxIdentity = computeReleaseAcceptanceIdentity({
     sandboxName: evidence.sandboxName,
     sandboxSessionId: evidence.sandboxSessionId,
     verificationId: verification.id,
     evidenceId: evidence.id,
   });
+  const modelObserved = boundReservations.some((reservation) => reservation.operationCategory === 'gemini_candidate_generation' &&
+    reservation.providerId === row.providerId && reservation.modelId === row.modelId && reservation.reservedProviderAttempts > 0);
+  const sandboxObserved = boundReservations.some((reservation) => reservation.operationCategory === 'sandbox_verification' &&
+    reservation.providerId === 'vercel' && reservation.reservedSandboxIdentities === 1 && reservation.reservedVerificationAttempts === 1);
+  if (!modelObserved || !sandboxObserved || !(await verifyAcceptanceExecutionAudit(database, reservationIds))) return false;
   return loop.state === 'verified' && loop.workspaceId === row.workspaceId && loop.id === iteration.repairLoopId &&
     loop.selectedCandidateId === candidate.id && loop.selectedVerificationId === verification.id && loop.selectedEvidenceId === evidence.id &&
     iteration.decision === 'verified' && iteration.aiCandidateGenerationId === generation.id && iteration.candidateVerificationId === verification.id &&
@@ -152,6 +205,7 @@ async function verifySecurityCostEvidence(database: VigiloDatabase, row: typeof 
     .where(inArray(externalExecutionReservation.id, reservationIds));
   const leases = reservationIds.length === 0 ? [] : await database.select().from(externalExecutionLease)
     .where(inArray(externalExecutionLease.reservationId, reservationIds));
+  if (!(await verifyAcceptanceExecutionAudit(database, reservationIds))) return false;
   return reservations.length === reservationIds.length &&
     leases.length === reservationIds.length && leases.every((lease) => lease.state !== 'active') &&
     reservations.every((reservation) => (grant.scope === 'account' ? reservation.accountGrantId : reservation.grantId) === grant.id && reservation.workspaceId === row.workspaceId && executionReservationIdentityMatches(reservation));

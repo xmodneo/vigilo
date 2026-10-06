@@ -2,10 +2,15 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
+import { sql } from 'drizzle-orm';
 
 import { executionBudgetGrant, releaseAcceptance, releaseAcceptanceRevocation, user, workspace } from '../db/schema.ts';
 import { computeExecutionGrantIdentity, computeReleaseAcceptanceIdentity } from '../lib/external-execution/identity.ts';
 import { acceptanceIdentityPayload, ReleaseAcceptanceError, resolveReleaseAcceptance } from '../lib/release-acceptance/resolver.ts';
+import {
+  PUBLICATION_ACCEPTANCE_BOUNDARIES,
+  computePublicationBootstrapPurpose,
+} from '../lib/release-acceptance/publication-gate.ts';
 import { createTestContext } from './support.ts';
 
 async function seedAcceptance(state: 'pending' | 'passed' = 'passed', malformedGrant = false) {
@@ -55,6 +60,9 @@ test('exact passed acceptance resolves only for its immutable release boundary',
     { ...boundary, releasedCommitSha: '9'.repeat(40) },
     { ...boundary, boundaryVersion: 'external-authority-v2' },
     { ...boundary, workspaceId: randomUUID() },
+    { ...boundary, protocolVersion: 1 },
+    { ...boundary, providerId: 'fake-provider' },
+    { ...boundary, modelId: 'fake-model' },
   ]) await assert.rejects(resolveReleaseAcceptance(seeded.context.database, changed), (error: unknown) => error instanceof ReleaseAcceptanceError && ['acceptance_missing', 'acceptance_boundary_mismatch'].includes(error.code));
   await seeded.context.client.close();
 });
@@ -93,8 +101,85 @@ test('concurrent passed records cannot duplicate an exact release boundary', asy
   await seeded.context.client.close();
 });
 
-test('deterministic acceptance records cannot unlock production publication', async () => {
+test('resolver rejects an ambiguous passed boundary even if catalog guards are deliberately removed', async () => {
+  const seeded = await seedAcceptance();
+  await seeded.context.database.execute(sql`drop trigger release_acceptance_insert_guard on release_acceptance`);
+  await seeded.context.database.execute(sql`drop index release_acceptance_passed_boundary_unique`);
+  const duplicate = { ...seeded.row, id: randomUUID(), reviewedBy: 'second-reviewer', acceptanceIdentity: '' };
+  duplicate.acceptanceIdentity = computeReleaseAcceptanceIdentity(acceptanceIdentityPayload(duplicate));
+  await seeded.context.database.insert(releaseAcceptance).values(duplicate);
+  await assert.rejects(resolveReleaseAcceptance(seeded.context.database, {
+    kind: 'security_cost_control', workspaceId: seeded.workspaceId, releasedCommitSha: '7'.repeat(40), boundaryVersion: 'external-authority-v1',
+  }), (error: unknown) => error instanceof ReleaseAcceptanceError && error.code === 'acceptance_boundary_mismatch');
+  await seeded.context.client.close();
+});
+
+test('production publication uses the immutable composite acceptance resolver', async () => {
   const source = await readFile('lib/human-reviews/flow.ts', 'utf8');
-  assert.match(source, /function assertTask43LiveAcceptanceReleaseGate\(\): never[\s\S]*throw new HumanReviewError\('live_acceptance_pending'\)/);
-  assert.doesNotMatch(source, /resolveReleaseAcceptance/);
+  assert.doesNotMatch(source, /assertTask43LiveAcceptanceReleaseGate/);
+  assert.match(source, /resolvePublicationReleaseAuthority/);
+});
+
+test('worker artifacts exclude publication test adapters and runtime rejects injected resolvers outside the test harness', async () => {
+  const configuration = JSON.parse(await readFile('tsconfig.worker.json', 'utf8')) as { exclude: string[] };
+  assert.ok(configuration.exclude.includes('lib/repair-publications/testing.ts'));
+  const { processRepairPublicationJobWithResolverInternal } = await import('../lib/repair-publications/worker.ts');
+  const previous = process.env.NODE_TEST_CONTEXT;
+  delete process.env.NODE_TEST_CONTEXT;
+  let calls = 0;
+  try {
+    await assert.rejects(processRepairPublicationJobWithResolverInternal({} as never, {} as never, async () => {
+      calls += 1; throw new Error('test_override');
+    }), /publication_authority_mismatch/);
+    assert.equal(calls, 0);
+  } finally {
+    if (previous !== undefined) process.env.NODE_TEST_CONTEXT = previous;
+  }
+});
+
+test('production release identity has no Git or test-only fallback', async () => {
+  const source = await readFile('lib/operations/release.ts', 'utf8');
+  assert.doesNotMatch(source, /testReleaseSha|git\s+rev-parse|exec(File|Sync)?/);
+  assert.match(source, /environment\.VIGILO_RELEASE_SHA/);
+});
+
+test('publication acceptance boundaries require the exact complete live set', () => {
+  assert.deepEqual(PUBLICATION_ACCEPTANCE_BOUNDARIES, {
+    repair_loop_live: { boundaryVersion: 'repair-loop-live-v1', protocolVersion: 4, providerId: 'google', modelId: 'gemini-3.1-flash-lite' },
+    human_review_live: { boundaryVersion: 'human-review-v1' },
+    draft_publication_live: { boundaryVersion: 'draft-publication-v1' },
+    security_cost_control: { boundaryVersion: 'external-authority-v1' },
+  });
+});
+
+test('publication bootstrap purpose binds every publication subject identity and the release', () => {
+  const subject = {
+    workspaceId: randomUUID(), installationId: 101, githubRepositoryId: 202, baseCommitSha: '1'.repeat(40),
+    repairRunId: randomUUID(), repairLoopId: randomUUID(), repairLoopIterationId: randomUUID(),
+    aiCandidateGenerationId: randomUUID(), repairCandidateId: randomUUID(), candidateIdentity: '2'.repeat(64),
+    candidateVerificationId: randomUUID(), verificationEvidenceId: randomUUID(), verificationEvidenceIdentity: '3'.repeat(64),
+    humanReviewDecisionId: randomUUID(), humanReviewDecisionIdentity: '4'.repeat(64), reviewSubjectIdentity: '5'.repeat(64),
+  };
+  const purpose = computePublicationBootstrapPurpose(subject, '6'.repeat(40));
+  assert.match(purpose, /^draft-pr-v1:[0-9a-f]{64}$/);
+  assert.ok(purpose.length <= 80);
+  for (const changed of [
+    { ...subject, workspaceId: randomUUID() },
+    { ...subject, installationId: 102 },
+    { ...subject, githubRepositoryId: 203 },
+    { ...subject, baseCommitSha: '7'.repeat(40) },
+    { ...subject, repairRunId: randomUUID() },
+    { ...subject, repairLoopId: randomUUID() },
+    { ...subject, repairLoopIterationId: randomUUID() },
+    { ...subject, aiCandidateGenerationId: randomUUID() },
+    { ...subject, repairCandidateId: randomUUID() },
+    { ...subject, candidateIdentity: '8'.repeat(64) },
+    { ...subject, candidateVerificationId: randomUUID() },
+    { ...subject, verificationEvidenceId: randomUUID() },
+    { ...subject, verificationEvidenceIdentity: '9'.repeat(64) },
+    { ...subject, humanReviewDecisionId: randomUUID() },
+    { ...subject, humanReviewDecisionIdentity: 'a'.repeat(64) },
+    { ...subject, reviewSubjectIdentity: 'b'.repeat(64) },
+  ]) assert.notEqual(computePublicationBootstrapPurpose(changed, '6'.repeat(40)), purpose);
+  assert.notEqual(computePublicationBootstrapPurpose(subject, 'c'.repeat(40)), purpose);
 });

@@ -1,4 +1,5 @@
 import { canonicalRecord } from '../repair-loops/canonical.ts';
+import type { candidateVerificationAttempt, candidateVerificationEvidence } from '../../db/schema.ts';
 
 export const HUMAN_REVIEW_VERSION = 1 as const;
 
@@ -55,6 +56,64 @@ export interface VerificationEvidenceIdentityInput {
   startedAt: string;
   completedAt: string;
   durationMs: number;
+}
+
+export function evidenceIdentityInput(
+  row: typeof candidateVerificationEvidence.$inferSelect,
+  attempt: typeof candidateVerificationAttempt.$inferSelect,
+): VerificationEvidenceIdentityInput {
+  return {
+    evidenceVersion: row.evidenceVersion,
+    verificationId: row.verificationId,
+    attemptId: row.attemptId,
+    attemptVerificationId: attempt.verificationId,
+    attemptExpectedEvidenceId: attempt.expectedEvidenceId,
+    attemptEvidenceId: attempt.evidenceId,
+    attemptState: attempt.state,
+    evidenceId: row.id,
+    candidateId: row.candidateId,
+    candidateIdentity: row.candidateIdentity,
+    workspaceId: row.workspaceId,
+    githubRepositoryId: row.githubRepositoryId,
+    installationId: row.installationId,
+    baseCommitSha: row.baseCommitSha,
+    profileIdentity: row.profileIdentity,
+    baselineId: row.baselineId,
+    candidateArtifactIntegrity: row.candidateArtifactIntegrity,
+    distinctSandboxConfirmed: row.distinctSandboxConfirmed,
+    pristineSourceIdentity: row.pristineSourceIdentity,
+    pristineBaseIntegrity: row.pristineBaseIntegrity,
+    reconstructedSourceIdentity: row.reconstructedSourceIdentity,
+    candidateReconstruction: row.candidateReconstruction,
+    credentialsExposure: row.credentialsExposure,
+    networkPolicy: row.networkPolicy,
+    installStatus: row.installStatus,
+    installExitCode: row.installExitCode,
+    installTimedOut: row.installTimedOut,
+    typecheckStatus: row.typecheckStatus,
+    typecheckExitCode: row.typecheckExitCode,
+    typecheckTimedOut: row.typecheckTimedOut,
+    buildStatus: row.buildStatus,
+    buildExitCode: row.buildExitCode,
+    buildTimedOut: row.buildTimedOut,
+    testStatus: row.testStatus,
+    testExitCode: row.testExitCode,
+    testTimedOut: row.testTimedOut,
+    sourceIdentityAfter: row.sourceIdentityAfter,
+    sourceIntegrityUnchanged: row.sourceIntegrityUnchanged,
+    cleanupStop: row.cleanupStop,
+    cleanupDelete: row.cleanupDelete,
+    cleanupLookup: row.cleanupLookup,
+    executionOutcome: row.executionOutcome,
+    verificationContract: row.verificationContract,
+    baselineComparison: row.baselineComparison,
+    repairObjectiveEvidence: row.repairObjectiveEvidence,
+    errorPhase: row.errorPhase,
+    errorCode: row.errorCode,
+    startedAt: row.startedAt.toISOString(),
+    completedAt: row.completedAt.toISOString(),
+    durationMs: row.durationMs,
+  };
 }
 
 export interface HumanReviewSubjectIdentityInput {

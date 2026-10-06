@@ -129,10 +129,19 @@ endpoint contacts an external provider.
   fresh verification, real sandbox evidence reconciliation, live verified
   recovery, live second iteration, and real-provider crash/restart recovery are
   not live-validated.
-- The production publication resolver therefore cannot reach a GitHub write;
-  publication remains hard-closed with `live_acceptance_pending`.
+- The production publication resolver now requires the exact immutable
+  `repair_loop_live`, `human_review_live`, `draft_publication_live`, and
+  `security_cost_control` acceptance set for `VIGILO_RELEASE_SHA`. No such live
+  set exists, so publication remains hard-closed with `live_acceptance_pending`.
+  In the current zero-authority state, production publication cannot reach a GitHub write.
+- A server-only, expiring one-shot bootstrap path exists solely for a future,
+  separately authorized live draft-publication acceptance. It requires the
+  exact prior repair-loop, human-review, and security/cost acceptances plus a
+  subject-bound durable grant; no bootstrap grant or reservation exists today.
 - Effective external execution authority is zero. No current UI state creates a
   grant or acceptance.
+- The zero-spend policy remains in force. No live acceptance, provider request,
+  Sandbox creation, or GitHub publication occurred while wiring this gate.
 - Milestone 7.4 operational readiness is local and deterministic, not deployed
   production acceptance. Managed SaaS production readiness has not been established.
 

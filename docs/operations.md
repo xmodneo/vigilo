@@ -9,7 +9,33 @@ worker process must receive the same exact 40-character `VIGILO_RELEASE_SHA`.
 Readiness requires migration 0023 and a fresh `ready` worker heartbeat with the
 same release and exact seven-queue registration. Provider availability is not a
 readiness dependency. Task 4.3 live acceptance remains pending and draft
-publication remains hard-blocked.
+publication remains hard-blocked. Normal publication resolves the complete
+immutable four-kind acceptance set for the exact `VIGILO_RELEASE_SHA`; a later
+commit therefore invalidates that release acceptance.
+
+The first separately authorized live draft-publication acceptance may use a
+server-only one-shot bootstrap. That path remains unavailable unless the exact
+repair-loop, human-review, and security/cost acceptances already resolve and an
+expiring durable grant binds the workspace, installation, repository, frozen
+revision, run, loop iteration, generation, candidate, verification evidence,
+human decision, release, and draft-only operation. The reservation is consumed
+on success or ambiguity. It cannot merge, deploy, force-push, or update the
+default branch, and it is not exposed in the customer UI. No such grant or live
+acceptance exists today.
+
+The customer HTTP path accepts only the complete four-kind gate. A future
+operator procedure must reserve the first acceptance publication server-side;
+the customer endpoint cannot use bootstrap authority. Its recorded issuer and
+acceptance reviewer must resolve to the same existing GitHub-authenticated
+workspace owner who approved the exact subject. No grant or acceptance issuance
+API exists. Privileged database writers remain a trust boundary: canonical hashes
+prove consistency, not that a fabricated transport occurred. Test adapters are
+excluded from the worker build, and resolver injection is restricted to the Node
+test harness. Execution evidence requires matched provider-attempt events,
+terminal audit events, unrevoked grants, and matching lease fences.
+
+Revocation or privacy changes observed after a remote write prevent subsequent
+writes and local success; they cannot undo a remote side effect already executed.
 
 The source and model workers support public GitHub repositories only. A private
 repository may remain visible as historical metadata, but selection and every

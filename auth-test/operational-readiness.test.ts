@@ -40,7 +40,10 @@ test('production release identity is exact and has no fallback', () => {
   assert.equal(readRuntimeRelease({ NODE_ENV: 'production', VIGILO_RELEASE_SHA: sha }), sha);
   assert.throws(() => readRuntimeRelease({ NODE_ENV: 'production' }), /runtime_release_unavailable/);
   assert.throws(() => readRuntimeRelease({ NODE_ENV: 'production', VIGILO_RELEASE_SHA: 'main' }), /runtime_release_unavailable/);
-  assert.equal(readRuntimeRelease({ NODE_ENV: 'test' }, { testReleaseSha: sha }), sha);
+  for (const invalid of [` ${sha}`, `${sha}\n`, sha.toUpperCase(), sha.slice(1)]) {
+    assert.throws(() => readRuntimeRelease({ NODE_ENV: 'production', VIGILO_RELEASE_SHA: invalid }), /runtime_release_unavailable/);
+  }
+  assert.equal(readRuntimeRelease({ NODE_ENV: 'test', VIGILO_RELEASE_SHA: sha }), sha);
 });
 
 test('canonical worker queue set is exact and sorted', () => {

@@ -1,14 +1,17 @@
 import { createHash, randomUUID } from 'node:crypto';
 
-import { and, desc, eq, lte } from 'drizzle-orm';
+import { and, desc, eq, gt, inArray, lte } from 'drizzle-orm';
 import type { JobResult } from 'pg-boss';
 
-import { repairCandidateFile, repairPublication, repairPublicationAttempt, repairPublicationEvent, repository } from '../../db/schema.ts';
+import { executionBudgetGrant, externalExecutionLease, externalExecutionReservation, releaseAcceptance, repairCandidateFile, repairPublication, repairPublicationAttempt, repairPublicationEvent, repository } from '../../db/schema.ts';
 import type { VigiloDatabase } from '../db/types.ts';
 import type { GitHubAppConfiguration } from '../github-app/types.ts';
 import { assertPublicRepositoryAuthority, RepositoryPolicyError } from '../github-repositories/policy.ts';
-import { HumanReviewError, resolveApprovedPublicationAuthority } from '../human-reviews/flow.ts';
+import { DurableExternalExecutionAuthorizer } from '../external-execution/authority.ts';
+import { ExternalExecutionAuthorityError, type ExternalExecutionAuthorizer, type ExternalExecutionPermit } from '../external-execution/types.ts';
+import { HumanReviewError, resolveApprovedPublicationWorkerAuthority } from '../human-reviews/flow.ts';
 import type { ApprovedHumanReviewAuthority } from '../human-reviews/types.ts';
+import type { ApprovedPublicationAuthority } from '../release-acceptance/publication-gate.ts';
 import { selfCheckRepairCandidateForWorkspace } from '../repair-candidates/flow.ts';
 import { parseRepairPublicationJobPayload, REPAIR_JOB_MAX_ATTEMPTS, type RepairQueueJob } from '../repair-runs/queue.ts';
 import type { WorkerLogger } from '../repair-runs/worker.ts';
@@ -21,7 +24,12 @@ const HEARTBEAT_MS = 20_000;
 const REQUIRED_PERMISSIONS = { contents: 'write', metadata: 'read', pull_requests: 'write' } as const;
 type PublicationRow = typeof repairPublication.$inferSelect;
 type AttemptRow = typeof repairPublicationAttempt.$inferSelect;
-export type PublicationAuthorityResolver = typeof resolveApprovedPublicationAuthority;
+export type PublicationAuthorityResolver = (
+  database: VigiloDatabase,
+  workspaceId: string,
+  decisionId: string,
+  publicationId: string,
+) => Promise<ApprovedPublicationAuthority>;
 
 export interface RepairPublicationWorkerDependencies {
   configuration: GitHubAppConfiguration;
@@ -31,6 +39,7 @@ export interface RepairPublicationWorkerDependencies {
   shutdownSignal?: AbortSignal;
   clock?: () => Date;
   randomId?: () => string;
+  executionAuthority?: ExternalExecutionAuthorizer;
 }
 
 type Claim = { kind: 'attempt'; publication: PublicationRow; attempt: AttemptRow } | { kind: 'busy'; publication: PublicationRow } | { kind: 'terminal'; publication: PublicationRow } | { kind: 'exhausted'; publication: PublicationRow };
@@ -40,7 +49,7 @@ class PublicationWorkerError extends Error {
 }
 
 const leaseEnd = (now: Date) => new Date(now.getTime() + LEASE_MS);
-const safeCode = (error: unknown) => error instanceof PublicationWorkerError || error instanceof PublicationArtifactError || error instanceof HumanReviewError ? error.code : 'github_publication_failed';
+const safeCode = (error: unknown) => error instanceof PublicationWorkerError || error instanceof PublicationArtifactError || error instanceof HumanReviewError || error instanceof ExternalExecutionAuthorityError ? error.code : 'github_publication_failed';
 
 function authorityMatches(publication: PublicationRow, authority: ApprovedHumanReviewAuthority): boolean {
   return publication.workspaceId === authority.workspaceId && publication.repairRunId === authority.repairRunId && publication.repairLoopId === authority.repairLoopId &&
@@ -52,9 +61,34 @@ function authorityMatches(publication: PublicationRow, authority: ApprovedHumanR
     publication.profileIdentity === authority.profileIdentity && publication.objectiveContractHash === authority.objectiveContractHash && publication.objectiveEvidenceHash === authority.objectiveEvidenceHash;
 }
 
-async function currentAuthority(database: VigiloDatabase, publication: PublicationRow, resolver: PublicationAuthorityResolver): Promise<void> {
-  const authority = await resolver(database, publication.workspaceId, publication.humanReviewDecisionId);
+function sameReleaseAuthorization(left: ApprovedPublicationAuthority, right: ApprovedPublicationAuthority): boolean {
+  if (left.releaseAuthorization.mode !== right.releaseAuthorization.mode ||
+      left.releaseAuthorization.releasedCommitSha !== right.releaseAuthorization.releasedCommitSha ||
+      JSON.stringify(left.releaseAuthorization.acceptanceIds) !== JSON.stringify(right.releaseAuthorization.acceptanceIds)) return false;
+  if (left.releaseAuthorization.mode === 'normal' || right.releaseAuthorization.mode === 'normal') return left.releaseAuthorization.mode === right.releaseAuthorization.mode;
+  return left.releaseAuthorization.purpose === right.releaseAuthorization.purpose &&
+    left.releaseAuthorization.oneShotGrantId === right.releaseAuthorization.oneShotGrantId &&
+    left.releaseAuthorization.accountGrantId === right.releaseAuthorization.accountGrantId &&
+    left.releaseAuthorization.reservationId === right.releaseAuthorization.reservationId;
+}
+
+async function currentAuthority(database: VigiloDatabase, publication: PublicationRow, resolver: PublicationAuthorityResolver): Promise<ApprovedPublicationAuthority> {
+  const authority = await resolver(database, publication.workspaceId, publication.humanReviewDecisionId, publication.id);
   if (!authorityMatches(publication, authority)) throw new PublicationWorkerError('publication_authority_mismatch', 'failed');
+  return authority;
+}
+
+async function mutationAuthority(
+  dependencies: RepairPublicationWorkerDependencies,
+  publication: PublicationRow,
+  attempt: AttemptRow,
+  resolver: PublicationAuthorityResolver,
+  permit: ExternalExecutionPermit | null,
+  now: Date,
+): Promise<void> {
+  await currentAuthority(dependencies.database, publication, resolver);
+  if (permit) await permit.assertOwnership();
+  await assertOwnership(dependencies.database, attempt, now);
 }
 
 async function claimAttempt(database: VigiloDatabase, publicationId: string, queueJobId: string, now: Date, randomId: () => string): Promise<Claim> {
@@ -83,7 +117,7 @@ async function claimAttempt(database: VigiloDatabase, publicationId: string, que
 }
 
 async function assertOwnership(database: VigiloDatabase, attempt: AttemptRow, now: Date): Promise<void> {
-  const [owned] = await database.update(repairPublicationAttempt).set({ heartbeatAt: now, leaseExpiresAt: leaseEnd(now) }).where(and(eq(repairPublicationAttempt.id, attempt.id), eq(repairPublicationAttempt.ownershipToken, attempt.ownershipToken), eq(repairPublicationAttempt.state, 'active'))).returning();
+  const [owned] = await database.update(repairPublicationAttempt).set({ heartbeatAt: now, leaseExpiresAt: leaseEnd(now) }).where(and(eq(repairPublicationAttempt.id, attempt.id), eq(repairPublicationAttempt.ownershipToken, attempt.ownershipToken), eq(repairPublicationAttempt.state, 'active'), gt(repairPublicationAttempt.leaseExpiresAt, now))).returning();
   if (!owned) throw new PublicationWorkerError('publication_ownership_lost', 'retryable');
 }
 
@@ -162,15 +196,24 @@ async function verifyTargetBranch(dependencies: RepairPublicationWorkerDependenc
   if (head !== publication.expectedCommitSha) throw new PublicationWorkerError('github_branch_conflict', 'review_required');
 }
 
-async function execute(dependencies: RepairPublicationWorkerDependencies, initial: PublicationRow, attempt: AttemptRow, resolver: PublicationAuthorityResolver): Promise<PublicationRow> {
+async function execute(dependencies: RepairPublicationWorkerDependencies, initial: PublicationRow, attempt: AttemptRow, resolver: PublicationAuthorityResolver, permit: ExternalExecutionPermit | null): Promise<PublicationRow> {
   let publication = initial; const now = dependencies.clock ?? (() => new Date());
   try { await assertPublicRepositoryAuthority(dependencies.database, publication.workspaceId, publication.githubRepositoryId); }
   catch (error) { if (error instanceof RepositoryPolicyError) throw new PublicationWorkerError(error.code, 'failed'); throw error; }
-  await currentAuthority(dependencies.database, publication, resolver);
+  await mutationAuthority(dependencies, publication, attempt, resolver, permit, now());
   const installation = await dependencies.gateway.getInstallation(publication.installationId);
   if (installation.id !== publication.installationId || installation.appId !== dependencies.configuration.appId || installation.appSlug !== dependencies.configuration.appSlug || installation.suspendedAt !== null || !exactPermissions(installation.permissions)) throw new PublicationWorkerError('installation_unavailable', 'failed');
   const token = await dependencies.gateway.createPublicationAccessToken({ installationId: publication.installationId, repositoryId: publication.githubRepositoryId });
   const owner = token.repository.ownerLogin; const name = token.repository.name;
+  const revalidate = async () => {
+    const remote = await dependencies.gateway.getRepositoryMetadata(token.accessToken, owner, name);
+    if (remote.isPrivate) throw new PublicationWorkerError('private_repository_not_supported', 'review_required');
+    if (remote.id !== publication.githubRepositoryId || remote.fullName !== `${owner}/${name}` || remote.defaultBranch !== token.repository.defaultBranch) {
+      throw new PublicationWorkerError('repository_state_changed', 'review_required');
+    }
+    await assertPublicRepositoryAuthority(dependencies.database, publication.workspaceId, publication.githubRepositoryId);
+    await mutationAuthority(dependencies, publication, attempt, resolver, permit, now());
+  };
   let revocationFailed = false;
   let operationError: unknown = null;
   try {
@@ -182,17 +225,25 @@ async function execute(dependencies: RepairPublicationWorkerDependencies, initia
     } else if (publication.expectedBaseTreeSha !== prepared.baseTreeSha || publication.expectedTreeSha !== prepared.treeSha || publication.expectedCommitSha !== prepared.commit.sha || publication.targetBaseBranch !== token.repository.defaultBranch || publication.preparedPublicationIdentity !== computePreparedPublicationIdentity({ publicationIntentIdentity: publication.publicationIntentIdentity, targetBaseBranch: publication.targetBaseBranch, expectedBaseTreeSha: prepared.baseTreeSha, expectedTreeSha: prepared.treeSha, expectedCommitSha: prepared.commit.sha })) throw new PublicationWorkerError('prepared_authority_mismatch', 'failed');
 
     await currentAuthority(dependencies.database, publication, resolver);
+    if (permit) await permit.assertOwnership();
     if (!branchMayAlreadyExist(publication)) await verifyDefaultBranch(dependencies, publication, token.accessToken, owner, name, false);
     if (['authority_prepared'].includes(publication.checkpoint)) {
-      for (const blob of prepared.blobs) { await assertOwnership(dependencies.database, attempt, now()); const remote = await dependencies.gateway.createBlob({ accessToken: token.accessToken, owner, repository: name, bytes: blob.bytes }); if (remote !== blob.sha) throw new PublicationWorkerError('remote_object_mismatch', 'failed'); }
-      await assertOwnership(dependencies.database, attempt, now());
+      for (const blob of prepared.blobs) {
+        await revalidate();
+        const remote = await dependencies.gateway.createBlob({ accessToken: token.accessToken, owner, repository: name, bytes: blob.bytes });
+        await revalidate();
+        if (remote !== blob.sha) throw new PublicationWorkerError('remote_object_mismatch', 'failed');
+      }
+      await revalidate();
       const mutations = (await dependencies.database.select().from(repairCandidateFile).where(eq(repairCandidateFile.candidateId, publication.repairCandidateId))).map((file) => ({ path: file.path, mode: '100644' as const, type: 'blob' as const, sha: file.operation === 'delete' ? null : prepared.blobs.find((blob) => blob.path === file.path)!.sha }));
       const treeSha = await dependencies.gateway.createTree({ accessToken: token.accessToken, owner, repository: name, baseTreeSha: prepared.baseTreeSha, entries: mutations });
+      await revalidate();
       if (treeSha !== prepared.treeSha) throw new PublicationWorkerError('remote_object_mismatch', 'failed');
       const remoteTree = await dependencies.gateway.getTree({ accessToken: token.accessToken, owner, repository: name, treeSha });
       if (remoteTree.truncated || !verifyPreparedTree(prepared, remoteTree.entries.filter((entry) => entry.type !== 'tree').map((entry) => ({ path: entry.path, mode: entry.mode as '100644', type: entry.type as 'blob', sha: entry.sha })))) throw new PublicationWorkerError('remote_object_mismatch', 'failed');
-      await assertOwnership(dependencies.database, attempt, now());
+      await revalidate();
       const commitSha = await dependencies.gateway.createCommit({ accessToken: token.accessToken, owner, repository: name, message: prepared.commit.message, treeSha: prepared.treeSha, parentSha: publication.baseCommitSha, author: { ...prepared.commit.author, date: prepared.commit.committedAt } });
+      await revalidate();
       if (commitSha !== prepared.commit.sha) throw new PublicationWorkerError('remote_object_mismatch', 'failed');
       const commit = await dependencies.gateway.getCommit({ accessToken: token.accessToken, owner, repository: name, commitSha });
       if (commit.sha !== prepared.commit.sha || commit.treeSha !== prepared.treeSha || commit.parents.length !== 1 || commit.parents[0] !== publication.baseCommitSha || commit.message !== prepared.commit.message || commit.author.name !== prepared.commit.author.name || commit.author.email !== prepared.commit.author.email || commit.author.date !== prepared.commit.committedAt || JSON.stringify(commit.author) !== JSON.stringify(commit.committer)) throw new PublicationWorkerError('remote_object_mismatch', 'failed');
@@ -201,13 +252,16 @@ async function execute(dependencies: RepairPublicationWorkerDependencies, initia
 
     if (publication.checkpoint === 'objects_verified') publication = await checkpoint(dependencies, publication, attempt, { checkpoint: 'branch_create_requested', eventType: 'branch_requested' }, now());
     if (publication.checkpoint === 'branch_create_requested') {
-      await currentAuthority(dependencies.database, publication, resolver); await assertOwnership(dependencies.database, attempt, now());
+      await revalidate();
       let branch = await dependencies.gateway.getBranchCommit({ accessToken: token.accessToken, owner, repository: name, branch: publication.targetBranch });
       if (branch === null) {
         await currentAuthority(dependencies.database, publication, resolver);
+        if (permit) await permit.assertOwnership();
         await verifyDefaultBranch(dependencies, publication, token.accessToken, owner, name, false);
         await assertOwnership(dependencies.database, attempt, now());
+        await revalidate();
         try { await dependencies.gateway.createBranch({ accessToken: token.accessToken, owner, repository: name, branch: publication.targetBranch, commitSha: publication.expectedCommitSha! }); } catch { branch = await dependencies.gateway.getBranchCommit({ accessToken: token.accessToken, owner, repository: name, branch: publication.targetBranch }); if (branch === null) throw new PublicationWorkerError('github_branch_outcome_unknown', 'retryable'); }
+        await revalidate();
         branch = await dependencies.gateway.getBranchCommit({ accessToken: token.accessToken, owner, repository: name, branch: publication.targetBranch });
       }
       if (branch !== publication.expectedCommitSha) throw new PublicationWorkerError('github_branch_conflict', 'review_required');
@@ -216,15 +270,18 @@ async function execute(dependencies: RepairPublicationWorkerDependencies, initia
 
     if (publication.checkpoint === 'branch_verified') { await verifyTargetBranch(dependencies, publication, token.accessToken, owner, name); await verifyDefaultBranch(dependencies, publication, token.accessToken, owner, name, true); publication = await checkpoint(dependencies, publication, attempt, { checkpoint: 'pr_create_requested', eventType: 'pr_requested' }, now()); }
     if (publication.checkpoint === 'pr_create_requested') {
-      await currentAuthority(dependencies.database, publication, resolver); await verifyTargetBranch(dependencies, publication, token.accessToken, owner, name); await assertOwnership(dependencies.database, attempt, now());
+      await currentAuthority(dependencies.database, publication, resolver); if (permit) await permit.assertOwnership(); await verifyTargetBranch(dependencies, publication, token.accessToken, owner, name); await assertOwnership(dependencies.database, attempt, now());
       let matches = exactPullRequestMatches(await dependencies.gateway.listPullRequests({ accessToken: token.accessToken, owner, repository: name, head: publication.targetBranch, base: publication.targetBaseBranch! }), publication);
       if (matches.length === 0 && attempt.attemptNumber === 1) {
         await currentAuthority(dependencies.database, publication, resolver);
+        if (permit) await permit.assertOwnership();
         await verifyTargetBranch(dependencies, publication, token.accessToken, owner, name);
         await verifyDefaultBranch(dependencies, publication, token.accessToken, owner, name, true);
         await assertOwnership(dependencies.database, attempt, now());
+        await revalidate();
         try { const created = await dependencies.gateway.createDraftPullRequest({ accessToken: token.accessToken, owner, repository: name, title: publication.pullRequestTitle, body: publication.pullRequestBody, head: publication.targetBranch, base: publication.targetBaseBranch! }); matches = exactPullRequest(created, publication) ? [created] : []; }
         catch { matches = exactPullRequestMatches(await dependencies.gateway.listPullRequests({ accessToken: token.accessToken, owner, repository: name, head: publication.targetBranch, base: publication.targetBaseBranch! }), publication); }
+        await revalidate();
       }
       if (matches.length !== 1) throw new PublicationWorkerError(matches.length > 1 ? 'github_pr_ambiguous' : 'github_pr_outcome_unknown', 'review_required');
       const verified = await dependencies.gateway.getPullRequest({ accessToken: token.accessToken, owner, repository: name, number: matches[0]!.number });
@@ -232,10 +289,11 @@ async function execute(dependencies: RepairPublicationWorkerDependencies, initia
       publication = await checkpoint(dependencies, publication, attempt, { checkpoint: 'pr_verified', eventType: 'pr_verified', githubPullRequestId: verified.id, githubPullRequestNumber: verified.number, githubPullRequestNodeId: verified.nodeId, githubPullRequestUrl: verified.url }, now());
     }
     if (publication.checkpoint === 'pr_verified') {
-      await currentAuthority(dependencies.database, publication, resolver); await verifyTargetBranch(dependencies, publication, token.accessToken, owner, name); await verifyDefaultBranch(dependencies, publication, token.accessToken, owner, name, true); await assertOwnership(dependencies.database, attempt, now());
+      await currentAuthority(dependencies.database, publication, resolver); if (permit) await permit.assertOwnership(); await verifyTargetBranch(dependencies, publication, token.accessToken, owner, name); await verifyDefaultBranch(dependencies, publication, token.accessToken, owner, name, true); await assertOwnership(dependencies.database, attempt, now());
       if (publication.githubPullRequestNumber === null || publication.githubPullRequestId === null) throw new PublicationWorkerError('github_pr_mismatch', 'review_required');
       const verified = await dependencies.gateway.getPullRequest({ accessToken: token.accessToken, owner, repository: name, number: publication.githubPullRequestNumber });
       if (!exactPullRequest(verified, publication) || verified.id !== publication.githubPullRequestId) throw new PublicationWorkerError('github_pr_mismatch', 'review_required');
+      await revalidate();
     }
   } catch (error) {
     operationError = error;
@@ -248,6 +306,9 @@ async function execute(dependencies: RepairPublicationWorkerDependencies, initia
 }
 
 export async function processRepairPublicationJobWithResolverInternal(job: RepairQueueJob, dependencies: RepairPublicationWorkerDependencies, resolver: PublicationAuthorityResolver): Promise<JobResult> {
+  if (resolver !== resolveApprovedPublicationWorkerAuthority && !process.env.NODE_TEST_CONTEXT) {
+    throw new PublicationWorkerError('publication_authority_mismatch', 'failed');
+  }
   let payload;
   try { payload = parseRepairPublicationJobPayload(job.data); } catch { return { id: job.id, status: 'deadletter', output: { code: 'invalid_repair_publication_job_payload' } }; }
   const clock = dependencies.clock ?? (() => new Date()); const randomId = dependencies.randomId ?? randomUUID;
@@ -258,18 +319,82 @@ export async function processRepairPublicationJobWithResolverInternal(job: Repai
   job.signal?.addEventListener('abort', abort, { once: true }); dependencies.shutdownSignal?.addEventListener('abort', abort, { once: true });
   const heartbeat = setInterval(() => { void assertOwnership(dependencies.database, claim.attempt, clock()).catch(() => controller.abort()); }, HEARTBEAT_MS);
   let current = claim.publication;
+  let bootstrapPermit: ExternalExecutionPermit | null = null;
   try {
-    current = await execute(dependencies, current, claim.attempt, resolver);
+    const authority = await currentAuthority(dependencies.database, current, resolver);
+    if (authority.releaseAuthorization.mode === 'acceptance_bootstrap') {
+      const authorization = authority.releaseAuthorization;
+      bootstrapPermit = await (dependencies.executionAuthority ?? new DurableExternalExecutionAuthorizer(dependencies.database, { ...(dependencies.clock ? { clock: dependencies.clock } : {}) })).reserve({
+        grantId: authorization.oneShotGrantId,
+        accountGrantId: authorization.accountGrantId,
+        operationKey: current.id,
+        scope: {
+          workspaceId: current.workspaceId,
+          repairRunId: current.repairRunId,
+          githubRepositoryId: current.githubRepositoryId,
+          baseCommitSha: current.baseCommitSha,
+          operationCategory: 'release_acceptance_one_shot',
+          providerId: 'vigilo',
+          acceptancePurpose: authorization.purpose,
+        },
+        amounts: {
+          logicalRequests: 1, providerAttempts: 0, inputTokens: 0, outputTokens: 0,
+          sandboxIdentities: 0, sandboxRuntimeMs: 0, verificationAttempts: 0, repairLoopIterations: 0,
+        },
+      });
+    }
+    current = await execute(dependencies, current, claim.attempt, resolver, bootstrapPermit);
     if (controller.signal.aborted) throw new PublicationWorkerError('publication_ownership_lost', 'retryable');
+    const finalAuthority = await currentAuthority(dependencies.database, current, resolver);
+    if (bootstrapPermit) await bootstrapPermit.assertOwnership();
     await dependencies.database.transaction(async (transaction) => {
-      const [finishedAttempt] = await transaction.update(repairPublicationAttempt).set({ state: 'succeeded', completedAt: clock() }).where(and(eq(repairPublicationAttempt.id, claim.attempt.id), eq(repairPublicationAttempt.ownershipToken, claim.attempt.ownershipToken), eq(repairPublicationAttempt.state, 'active'))).returning();
+      const acceptanceIds = [...finalAuthority.releaseAuthorization.acceptanceIds];
+      // The empty set exists only behind lib/repair-publications/testing.ts.
+      // Both production modes return a fixed non-empty immutable set.
+      if (acceptanceIds.length > 0) {
+        const expectedCount = finalAuthority.releaseAuthorization.mode === 'normal' ? 4 : 3;
+        if (acceptanceIds.length !== expectedCount) throw new PublicationWorkerError('publication_authority_mismatch', 'failed');
+        const lockedAcceptances = await transaction.select().from(releaseAcceptance)
+          .where(inArray(releaseAcceptance.id, acceptanceIds)).orderBy(releaseAcceptance.id).for('update');
+        if (lockedAcceptances.length !== acceptanceIds.length) throw new PublicationWorkerError('publication_authority_mismatch', 'failed');
+        const evidenceReservations = lockedAcceptances.flatMap((acceptance) => acceptance.executionReservationIds);
+        const reservations = evidenceReservations.length ? await transaction.select().from(externalExecutionReservation)
+          .where(inArray(externalExecutionReservation.id, evidenceReservations)) : [];
+        const grantIds = [...new Set([
+          ...lockedAcceptances.flatMap((acceptance) => acceptance.executionBudgetGrantId ? [acceptance.executionBudgetGrantId] : []),
+          ...reservations.flatMap((reservation) => [reservation.grantId, reservation.accountGrantId]),
+          ...(finalAuthority.releaseAuthorization.mode === 'acceptance_bootstrap'
+            ? [finalAuthority.releaseAuthorization.accountGrantId, finalAuthority.releaseAuthorization.oneShotGrantId] : []),
+        ])].sort();
+        const lockedGrants = await transaction.select({ id: executionBudgetGrant.id }).from(executionBudgetGrant)
+          .where(inArray(executionBudgetGrant.id, grantIds)).orderBy(executionBudgetGrant.id).for('update');
+        if (lockedGrants.length !== grantIds.length) throw new PublicationWorkerError('publication_authority_mismatch', 'failed');
+        if (finalAuthority.releaseAuthorization.mode === 'acceptance_bootstrap') {
+          if (!bootstrapPermit) throw new PublicationWorkerError('publication_authority_mismatch', 'failed');
+          const [lockedLease] = await transaction.select({ id: externalExecutionLease.reservationId }).from(externalExecutionLease)
+            .where(and(
+              eq(externalExecutionLease.reservationId, bootstrapPermit.reservationId),
+              eq(externalExecutionLease.ownershipToken, bootstrapPermit.ownershipToken),
+              eq(externalExecutionLease.fence, bootstrapPermit.fence),
+              eq(externalExecutionLease.state, 'active'),
+            )).for('update').limit(1);
+          if (!lockedLease) throw new PublicationWorkerError('publication_authority_mismatch', 'failed');
+        }
+      }
+      const fencedAuthority = await currentAuthority(transaction as unknown as VigiloDatabase, current, resolver);
+      if (!sameReleaseAuthorization(finalAuthority, fencedAuthority)) throw new PublicationWorkerError('publication_authority_mismatch', 'failed');
+      const [finishedAttempt] = await transaction.update(repairPublicationAttempt).set({ state: 'succeeded', completedAt: clock() }).where(and(eq(repairPublicationAttempt.id, claim.attempt.id), eq(repairPublicationAttempt.ownershipToken, claim.attempt.ownershipToken), eq(repairPublicationAttempt.state, 'active'), gt(repairPublicationAttempt.leaseExpiresAt, clock()))).returning();
       if (!finishedAttempt) throw new PublicationWorkerError('publication_ownership_lost', 'retryable');
       const [published] = await transaction.update(repairPublication).set({ state: 'published', checkpoint: 'completed', completedAt: clock(), updatedAt: clock() }).where(and(eq(repairPublication.id, current.id), eq(repairPublication.state, 'publishing'), eq(repairPublication.checkpoint, 'pr_verified'))).returning();
       if (!published) throw new PublicationWorkerError('publication_ownership_lost', 'retryable');
       await transaction.insert(repairPublicationEvent).values({ id: randomId(), publicationId: current.id, attemptId: claim.attempt.id, workspaceId: current.workspaceId, fromState: 'publishing', toState: 'published', checkpoint: 'completed', eventType: 'completed', createdAt: clock() });
     });
+    if (bootstrapPermit) await bootstrapPermit.complete('succeeded');
     return { id: job.id, status: 'completed' };
   } catch (error) {
+    if (bootstrapPermit) {
+      try { await bootstrapPermit.complete('ambiguous', 'provider_attempt_ambiguous'); } catch { /* A terminal or fenced lease is already unusable. */ }
+    }
     const disposition = error instanceof PublicationWorkerError ? error.disposition : error instanceof PublicationArtifactError || error instanceof HumanReviewError ? 'failed' : 'retryable';
     const code = safeCode(error);
     if (disposition === 'retryable') {
@@ -290,5 +415,5 @@ export async function processRepairPublicationJobWithResolverInternal(job: Repai
 }
 
 export function processRepairPublicationJob(job: RepairQueueJob, dependencies: RepairPublicationWorkerDependencies): Promise<JobResult> {
-  return processRepairPublicationJobWithResolverInternal(job, dependencies, resolveApprovedPublicationAuthority);
+  return processRepairPublicationJobWithResolverInternal(job, dependencies, resolveApprovedPublicationWorkerAuthority);
 }

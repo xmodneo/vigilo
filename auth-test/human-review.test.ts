@@ -7,9 +7,10 @@ import { and, eq, sql } from 'drizzle-orm';
 import {
   account, aiCandidateGeneration, aiCandidateGenerationAttempt, aiInvestigation,
   candidateVerification, candidateVerificationAttempt, candidateVerificationEvidence,
-  executionProfile, githubInstallation, humanReviewDecision, investigation, repairCandidate,
+  executionBudgetGrant, executionBudgetGrantRevocation, executionProfile, externalExecutionLease, externalExecutionReservation,
+  githubInstallation, humanReviewDecision, investigation, repairCandidate,
   repairCandidateFile, repairIntent, repairLoop, repairLoopIteration, repairRun,
-  releaseAcceptance, repairPublication, repairPublicationAttempt, repairPublicationEvent, repository, repositoryBaseline, user, workspace,
+  releaseAcceptance, releaseAcceptanceRevocation, repairPublication, repairPublicationAttempt, repairPublicationEvent, repository, repositoryBaseline, user, workspace,
 } from '../db/schema.ts';
 import type { AuthenticatedWorkspace } from '../lib/auth/protected-context.ts';
 import { AccessDeniedError } from '../lib/auth/protected-context.ts';
@@ -34,10 +35,15 @@ import { parseRepairPublicationJobPayload, type TransactionalRepairPublicationQu
 import { prepareGitPublication, type PreparedGitPublication } from '../lib/repair-publications/git-objects.ts';
 import type { PublicationPullRequest, RepairPublicationGateway } from '../lib/repair-publications/types.ts';
 import { createRepairPublicationHandlers } from '../lib/repair-publications/handlers.ts';
+import { DurableExternalExecutionAuthorizer } from '../lib/external-execution/authority.ts';
+import { computeExecutionGrantIdentity, computeReleaseAcceptanceIdentity } from '../lib/external-execution/identity.ts';
+import { acceptanceIdentityPayload, ReleaseAcceptanceError } from '../lib/release-acceptance/resolver.ts';
+import { computePublicationBootstrapPurpose, resolvePublicationReleaseAuthority } from '../lib/release-acceptance/publication-gate.ts';
 
 const NOW = new Date('2032-02-03T04:05:06.000Z');
 const COMMIT = 'a'.repeat(40); const SOURCE = 'c'.repeat(64);
 const REPOSITORY_ID = 61001; const INSTALLATION_ID = 62001;
+const RELEASE_SHA = '7'.repeat(40);
 const FILE_CONTENT = '<script>alert("escaped")</script>\nexport const repaired = true;\n';
 
 test('publication queue payload contains only its durable publication identifier', () => {
@@ -126,12 +132,13 @@ class FakePublicationGateway implements RepairPublicationGateway {
   beforePullRequestList: (() => Promise<void>) | null = null;
   afterBranchCreate: (() => Promise<void>) | null = null;
   beforePullRequestGet: (() => Promise<void>) | null = null;
+  remoteRepositoryPrivate = false;
 
   constructor(private readonly row: PublicationRow, private readonly prepared: PreparedGitPublication) {}
   async getInstallation() { this.calls.push('installation'); return { id: INSTALLATION_ID, appId: 1, appSlug: 'vigilo', suspendedAt: null, permissions: { contents: 'write', metadata: 'read', pull_requests: 'write' } }; }
   async createPublicationAccessToken() { this.calls.push('token'); return { accessToken: 'test-token', expiresAt: new Date(NOW.getTime() + 30_000), repository: { id: REPOSITORY_ID, ownerLogin: 'reviewer', name: 'repo', fullName: 'reviewer/repo', defaultBranch: 'main', isPrivate: this.tokenRepositoryPrivate } }; }
   async revokeInstallationAccessToken() { this.calls.push('revoke'); this.revoked = true; if (this.failRevocation) throw new Error('revocation_failed'); }
-  async getRepositoryMetadata() { return { id: REPOSITORY_ID, ownerLogin: 'reviewer', name: 'repo', fullName: 'reviewer/repo', defaultBranch: 'main', isPrivate: false }; }
+  async getRepositoryMetadata() { return { id: REPOSITORY_ID, ownerLogin: 'reviewer', name: 'repo', fullName: 'reviewer/repo', defaultBranch: 'main', isPrivate: this.remoteRepositoryPrivate }; }
   async resolveBranchCommit() { this.defaultBranchReads += 1; return this.defaultBranchReads >= this.advanceDefaultAt ? '9'.repeat(40) : COMMIT; }
   async getBranchCommit() {
     const beforeRead = this.beforeBranchRead; this.beforeBranchRead = null;
@@ -179,6 +186,397 @@ async function approvedPublication(context: Awaited<ReturnType<typeof createTest
   const prepared = prepareGitPublication({ baseCommitSha: COMMIT, baseTreeSha: EMPTY_TREE, candidateIdentity: seeded.candidateIdentity, committedAt: NOW, files: [seeded.file], profileIdentity: seeded.profileIdentity, treeEntries: [] });
   return { authority, publication, row, prepared };
 }
+
+const grantLimits = {
+  logicalRequests: 10, providerAttempts: 10, inputTokens: 10_000, outputTokens: 10_000,
+  sandboxIdentities: 10, sandboxRuntimeMs: 100_000, verificationAttempts: 10, repairLoopIterations: 10,
+  maxConcurrentExternalOperations: 4,
+};
+
+async function insertAcceptance(
+  context: Awaited<ReturnType<typeof createTestContext>>,
+  values: Partial<typeof releaseAcceptance.$inferInsert> & Pick<typeof releaseAcceptance.$inferInsert, 'kind' | 'workspaceId'>,
+) {
+  const row = {
+    id: randomUUID(), version: 1, state: 'passed', releasedCommitSha: RELEASE_SHA,
+    protocolVersion: null, repairRunId: null, repairLoopId: null, repairLoopIterationId: null,
+    aiCandidateGenerationId: null, repairCandidateId: null, candidateIdentity: null,
+    candidateVerificationId: null, verificationEvidenceId: null, verificationEvidenceIdentity: null,
+    objectiveContractHash: null, objectiveEvidenceHash: null, humanReviewDecisionId: null,
+    repairPublicationId: null, providerId: null, modelId: null, sandboxExecutionIdentity: null,
+    executionBudgetGrantId: null, executionReservationIds: [] as string[], reviewedBy: 'release-reviewer',
+    acceptedAt: NOW, createdAt: NOW, acceptanceIdentity: '',
+    boundaryVersion: values.kind === 'repair_loop_live' ? 'repair-loop-live-v1'
+      : values.kind === 'human_review_live' ? 'human-review-v1'
+        : values.kind === 'draft_publication_live' ? 'draft-publication-v1' : 'external-authority-v1',
+    ...values,
+  } satisfies typeof releaseAcceptance.$inferInsert;
+  row.acceptanceIdentity = computeReleaseAcceptanceIdentity(acceptanceIdentityPayload(row as typeof releaseAcceptance.$inferSelect));
+  const [created] = await context.database.insert(releaseAcceptance).values(row).returning();
+  assert.ok(created);
+  return created;
+}
+
+async function seedPublicationAcceptances(context: Awaited<ReturnType<typeof createTestContext>>) {
+  const seeded = await approvedPublication(context);
+  const operatorId = seeded.authority.reviewerUserId;
+  const accountGrantId = randomUUID(); const operationGrantId = randomUUID();
+  const expiresAt = new Date('2033-01-01T00:00:00.000Z');
+  await context.database.insert(executionBudgetGrant).values({
+    id: accountGrantId, version: 1, scope: 'account', maxLogicalRequests: grantLimits.logicalRequests,
+    maxProviderAttempts: grantLimits.providerAttempts, maxInputTokens: grantLimits.inputTokens,
+    maxOutputTokens: grantLimits.outputTokens, maxSandboxIdentities: grantLimits.sandboxIdentities,
+    maxSandboxRuntimeMs: grantLimits.sandboxRuntimeMs, maxVerificationAttempts: grantLimits.verificationAttempts,
+    maxRepairLoopIterations: grantLimits.repairLoopIterations, maxConcurrentExternalOperations: grantLimits.maxConcurrentExternalOperations,
+    expiresAt, authorizedBy: operatorId, createdAt: NOW,
+    grantIdentity: computeExecutionGrantIdentity({ version: 1, scope: 'account', workspaceId: null, repairRunId: null,
+      githubRepositoryId: null, baseCommitSha: null, operationCategory: null, providerId: null, modelId: null,
+      acceptancePurpose: null, limits: grantLimits, expiresAt: expiresAt.toISOString(), authorizedBy: operatorId }),
+  });
+  const operationLimits = { ...grantLimits, logicalRequests: 1, repairLoopIterations: 1, maxConcurrentExternalOperations: 0 };
+  await context.database.insert(executionBudgetGrant).values({
+    id: operationGrantId, version: 1, scope: 'operation', workspaceId: seeded.authority.workspaceId,
+    repairRunId: seeded.authority.repairRunId, githubRepositoryId: REPOSITORY_ID, baseCommitSha: COMMIT,
+    operationCategory: 'repair_loop_iteration', providerId: 'vigilo', maxLogicalRequests: 1,
+    maxProviderAttempts: operationLimits.providerAttempts, maxInputTokens: operationLimits.inputTokens,
+    maxOutputTokens: operationLimits.outputTokens, maxSandboxIdentities: operationLimits.sandboxIdentities,
+    maxSandboxRuntimeMs: operationLimits.sandboxRuntimeMs, maxVerificationAttempts: operationLimits.verificationAttempts,
+    maxRepairLoopIterations: 1, maxConcurrentExternalOperations: 0, expiresAt, authorizedBy: operatorId, createdAt: NOW,
+    grantIdentity: computeExecutionGrantIdentity({ version: 1, scope: 'operation', workspaceId: seeded.authority.workspaceId,
+      repairRunId: seeded.authority.repairRunId, githubRepositoryId: REPOSITORY_ID, baseCommitSha: COMMIT,
+      operationCategory: 'repair_loop_iteration', providerId: 'vigilo', modelId: null, acceptancePurpose: null,
+      limits: operationLimits, expiresAt: expiresAt.toISOString(), authorizedBy: operatorId }),
+  });
+  const authorizer = new DurableExternalExecutionAuthorizer(context.database, { clock: () => NOW });
+  const execution = await authorizer.reserve({
+    grantId: operationGrantId, accountGrantId,
+    scope: { workspaceId: seeded.authority.workspaceId, repairRunId: seeded.authority.repairRunId,
+      githubRepositoryId: REPOSITORY_ID, baseCommitSha: COMMIT, operationCategory: 'repair_loop_iteration', providerId: 'vigilo' },
+    amounts: { logicalRequests: 1, providerAttempts: 0, inputTokens: 0, outputTokens: 0,
+      sandboxIdentities: 0, sandboxRuntimeMs: 0, verificationAttempts: 0, repairLoopIterations: 1 },
+  });
+  await execution.complete('succeeded');
+  const liveReservations = [execution.reservationId];
+  for (const category of ['gemini_candidate_generation', 'sandbox_verification'] as const) {
+    const model = category === 'gemini_candidate_generation';
+    const grantId = randomUUID();
+    const scope = { workspaceId: seeded.authority.workspaceId, repairRunId: seeded.authority.repairRunId,
+      githubRepositoryId: REPOSITORY_ID, baseCommitSha: COMMIT, operationCategory: category,
+      providerId: model ? 'google' : 'vercel', ...(model ? { modelId: 'gemini-3.1-flash-lite' } : {}) };
+    const amounts = { logicalRequests: 1, providerAttempts: 1, inputTokens: model ? 100 : 0, outputTokens: model ? 100 : 0,
+      sandboxIdentities: model ? 0 : 1, sandboxRuntimeMs: model ? 0 : 1000,
+      ...(!model ? { sandboxResourceClass: 'vcpu_1' as const } : {}), verificationAttempts: model ? 0 : 1, repairLoopIterations: 0 };
+    await context.database.insert(executionBudgetGrant).values({
+      id: grantId, version: 1, scope: 'operation', ...scope, maxLogicalRequests: 1, maxProviderAttempts: 1,
+      maxInputTokens: amounts.inputTokens, maxOutputTokens: amounts.outputTokens,
+      maxSandboxIdentities: amounts.sandboxIdentities, maxSandboxRuntimeMs: amounts.sandboxRuntimeMs,
+      sandboxResourceClass: model ? null : 'vcpu_1', maxVerificationAttempts: amounts.verificationAttempts,
+      maxRepairLoopIterations: 0, maxConcurrentExternalOperations: 0, expiresAt, authorizedBy: operatorId, createdAt: NOW,
+      grantIdentity: computeExecutionGrantIdentity({ version: 1, scope: 'operation', ...scope, modelId: model ? 'gemini-3.1-flash-lite' : null,
+        acceptancePurpose: null, limits: { ...amounts, maxConcurrentExternalOperations: 0 }, expiresAt: expiresAt.toISOString(), authorizedBy: operatorId }),
+    });
+    const permit = await authorizer.reserve({ grantId, accountGrantId, scope, amounts });
+    const ordinal = await permit.beginProviderAttempt();
+    await permit.finishProviderAttempt(ordinal, 'succeeded');
+    await permit.complete('succeeded');
+    liveReservations.push(permit.reservationId);
+  }
+  const [evidence] = await context.database.select().from(candidateVerificationEvidence)
+    .where(eq(candidateVerificationEvidence.id, seeded.authority.verificationEvidenceId));
+  assert.ok(evidence);
+  const repair = await insertAcceptance(context, {
+    kind: 'repair_loop_live', workspaceId: seeded.authority.workspaceId, protocolVersion: 4, reviewedBy: operatorId,
+    repairRunId: seeded.authority.repairRunId, repairLoopId: seeded.authority.repairLoopId,
+    repairLoopIterationId: seeded.authority.repairLoopIterationId, aiCandidateGenerationId: seeded.authority.aiCandidateGenerationId,
+    repairCandidateId: seeded.authority.repairCandidateId, candidateIdentity: seeded.authority.candidateIdentity,
+    candidateVerificationId: seeded.authority.candidateVerificationId, verificationEvidenceId: seeded.authority.verificationEvidenceId,
+    verificationEvidenceIdentity: seeded.authority.verificationEvidenceIdentity, objectiveContractHash: seeded.authority.objectiveContractHash,
+    objectiveEvidenceHash: seeded.authority.objectiveEvidenceHash, providerId: 'google', modelId: 'gemini-3.1-flash-lite',
+    sandboxExecutionIdentity: computeReleaseAcceptanceIdentity({ sandboxName: evidence.sandboxName, sandboxSessionId: evidence.sandboxSessionId,
+      verificationId: seeded.authority.candidateVerificationId, evidenceId: seeded.authority.verificationEvidenceId }),
+    executionBudgetGrantId: accountGrantId, executionReservationIds: liveReservations,
+  });
+  const human = await insertAcceptance(context, {
+    kind: 'human_review_live', workspaceId: seeded.authority.workspaceId, repairRunId: seeded.authority.repairRunId, reviewedBy: operatorId,
+    repairLoopId: seeded.authority.repairLoopId, repairLoopIterationId: seeded.authority.repairLoopIterationId,
+    aiCandidateGenerationId: seeded.authority.aiCandidateGenerationId, repairCandidateId: seeded.authority.repairCandidateId,
+    candidateIdentity: seeded.authority.candidateIdentity, candidateVerificationId: seeded.authority.candidateVerificationId,
+    verificationEvidenceId: seeded.authority.verificationEvidenceId, verificationEvidenceIdentity: seeded.authority.verificationEvidenceIdentity,
+    objectiveContractHash: seeded.authority.objectiveContractHash, objectiveEvidenceHash: seeded.authority.objectiveEvidenceHash,
+    humanReviewDecisionId: seeded.authority.humanReviewDecisionId,
+  });
+  const security = await insertAcceptance(context, {
+    kind: 'security_cost_control', workspaceId: seeded.authority.workspaceId, reviewedBy: operatorId,
+    executionBudgetGrantId: accountGrantId, executionReservationIds: liveReservations,
+  });
+  return { ...seeded, accountGrantId, authorizer, repair, human, security, expiresAt };
+}
+
+async function insertBootstrapGrant(
+  context: Awaited<ReturnType<typeof createTestContext>>,
+  seeded: Awaited<ReturnType<typeof seedPublicationAcceptances>>,
+  options: { purpose?: string; expiresAt?: Date; authorizedBy?: string } = {},
+) {
+  const id = randomUUID();
+  const purpose = options.purpose ?? computePublicationBootstrapPurpose(seeded.authority, RELEASE_SHA);
+  const expiresAt = options.expiresAt ?? seeded.expiresAt;
+  const authorizedBy = options.authorizedBy ?? seeded.authority.reviewerUserId;
+  const limits = { logicalRequests: 1, providerAttempts: 0, inputTokens: 0, outputTokens: 0,
+    sandboxIdentities: 0, sandboxRuntimeMs: 0, verificationAttempts: 0, repairLoopIterations: 0,
+    maxConcurrentExternalOperations: 0 };
+  await context.database.insert(executionBudgetGrant).values({
+    id, version: 1, scope: 'one_shot', workspaceId: seeded.authority.workspaceId,
+    repairRunId: seeded.authority.repairRunId, githubRepositoryId: REPOSITORY_ID, baseCommitSha: COMMIT,
+    operationCategory: 'release_acceptance_one_shot', providerId: 'vigilo', acceptancePurpose: purpose,
+    maxLogicalRequests: 1, maxProviderAttempts: 0, maxInputTokens: 0, maxOutputTokens: 0,
+    maxSandboxIdentities: 0, maxSandboxRuntimeMs: 0, maxVerificationAttempts: 0, maxRepairLoopIterations: 0,
+    maxConcurrentExternalOperations: 0, expiresAt, authorizedBy, createdAt: NOW,
+    grantIdentity: computeExecutionGrantIdentity({ version: 1, scope: 'one_shot', workspaceId: seeded.authority.workspaceId,
+      repairRunId: seeded.authority.repairRunId, githubRepositoryId: REPOSITORY_ID, baseCommitSha: COMMIT,
+      operationCategory: 'release_acceptance_one_shot', providerId: 'vigilo', modelId: null, acceptancePurpose: purpose,
+      limits, expiresAt: expiresAt.toISOString(), authorizedBy }),
+  });
+  return { id, purpose };
+}
+
+test('partial acceptance sets and wrong release or subject identities remain unavailable', async (t) => {
+  const context = await createTestContext(); t.after(() => context.client.close());
+  const seeded = await seedPublicationAcceptances(context);
+  await assert.rejects(
+    resolvePublicationReleaseAuthority(context.database, seeded.authority, RELEASE_SHA, { clock: () => NOW }),
+    (error: unknown) => error instanceof ReleaseAcceptanceError && error.code === 'acceptance_missing',
+  );
+  await assert.rejects(
+    resolvePublicationReleaseAuthority(context.database, seeded.authority, '8'.repeat(40), { clock: () => NOW }),
+    (error: unknown) => error instanceof ReleaseAcceptanceError && error.code === 'acceptance_missing',
+  );
+  await insertBootstrapGrant(context, seeded);
+  for (const changed of [
+    { ...seeded.authority, workspaceId: randomUUID() },
+    { ...seeded.authority, githubRepositoryId: REPOSITORY_ID + 1 },
+    { ...seeded.authority, baseCommitSha: '9'.repeat(40) },
+    { ...seeded.authority, repairCandidateId: randomUUID() },
+    { ...seeded.authority, candidateIdentity: '9'.repeat(64) },
+    { ...seeded.authority, candidateVerificationId: randomUUID() },
+    { ...seeded.authority, verificationEvidenceId: randomUUID() },
+    { ...seeded.authority, verificationEvidenceIdentity: '9'.repeat(64) },
+    { ...seeded.authority, humanReviewDecisionId: randomUUID() },
+  ]) await assert.rejects(resolvePublicationReleaseAuthority(context.database, changed, RELEASE_SHA, { clock: () => NOW }));
+});
+
+test('acceptance-publication bootstrap is exact, expiring, revocable, and one-shot under concurrency', async (t) => {
+  const context = await createTestContext(); t.after(() => context.client.close());
+  const seeded = await seedPublicationAcceptances(context);
+  const bootstrap = await insertBootstrapGrant(context, seeded);
+  const eligible = await resolvePublicationReleaseAuthority(context.database, seeded.authority, RELEASE_SHA, { clock: () => NOW });
+  assert.deepEqual(eligible.releaseAuthorization, {
+    mode: 'acceptance_bootstrap', releasedCommitSha: RELEASE_SHA,
+    acceptanceIds: [seeded.repair.id, seeded.human.id, seeded.security.id], purpose: bootstrap.purpose,
+    oneShotGrantId: bootstrap.id, accountGrantId: seeded.accountGrantId, reservationId: null,
+  });
+  const request = {
+    grantId: bootstrap.id, accountGrantId: seeded.accountGrantId, operationKey: seeded.publication.id,
+    scope: { workspaceId: seeded.authority.workspaceId, repairRunId: seeded.authority.repairRunId,
+      githubRepositoryId: REPOSITORY_ID, baseCommitSha: COMMIT, operationCategory: 'release_acceptance_one_shot' as const,
+      providerId: 'vigilo', acceptancePurpose: bootstrap.purpose },
+    amounts: { logicalRequests: 1, providerAttempts: 0, inputTokens: 0, outputTokens: 0,
+      sandboxIdentities: 0, sandboxRuntimeMs: 0, verificationAttempts: 0, repairLoopIterations: 0 },
+  };
+  const outcomes = await Promise.allSettled([seeded.authorizer.reserve(request), seeded.authorizer.reserve(request)]);
+  assert.equal(outcomes.filter((outcome) => outcome.status === 'fulfilled').length, 1);
+  const permit = outcomes.find((outcome): outcome is PromiseFulfilledResult<Awaited<ReturnType<typeof seeded.authorizer.reserve>>> => outcome.status === 'fulfilled')!.value;
+  const active = await resolvePublicationReleaseAuthority(context.database, seeded.authority, RELEASE_SHA, { clock: () => NOW, operationKey: seeded.publication.id });
+  assert.equal(active.releaseAuthorization.mode, 'acceptance_bootstrap');
+  if (active.releaseAuthorization.mode === 'acceptance_bootstrap') assert.equal(active.releaseAuthorization.reservationId, permit.reservationId);
+  await assert.rejects(resolvePublicationReleaseAuthority(context.database, seeded.authority, RELEASE_SHA, { clock: () => NOW }));
+  await permit.complete('ambiguous', 'provider_attempt_ambiguous');
+  await assert.rejects(resolvePublicationReleaseAuthority(context.database, seeded.authority, RELEASE_SHA, { clock: () => NOW, operationKey: seeded.publication.id }));
+
+  const expiredContext = await createTestContext(); t.after(() => expiredContext.client.close());
+  const expired = await seedPublicationAcceptances(expiredContext);
+  await insertBootstrapGrant(expiredContext, expired, { expiresAt: new Date(NOW.getTime() - 1_000) });
+  await assert.rejects(resolvePublicationReleaseAuthority(expiredContext.database, expired.authority, RELEASE_SHA, { clock: () => NOW }));
+
+  const revokedContext = await createTestContext(); t.after(() => revokedContext.client.close());
+  const revoked = await seedPublicationAcceptances(revokedContext); const revokedGrant = await insertBootstrapGrant(revokedContext, revoked);
+  await revokedContext.database.insert(executionBudgetGrantRevocation).values({ id: randomUUID(), grantId: revokedGrant.id, reasonCode: 'operator_revoked', revokedBy: 'release-operator', createdAt: NOW });
+  await assert.rejects(resolvePublicationReleaseAuthority(revokedContext.database, revoked.authority, RELEASE_SHA, { clock: () => NOW }),
+    (error: unknown) => error instanceof ReleaseAcceptanceError && error.code === 'acceptance_revoked');
+
+  const wrongContext = await createTestContext(); t.after(() => wrongContext.client.close());
+  const wrong = await seedPublicationAcceptances(wrongContext);
+  await insertBootstrapGrant(wrongContext, wrong, { purpose: `draft-pr-v1:${'f'.repeat(64)}` });
+  await assert.rejects(resolvePublicationReleaseAuthority(wrongContext.database, wrong.authority, RELEASE_SHA, { clock: () => NOW }));
+
+  const issuerContext = await createTestContext(); t.after(() => issuerContext.client.close());
+  const issuer = await seedPublicationAcceptances(issuerContext);
+  await insertBootstrapGrant(issuerContext, issuer, { authorizedBy: 'test-issuer' });
+  await assert.rejects(resolvePublicationReleaseAuthority(issuerContext.database, issuer.authority, RELEASE_SHA, { clock: () => NOW }));
+});
+
+test('normal HTTP authority cannot use the operator bootstrap', async (t) => {
+  const context = await createTestContext(); t.after(() => context.client.close());
+  const seeded = await seedPublicationAcceptances(context);
+  await insertBootstrapGrant(context, seeded);
+  const previous = process.env.VIGILO_RELEASE_SHA;
+  process.env.VIGILO_RELEASE_SHA = RELEASE_SHA;
+  try {
+    await assert.rejects(resolveApprovedPublicationAuthority(context.database, seeded.authority.workspaceId, seeded.authority.humanReviewDecisionId),
+      (error: unknown) => error instanceof HumanReviewError && error.code === 'live_acceptance_pending');
+  } finally {
+    if (previous === undefined) delete process.env.VIGILO_RELEASE_SHA;
+    else process.env.VIGILO_RELEASE_SHA = previous;
+  }
+});
+
+test('revoked cost authority and synthetic execution without provider audit cannot open bootstrap', async (t) => {
+  for (const scenario of ['revoked', 'no_provider_audit'] as const) {
+    const context = await createTestContext(); t.after(() => context.client.close());
+    const seeded = await seedPublicationAcceptances(context);
+    await insertBootstrapGrant(context, seeded);
+    if (scenario === 'revoked') await context.database.insert(executionBudgetGrantRevocation).values({
+      id: randomUUID(), grantId: seeded.accountGrantId, reasonCode: 'operator_revoked', revokedBy: 'release-operator', createdAt: NOW,
+    });
+    else {
+      await context.database.execute(sql`drop trigger external_execution_event_mutation_guard on external_execution_event`);
+      await context.database.execute(sql`delete from external_execution_event where event_type like 'attempt_%'`);
+    }
+    await assert.rejects(resolvePublicationReleaseAuthority(context.database, seeded.authority, RELEASE_SHA, { clock: () => NOW }));
+  }
+});
+
+test('a late branch response cannot revive an expired publication attempt or create a PR', async (t) => {
+  const context = await createTestContext(); t.after(() => context.client.close());
+  const seeded = await approvedPublication(context);
+  const gateway = new FakePublicationGateway(seeded.row, seeded.prepared);
+  let now = NOW;
+  gateway.afterBranchCreate = async () => { now = new Date(NOW.getTime() + 91_000); };
+  const result = await processRepairPublicationJobForTest(
+    { id: seeded.publication.id, data: { version: 1, publicationId: seeded.publication.id } } as never,
+    { database: context.database, configuration: { appId: 1, clientId: 'client', appSlug: 'vigilo', baseUrl: 'https://github.com' },
+      gateway, logger: { write() {} }, clock: () => now }, async () => seeded.authority,
+  );
+  assert.equal(result.status, 'failed');
+  assert.equal(gateway.calls.includes('pr'), false);
+  const [stored] = await context.database.select().from(repairPublication).where(eq(repairPublication.id, seeded.publication.id));
+  assert.notEqual(stored?.state, 'published');
+});
+
+test('a remote public-to-private transition fences the next publication write', async (t) => {
+  const context = await createTestContext(); t.after(() => context.client.close());
+  const seeded = await approvedPublication(context);
+  const gateway = new FakePublicationGateway(seeded.row, seeded.prepared);
+  gateway.afterBranchCreate = async () => { gateway.remoteRepositoryPrivate = true; };
+  await processRepairPublicationJobForTest(
+    { id: seeded.publication.id, data: { version: 1, publicationId: seeded.publication.id } } as never,
+    { database: context.database, configuration: { appId: 1, clientId: 'client', appSlug: 'vigilo', baseUrl: 'https://github.com' },
+      gateway, logger: { write() {} }, clock: () => NOW }, async () => seeded.authority,
+  );
+  assert.equal(gateway.calls.includes('branch'), true);
+  assert.equal(gateway.calls.includes('pr'), false);
+  assert.equal(gateway.revoked, true);
+  const [stored] = await context.database.select().from(repairPublication).where(eq(repairPublication.id, seeded.publication.id));
+  assert.equal(stored?.failureCode, 'private_repository_not_supported');
+  assert.notEqual(stored?.state, 'published');
+});
+
+test('the complete exact acceptance set opens only normal publication and revocation closes it', async (t) => {
+  const context = await createTestContext(); t.after(() => context.client.close());
+  const seeded = await seedPublicationAcceptances(context);
+  const bootstrap = await insertBootstrapGrant(context, seeded);
+  const gateway = new FakePublicationGateway(seeded.row, seeded.prepared);
+  const resolver = (database: typeof context.database) => resolvePublicationReleaseAuthority(database, seeded.authority, RELEASE_SHA, { clock: () => NOW, operationKey: seeded.publication.id });
+  const published = await processRepairPublicationJobForTest(
+    { id: seeded.publication.id, data: { version: 1, publicationId: seeded.publication.id } } as never,
+    { database: context.database, configuration: { appId: 1, clientId: 'client', appSlug: 'vigilo', baseUrl: 'https://github.com' },
+      gateway, logger: { write() {} }, clock: () => NOW, executionAuthority: seeded.authorizer },
+    resolver,
+  );
+  assert.equal(published.status, 'completed');
+  const [reservation] = await context.database.select().from(externalExecutionReservation)
+    .where(eq(externalExecutionReservation.operationKey, seeded.publication.id));
+  assert.ok(reservation);
+  const [lease] = await context.database.select().from(externalExecutionLease)
+    .where(eq(externalExecutionLease.reservationId, reservation.id));
+  assert.equal(lease?.state, 'succeeded');
+  const draft = await insertAcceptance(context, {
+    kind: 'draft_publication_live', workspaceId: seeded.authority.workspaceId, reviewedBy: seeded.authority.reviewerUserId,
+    repairRunId: seeded.authority.repairRunId, repairLoopId: seeded.authority.repairLoopId,
+    repairLoopIterationId: seeded.authority.repairLoopIterationId, aiCandidateGenerationId: seeded.authority.aiCandidateGenerationId,
+    repairCandidateId: seeded.authority.repairCandidateId, candidateIdentity: seeded.authority.candidateIdentity,
+    candidateVerificationId: seeded.authority.candidateVerificationId, verificationEvidenceId: seeded.authority.verificationEvidenceId,
+    verificationEvidenceIdentity: seeded.authority.verificationEvidenceIdentity, objectiveContractHash: seeded.authority.objectiveContractHash,
+    objectiveEvidenceHash: seeded.authority.objectiveEvidenceHash, humanReviewDecisionId: seeded.authority.humanReviewDecisionId,
+    repairPublicationId: seeded.publication.id, executionBudgetGrantId: bootstrap.id, executionReservationIds: [reservation.id],
+  });
+  const resolved = await resolvePublicationReleaseAuthority(context.database, seeded.authority, RELEASE_SHA, { clock: () => NOW });
+  assert.equal(resolved.releaseAuthorization.mode, 'normal');
+  for (const changed of [
+    { ...seeded.authority, githubRepositoryId: REPOSITORY_ID + 1 },
+    { ...seeded.authority, baseCommitSha: '9'.repeat(40) },
+    { ...seeded.authority, repairCandidateId: randomUUID() },
+    { ...seeded.authority, candidateIdentity: '9'.repeat(64) },
+    { ...seeded.authority, candidateVerificationId: randomUUID() },
+    { ...seeded.authority, verificationEvidenceId: randomUUID() },
+    { ...seeded.authority, verificationEvidenceIdentity: '9'.repeat(64) },
+    { ...seeded.authority, humanReviewDecisionId: randomUUID() },
+    { ...seeded.authority, humanReviewDecisionIdentity: '9'.repeat(64) },
+    { ...seeded.authority, reviewSubjectIdentity: '9'.repeat(64) },
+  ]) await assert.rejects(
+    resolvePublicationReleaseAuthority(context.database, changed, RELEASE_SHA, { clock: () => NOW }),
+    (error: unknown) => error instanceof ReleaseAcceptanceError && error.code === 'acceptance_boundary_mismatch',
+  );
+  await context.database.insert(releaseAcceptanceRevocation).values({ id: randomUUID(), acceptanceId: draft.id, reasonCode: 'boundary_changed', revokedBy: 'release-reviewer', createdAt: NOW });
+  await assert.rejects(resolvePublicationReleaseAuthority(context.database, seeded.authority, RELEASE_SHA, { clock: () => NOW }),
+    (error: unknown) => error instanceof ReleaseAcceptanceError && error.code === 'acceptance_revoked');
+});
+
+test('bootstrap worker consumes ambiguity and post-response revocation fences further GitHub writes', async (t) => {
+  const run = async (revokeAfterBranch: boolean) => {
+    const context = await createTestContext(); t.after(() => context.client.close());
+    const seeded = await seedPublicationAcceptances(context);
+    await insertBootstrapGrant(context, seeded);
+    const gateway = new FakePublicationGateway(seeded.row, seeded.prepared);
+    gateway.uncertainPr = !revokeAfterBranch;
+    if (revokeAfterBranch) gateway.afterBranchCreate = async () => {
+      await context.database.insert(releaseAcceptanceRevocation).values({
+        id: randomUUID(), acceptanceId: seeded.human.id, reasonCode: 'boundary_changed', revokedBy: 'release-reviewer', createdAt: NOW,
+      });
+    };
+    const resolver = async (database: typeof context.database) => {
+      try {
+        return await resolvePublicationReleaseAuthority(database, seeded.authority, RELEASE_SHA, { clock: () => NOW, operationKey: seeded.publication.id });
+      } catch {
+        throw new HumanReviewError('live_acceptance_pending');
+      }
+    };
+    const result = await processRepairPublicationJobForTest(
+      { id: seeded.publication.id, data: { version: 1, publicationId: seeded.publication.id } } as never,
+      { database: context.database, configuration: { appId: 1, clientId: 'client', appSlug: 'vigilo', baseUrl: 'https://github.com' },
+        gateway, logger: { write() {} }, clock: () => NOW, executionAuthority: seeded.authorizer },
+      resolver,
+    );
+    assert.equal(result.status, 'completed');
+    const [reservation] = await context.database.select().from(externalExecutionReservation)
+      .where(eq(externalExecutionReservation.operationKey, seeded.publication.id));
+    assert.ok(reservation);
+    const [lease] = await context.database.select().from(externalExecutionLease)
+      .where(eq(externalExecutionLease.reservationId, reservation.id));
+    assert.equal(lease?.state, 'ambiguous');
+    assert.equal(gateway.calls.includes('branch'), true);
+    assert.equal(gateway.calls.includes('pr'), !revokeAfterBranch);
+    const beforeRetry = [...gateway.calls];
+    await processRepairPublicationJobForTest(
+      { id: seeded.publication.id, data: { version: 1, publicationId: seeded.publication.id } } as never,
+      { database: context.database, configuration: { appId: 1, clientId: 'client', appSlug: 'vigilo', baseUrl: 'https://github.com' },
+        gateway, logger: { write() {} }, clock: () => NOW, executionAuthority: seeded.authorizer },
+      resolver,
+    );
+    assert.deepEqual(gateway.calls, beforeRetry);
+  };
+  await run(false);
+  await run(true);
+});
 
 test('eligible exact evidence can be approved and remains immutable and release-gated', async (t) => {
   const context = await createTestContext(); t.after(() => context.client.close());

@@ -18,6 +18,7 @@
   ],
   "exclude": [
     "node_modules",
+    "lib/repair-publications/testing.ts",
     "dist",
     ".next",
     ".web-test-dist",

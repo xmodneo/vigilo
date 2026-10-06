@@ -23,6 +23,12 @@ import { assertPublicRepositoryAuthority, RepositoryPolicyError } from '../githu
 import { selfCheckRepairCandidateForWorkspace } from '../repair-candidates/flow.ts';
 import { frozenBaselineProfile } from '../repository-baselines/authority.ts';
 import { canonicalRecord } from '../repair-loops/canonical.ts';
+import { readRuntimeRelease } from '../operations/release.ts';
+import { ReleaseAcceptanceError } from '../release-acceptance/resolver.ts';
+import {
+  resolvePublicationReleaseAuthority,
+  type ApprovedPublicationAuthority,
+} from '../release-acceptance/publication-gate.ts';
 import {
   evaluateBaselineRecovery,
   deriveBaselineRecoveryContract,
@@ -34,8 +40,8 @@ import {
   computeHumanReviewDecisionIdentity,
   computeHumanReviewSubjectIdentity,
   computeVerificationEvidenceIdentity,
+  evidenceIdentityInput,
   type HumanReviewDecision,
-  type VerificationEvidenceIdentityInput,
 } from './identity.ts';
 import {
   TASK_4_3_LIVE_ACCEPTANCE_STATUS,
@@ -80,64 +86,6 @@ function publicDecision(row: DecisionRow): HumanReviewDecisionResult {
     reviewerUserId: row.reviewerUserId,
     decisionIdentity: row.decisionIdentity,
     createdAt: row.createdAt,
-  };
-}
-
-export function evidenceIdentityInput(
-  row: typeof candidateVerificationEvidence.$inferSelect,
-  attempt: typeof candidateVerificationAttempt.$inferSelect,
-): VerificationEvidenceIdentityInput {
-  return {
-    evidenceVersion: row.evidenceVersion,
-    verificationId: row.verificationId,
-    attemptId: row.attemptId,
-    attemptVerificationId: attempt.verificationId,
-    attemptExpectedEvidenceId: attempt.expectedEvidenceId,
-    attemptEvidenceId: attempt.evidenceId,
-    attemptState: attempt.state,
-    evidenceId: row.id,
-    candidateId: row.candidateId,
-    candidateIdentity: row.candidateIdentity,
-    workspaceId: row.workspaceId,
-    githubRepositoryId: row.githubRepositoryId,
-    installationId: row.installationId,
-    baseCommitSha: row.baseCommitSha,
-    profileIdentity: row.profileIdentity,
-    baselineId: row.baselineId,
-    candidateArtifactIntegrity: row.candidateArtifactIntegrity,
-    distinctSandboxConfirmed: row.distinctSandboxConfirmed,
-    pristineSourceIdentity: row.pristineSourceIdentity,
-    pristineBaseIntegrity: row.pristineBaseIntegrity,
-    reconstructedSourceIdentity: row.reconstructedSourceIdentity,
-    candidateReconstruction: row.candidateReconstruction,
-    credentialsExposure: row.credentialsExposure,
-    networkPolicy: row.networkPolicy,
-    installStatus: row.installStatus,
-    installExitCode: row.installExitCode,
-    installTimedOut: row.installTimedOut,
-    typecheckStatus: row.typecheckStatus,
-    typecheckExitCode: row.typecheckExitCode,
-    typecheckTimedOut: row.typecheckTimedOut,
-    buildStatus: row.buildStatus,
-    buildExitCode: row.buildExitCode,
-    buildTimedOut: row.buildTimedOut,
-    testStatus: row.testStatus,
-    testExitCode: row.testExitCode,
-    testTimedOut: row.testTimedOut,
-    sourceIdentityAfter: row.sourceIdentityAfter,
-    sourceIntegrityUnchanged: row.sourceIntegrityUnchanged,
-    cleanupStop: row.cleanupStop,
-    cleanupDelete: row.cleanupDelete,
-    cleanupLookup: row.cleanupLookup,
-    executionOutcome: row.executionOutcome,
-    verificationContract: row.verificationContract,
-    baselineComparison: row.baselineComparison,
-    repairObjectiveEvidence: row.repairObjectiveEvidence,
-    errorPhase: row.errorPhase,
-    errorCode: row.errorCode,
-    startedAt: row.startedAt.toISOString(),
-    completedAt: row.completedAt.toISOString(),
-    durationMs: row.durationMs,
   };
 }
 
@@ -378,12 +326,24 @@ export async function getHumanReview(database: VigiloDatabase, context: Authenti
   const loaded = await loadEligibleSubject(database, context.workspace.id, repairRunId);
   const history = await safeHistory(database, loop.id);
   if (!loaded.value) return { repairRunId, status: 'ineligible', ineligibleReason: loaded.reason, reviewSubjectIdentity: null, liveAcceptanceStatus: TASK_4_3_LIVE_ACCEPTANCE_STATUS, subject: null, decision: decision ? publicDecision(decision) : null, history };
+  let liveAcceptanceStatus: HumanReviewResult['liveAcceptanceStatus'] = TASK_4_3_LIVE_ACCEPTANCE_STATUS;
+  if (decision?.decision === 'approved') {
+    try {
+      const authority = await resolveApprovedHumanReviewAuthority(database, context.workspace.id, decision.id);
+      const releaseAuthority = await resolvePublicationReleaseAuthority(database, authority, readRuntimeRelease());
+      liveAcceptanceStatus = releaseAuthority.releaseAuthorization.mode === 'normal' ? 'passed' : 'pending';
+    } catch (error) {
+      liveAcceptanceStatus = error instanceof ReleaseAcceptanceError
+        ? error.code === 'acceptance_revoked' ? 'revoked' : error.code === 'acceptance_boundary_mismatch' ? 'failed' : 'pending'
+        : 'pending';
+    }
+  }
   return {
     repairRunId,
     status: decision ? 'decided' : 'awaiting_decision',
     ineligibleReason: null,
     reviewSubjectIdentity: loaded.value.subjectIdentity,
-    liveAcceptanceStatus: TASK_4_3_LIVE_ACCEPTANCE_STATUS,
+    liveAcceptanceStatus,
     subject: loaded.value.subject,
     decision: decision ? publicDecision(decision) : null,
     history,
@@ -514,16 +474,31 @@ export async function resolveApprovedHumanReviewAuthority(
   };
 }
 
-function assertTask43LiveAcceptanceReleaseGate(): never {
-  throw new HumanReviewError('live_acceptance_pending');
-}
-
 export async function resolveApprovedPublicationAuthority(
   database: VigiloDatabase,
   workspaceId: string,
   decisionId: string,
-): Promise<ApprovedHumanReviewAuthority> {
+): Promise<ApprovedPublicationAuthority> {
   const authority = await resolveApprovedHumanReviewAuthority(database, workspaceId, decisionId);
-  assertTask43LiveAcceptanceReleaseGate();
-  return authority;
+  try {
+    const resolved = await resolvePublicationReleaseAuthority(database, authority, readRuntimeRelease());
+    if (resolved.releaseAuthorization.mode !== 'normal') throw new HumanReviewError('live_acceptance_pending');
+    return resolved;
+  } catch {
+    throw new HumanReviewError('live_acceptance_pending');
+  }
+}
+
+export async function resolveApprovedPublicationWorkerAuthority(
+  database: VigiloDatabase,
+  workspaceId: string,
+  decisionId: string,
+  publicationId: string,
+): Promise<ApprovedPublicationAuthority> {
+  const authority = await resolveApprovedHumanReviewAuthority(database, workspaceId, decisionId);
+  try {
+    return await resolvePublicationReleaseAuthority(database, authority, readRuntimeRelease(), { operationKey: publicationId });
+  } catch {
+    throw new HumanReviewError('live_acceptance_pending');
+  }
 }
