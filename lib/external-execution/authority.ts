@@ -12,6 +12,7 @@ import {
 } from '../../db/schema.ts';
 import type { VigiloDatabase } from '../db/types.ts';
 import { computeExecutionReservationIdentity, executionGrantIdentityMatches } from './identity.ts';
+import { SandboxTransportError } from './sandbox-auth.ts';
 import {
   ExternalExecutionAuthorityError,
   type ExternalExecutionAuthorizer,
@@ -266,7 +267,7 @@ export class DurableExternalExecutionAuthorizer implements ExternalExecutionAuth
         return ordinal;
       })),
       finishProviderAttempt: async (ordinal, outcome, usage = {}) => authorityOperation(() => database.transaction(async (transaction) => {
-        await owned(transaction, { lock: true, requireFresh: true, requireGrant: false });
+        await owned(transaction, { lock: true, requireFresh: true, requireGrant: outcome === 'succeeded' });
         await transaction.insert(externalExecutionEvent).values({
           id: randomId(), reservationId: reservation.id, eventType: terminalEvent(outcome), attemptOrdinal: ordinal,
           failureCode: outcome === 'ambiguous' ? 'provider_attempt_ambiguous' : null,
@@ -282,7 +283,7 @@ export class DurableExternalExecutionAuthorizer implements ExternalExecutionAuth
         await transaction.insert(externalExecutionEvent).values({ id: randomId(), reservationId: reservation.id, eventType: 'lease_renewed', createdAt: now });
       })),
       complete: async (outcome, failureCode) => authorityOperation(() => database.transaction(async (transaction) => {
-        await owned(transaction, { lock: true, requireFresh: outcome === 'succeeded', requireGrant: false });
+        await owned(transaction, { lock: true, requireFresh: outcome === 'succeeded', requireGrant: outcome === 'succeeded' });
         const now = clock();
         const state = outcome === 'succeeded' ? 'succeeded' : outcome === 'failed' ? 'failed' : 'ambiguous';
         const code = state === 'succeeded' ? null : failureCode ?? (state === 'ambiguous' ? 'provider_attempt_ambiguous' : 'execution_authority_mismatch');
@@ -292,16 +293,33 @@ export class DurableExternalExecutionAuthorizer implements ExternalExecutionAuth
         await transaction.insert(externalExecutionEvent).values({ id: randomId(), reservationId: reservation.id, eventType: state === 'succeeded' ? 'completed' : 'failed', failureCode: code, createdAt: now });
       })),
       meteredFetch: async (input, init) => {
-        const ordinal = await permit.beginProviderAttempt();
-        let response: Response;
+        const sandbox = reservation.operationCategory === 'sandbox_baseline' || reservation.operationCategory === 'sandbox_verification';
         try {
-          response = await fetchImplementation(input, init);
+          const signal = init?.signal ?? (input instanceof Request ? input.signal : undefined);
+          signal?.throwIfAborted();
+          const ordinal = await permit.beginProviderAttempt();
+          let response: Response;
+          try {
+            signal?.throwIfAborted();
+            response = await fetchImplementation(input, sandbox ? { ...init, redirect: 'manual' } : init);
+          } catch (error) {
+            await permit.finishProviderAttempt(ordinal, 'ambiguous');
+            throw error;
+          }
+          await permit.finishProviderAttempt(ordinal, response.ok ? 'succeeded' : 'failed');
+          if (sandbox && response.status >= 300 && response.status < 400) {
+            await response.body?.cancel().catch(() => undefined);
+            throw new SandboxTransportError();
+          }
+          return response;
         } catch (error) {
-          await permit.finishProviderAttempt(ordinal, 'ambiguous');
+          // async-retry honors `bail` without replacing the stable domain error.
+          // Policy denials are terminal; network/429/5xx retries remain metered.
+          if (sandbox && (error instanceof ExternalExecutionAuthorityError || error instanceof SandboxTransportError)) {
+            Object.assign(error, { bail: true });
+          }
           throw error;
         }
-        await permit.finishProviderAttempt(ordinal, response.ok ? 'succeeded' : 'failed');
-        return response;
       },
     };
     return permit;

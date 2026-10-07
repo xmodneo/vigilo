@@ -75,6 +75,17 @@ Tier is used only for development and live acceptance against the public Vigilo
 repository. Current Free Tier terms state that submitted content may be used to
 improve Google products. It is not approved for private customer source.
 
+Sandbox execution in V1 requires an explicit, non-refreshing, team-scoped
+Vercel access token (`VERCEL_TOKEN`) with `VERCEL_TEAM_ID` and
+`VERCEL_PROJECT_ID`, held only by the worker/control plane. Never inject these
+values into a sandbox, customer commands, evidence, logs, or UI. Configured
+`VERCEL_OIDC_TOKEN` (even alongside access-token configuration), three-segment
+JWT-shaped tokens, and incomplete configuration fail closed before transport.
+Automatic OIDC/JWT authentication is deferred because the SDK's refresh path is
+not included in durable attempt accounting—not because OIDC is inherently unsafe.
+Future support requires separately reviewed, metered short-lived refresh handling.
+No live acceptance of this remediated boundary has occurred.
+
 ## Local development
 
 Requirements:

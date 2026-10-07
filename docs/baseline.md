@@ -1,6 +1,6 @@
 # Task 1.3: original fixture baseline in Vercel Sandbox
 
-Run from the Vigilo root, using the same ignored local Vercel OIDC credentials
+Run from the Vigilo root, using ignored explicit Vercel access-token credentials
 as Task 1.1:
 
 ```sh

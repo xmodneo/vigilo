@@ -11,7 +11,7 @@ import { spawnSync } from "node:child_process";
 import type { ExternalExecutionAuthorizer, ExternalExecutionPermit, ExternalExecutionScope } from "../lib/external-execution/types.js";
 
 const executionScope: ExternalExecutionScope = { workspaceId: "test-workspace", operationCategory: "sandbox_baseline", providerId: "vercel" };
-const TEST_OIDC_TOKEN = `header.${Buffer.from(JSON.stringify({ owner_id: "team_test", project_id: "prj_test", exp: 4_102_444_800 })).toString("base64url")}.signature`;
+const TEST_ACCESS_TOKEN = "fake-sandbox-access-token";
 const executionAuthority: ExternalExecutionAuthorizer = {
   reserve: async (): Promise<ExternalExecutionPermit> => ({
     reservationId: "test-reservation", ownershipToken: "test-owner", fence: 1, sandboxResourceClass: "vcpu_1",
@@ -26,7 +26,9 @@ test("explicit cancellation interrupts work and preserves independent cleanup ev
   const old = names.map(name => process.env[name]);
   context.after(() => names.forEach((name, i) => { if (old[i] === undefined) delete process.env[name]; else process.env[name] = old[i]; }));
   names.forEach(name => { delete process.env[name]; });
-  process.env.VERCEL_OIDC_TOKEN = TEST_OIDC_TOKEN;
+  process.env.VERCEL_TOKEN = TEST_ACCESS_TOKEN;
+  process.env.VERCEL_TEAM_ID = "team_test";
+  process.env.VERCEL_PROJECT_ID = "prj_test";
   context.mock.method(console, "log", () => {});
   const controller = new AbortController();
   let deleted = false, furtherWork = false;
@@ -96,7 +98,9 @@ test("controlled scenarios keep execution outcomes separate from failed cleanup 
   const old = auth.map(name => process.env[name]);
   context.after(() => auth.forEach((name, i) => { if (old[i] === undefined) delete process.env[name]; else process.env[name] = old[i]; }));
   auth.forEach(name => { delete process.env[name]; });
-  process.env.VERCEL_OIDC_TOKEN = TEST_OIDC_TOKEN;
+  process.env.VERCEL_TOKEN = TEST_ACCESS_TOKEN;
+  process.env.VERCEL_TEAM_ID = "team_test";
+  process.env.VERCEL_PROJECT_ID = "prj_test";
   for (const scenario of ["installation_failure", "command_timeout", "cancellation"] as const) {
     await context.test(scenario, async child => {
       child.mock.method(console, "log", () => {});
@@ -145,11 +149,13 @@ test("provider inspection never resumes a stopped sandbox and never calls authen
   const old = names.map(name => process.env[name]);
   context.after(() => names.forEach((name, i) => { if (old[i] === undefined) delete process.env[name]; else process.env[name] = old[i]; }));
   names.forEach(name => { delete process.env[name]; });
-  process.env.VERCEL_OIDC_TOKEN = TEST_OIDC_TOKEN;
+  process.env.VERCEL_TOKEN = TEST_ACCESS_TOKEN;
+  process.env.VERCEL_TEAM_ID = "team_test";
+  process.env.VERCEL_PROJECT_ID = "prj_test";
   context.mock.method(Sandbox, "get", async (params: { resume: boolean; token: string; teamId: string; projectId: string }) => {
     assert.equal(params.resume, false);
     assert.deepEqual({ token: params.token, teamId: params.teamId, projectId: params.projectId },
-      { token: TEST_OIDC_TOKEN, teamId: "team_test", projectId: "prj_test" });
+      { token: TEST_ACCESS_TOKEN, teamId: "team_test", projectId: "prj_test" });
     throw new APIError(new Response(null, { status: 401 }));
   });
   const observed = await observeSandbox("owned-sandbox", "known-session", executionAuthority, executionScope);

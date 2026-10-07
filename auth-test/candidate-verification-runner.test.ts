@@ -10,11 +10,10 @@ import type { FrozenCandidateFile } from '../lib/repair-candidates/types.ts';
 import { expectedCandidateManifest, runFrozenCandidateVerification } from '../lib/candidate-verifications/runner.ts';
 import type { FrozenVerificationInput } from '../lib/candidate-verifications/types.ts';
 import type { SourceManifest } from '../lib/repository-baselines/runner.ts';
-import { createTestExternalExecutionAuthorizer } from './external-execution-support.ts';
+import { createTestExternalExecutionAuthorizer, configureSandboxTestCredentials, TEST_ACCESS_TOKEN } from './external-execution-support.ts';
 
 const PACKAGE = '{"name":"fixture"}';
 const LOCK = '{"lockfileVersion":3,"packages":{"":{"name":"fixture"}}}';
-const TEST_OIDC_TOKEN = `test.${Buffer.from(JSON.stringify({ owner_id: 'team_test', project_id: 'project_test', exp: 4_102_444_800 })).toString('base64url')}.signature`;
 const ORIGINAL = 'export const fixed = false;\n';
 const REPAIRED = 'export const fixed = true;\n';
 const hash = (value: string | Buffer) => createHash('sha256').update(value).digest('hex');
@@ -83,7 +82,7 @@ function installSandboxMock(t: test.TestContext, scenario: Scenario, commands: s
     currentSession() { return { sessionId: scenario.sessionId ?? 'fresh-verifier-session', status: 'running' }; },
     async writeFiles(files: Array<{ content: Uint8Array; path: string }>) {
       writes.push(...files.map((item) => item.path));
-      assert.ok(!JSON.stringify(files).includes(TEST_OIDC_TOKEN));
+      assert.ok(!JSON.stringify(files).includes(TEST_ACCESS_TOKEN));
       assert.doesNotMatch(JSON.stringify(files), /installation-token|PRIVATE KEY/);
     },
     async runCommand(params: { cmd: string; args: string[]; env?: unknown }) {
@@ -114,22 +113,32 @@ function installSandboxMock(t: test.TestContext, scenario: Scenario, commands: s
     async delete() { if (scenario.cleanupFails) throw new Error('controlled cleanup failure'); deleted = true; },
   };
   t.mock.method(console, 'log', () => {});
-  t.mock.method(Sandbox, 'create', async (params: { env?: unknown; image: string; networkPolicy: unknown; persistent: boolean; ports: unknown[]; resources: unknown; fetch: unknown; timeout: number }) => {
+  t.mock.method(Sandbox, 'create', async (params: { token: string; teamId: string; projectId: string; env?: unknown; image: string; networkPolicy: unknown; persistent: boolean; ports: unknown[]; resources: unknown; fetch: unknown; timeout: number }) => {
+    assert.deepEqual({ token: params.token, teamId: params.teamId, projectId: params.projectId }, { token: TEST_ACCESS_TOKEN, teamId: 'team_test', projectId: 'project_test' });
     assert.equal(params.env, undefined); assert.equal(params.image, 'vercel/sandbox/node:24'); assert.equal(params.persistent, false); assert.deepEqual(params.ports, []);
     assert.deepEqual(params.resources, { vcpus: 1 }); assert.equal(typeof params.fetch, 'function'); assert.equal(params.timeout, 600_000);
     return sandbox as never;
   });
-  t.mock.method(Sandbox, 'get', async (params: { resume: boolean }) => {
+  t.mock.method(Sandbox, 'get', async (params: { token: string; teamId: string; projectId: string; fetch: unknown; resume: boolean }) => {
+    assert.deepEqual({ token: params.token, teamId: params.teamId, projectId: params.projectId }, { token: TEST_ACCESS_TOKEN, teamId: 'team_test', projectId: 'project_test' });
+    assert.equal(typeof params.fetch, 'function');
     assert.equal(params.resume, false);
     if (deleted) throw new APIError(new Response(null, { status: 404 }));
     return sandbox as never;
   });
 }
 
+test('verifier unsupported Sandbox auth is a safe configuration failure before SDK invocation', async (t) => {
+  configureSandboxTestCredentials(t); process.env.VERCEL_OIDC_TOKEN = 'fake-oidc';
+  t.mock.method(Sandbox, 'create', () => assert.fail('SDK reached'));
+  const value = input();
+  const evidence = await runFrozenCandidateVerification(value, undefined, () => new Date(), undefined, sandboxAuthority(value));
+  assert.equal(evidence.error?.code, 'sandbox_auth_mode_unsupported');
+  assert.ok(!JSON.stringify(evidence).includes('fake-oidc'));
+});
+
 test('fresh verifier reconstructs exact persisted bytes after deny-all and runs only frozen npm descriptors', async (t) => {
-  const original = process.env.VERCEL_OIDC_TOKEN;
-  process.env.VERCEL_OIDC_TOKEN = TEST_OIDC_TOKEN;
-  t.after(() => { if (original === undefined) delete process.env.VERCEL_OIDC_TOKEN; else process.env.VERCEL_OIDC_TOKEN = original; });
+  configureSandboxTestCredentials(t);
   const commands: string[][] = []; const writes: string[] = [];
   installSandboxMock(t, {}, commands, writes);
   const value = input();
@@ -151,14 +160,12 @@ test('fresh verifier reconstructs exact persisted bytes after deny-all and runs 
   ]);
   assert.equal(writes.length, 2);
   assert.match(writes[1]!, /src\/fix\.ts$/);
-  assert.ok(!JSON.stringify(result).includes(TEST_OIDC_TOKEN));
+  assert.ok(!JSON.stringify(result).includes(TEST_ACCESS_TOKEN));
   assert.doesNotMatch(JSON.stringify(result), /trusted-archive|export const fixed|PRIVATE KEY/);
 });
 
 test('verifier failures, source mutation, sandbox reuse, and missing cleanup fail closed', async (t) => {
-  const original = process.env.VERCEL_OIDC_TOKEN;
-  process.env.VERCEL_OIDC_TOKEN = TEST_OIDC_TOKEN;
-  t.after(() => { if (original === undefined) delete process.env.VERCEL_OIDC_TOKEN; else process.env.VERCEL_OIDC_TOKEN = original; });
+  configureSandboxTestCredentials(t);
   const addedEntries = [...reconstructed.entries, { path: 'src/unexpected.ts', type: 'file' as const, mode: 644, sha256: 'e'.repeat(64), blobSha: 'f'.repeat(40) }];
   const mutated: SourceManifest = { entries: addedEntries, identity: hash(JSON.stringify(addedEntries)) };
   const scenarios: Array<[string, Scenario, Partial<FrozenVerificationInput>, string, string]> = [

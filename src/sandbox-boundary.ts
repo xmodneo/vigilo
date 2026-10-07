@@ -1,6 +1,7 @@
 import { APIError, Sandbox, type NetworkPolicy } from "@vercel/sandbox";
 import { randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
+import { sandboxCredentials, SandboxConfigurationError, SandboxTransportError } from "../lib/external-execution/sandbox-auth.ts";
 
 import { ExternalExecutionAuthorityError, ZERO_EXTERNAL_EXECUTION_AUTHORITY, type ExternalExecutionAuthorizer, type ExternalExecutionPermit, type ExternalExecutionScope, type SandboxResourceClass } from "../lib/external-execution/types.ts";
 
@@ -39,7 +40,7 @@ export interface SandboxLifecycleObserver {
 
 export type CleanupError = { operation: "stop" | "delete" | "lookup"; code: string };
 export function providerErrorCode(error: unknown) {
-  return error instanceof APIError ? `provider_http_${error.response.status}` : "provider_operation_failed";
+  return error instanceof SandboxConfigurationError || error instanceof SandboxTransportError ? error.code : error instanceof APIError ? `provider_http_${error.response.status}` : "provider_operation_failed";
 }
 export class ExecutionCancelled extends Error {
   constructor() { super("execution_cancelled"); }
@@ -63,26 +64,7 @@ export async function cleanupSandbox(sandbox: CleanupTarget, errors: CleanupErro
 }
 
 export function readSandboxCredentials(): { token: string; teamId: string; projectId: string } {
-  const { VERCEL_TOKEN: token, VERCEL_TEAM_ID: teamId, VERCEL_PROJECT_ID: projectId } = process.env;
-  if ((token || teamId || projectId) && !(token && teamId && projectId)) throw new Error("incomplete_credentials");
-  if (token && teamId && projectId) return { token, teamId, projectId };
-  const oidcToken = process.env.VERCEL_OIDC_TOKEN;
-  if (!oidcToken) throw new Error("credentials_missing");
-  try {
-    const parts = oidcToken.split(".");
-    if (parts.length !== 3 || !parts[1]) throw new Error("invalid_token");
-    const payload = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8")) as Record<string, unknown>;
-    if (typeof payload.owner_id !== "string" || !/^[A-Za-z0-9_-]{1,200}$/.test(payload.owner_id) ||
-        typeof payload.project_id !== "string" || !/^[A-Za-z0-9_-]{1,200}$/.test(payload.project_id) ||
-        typeof payload.exp !== "number" || !Number.isSafeInteger(payload.exp) || payload.exp * 1000 <= Date.now()) {
-      throw new Error("invalid_token");
-    }
-    // Passing the already-present token explicitly prevents the SDK from
-    // refreshing OIDC credentials through an unmetered global fetch.
-    return { token: oidcToken, teamId: payload.owner_id, projectId: payload.project_id };
-  } catch {
-    throw new Error("credentials_invalid");
-  }
+  return sandboxCredentials(process.env);
 }
 
 export async function recoverSandbox(
@@ -91,6 +73,7 @@ export async function recoverSandbox(
   scope?: ExternalExecutionScope,
 ): Promise<{ stop: string; delete: string; lookup: string; errors: CleanupError[] }> {
   if (!scope) throw new ExternalExecutionAuthorityError("execution_authority_missing");
+  const credentials = readSandboxCredentials();
   const permit = await authority.reserve({
     scope,
     amounts: {
@@ -104,7 +87,7 @@ export async function recoverSandbox(
   const result = { stop: "not_needed", delete: "not_needed", lookup: "unconfirmed", errors };
   let sandbox: Sandbox;
   try {
-    sandbox = await Sandbox.get({ ...readSandboxCredentials(), name: identity.name, resume: false, signal: AbortSignal.timeout(10_000), fetch: permit.meteredFetch });
+    sandbox = await Sandbox.get({ ...credentials, name: identity.name, resume: false, signal: AbortSignal.timeout(10_000), fetch: permit.meteredFetch });
   } catch (error) {
     if (error instanceof APIError && error.response.status === 404) {
       await permit.complete("succeeded");
@@ -121,7 +104,7 @@ export async function recoverSandbox(
   }
   Object.assign(result, await cleanupSandbox(sandbox, errors));
   try {
-    await Sandbox.get({ ...readSandboxCredentials(), name: identity.name, resume: false, signal: AbortSignal.timeout(10_000), fetch: permit.meteredFetch });
+    await Sandbox.get({ ...credentials, name: identity.name, resume: false, signal: AbortSignal.timeout(10_000), fetch: permit.meteredFetch });
     result.lookup = "still_present";
   } catch (error) {
     result.lookup = error instanceof APIError && error.response.status === 404 ? "absent" : "unconfirmed";

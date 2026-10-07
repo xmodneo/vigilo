@@ -4,6 +4,7 @@ import { createHash } from 'node:crypto';
 import { commandEvidence, ExecutionFailure, fixtureExecutor, ROOT } from '../../src/fixture-execution.ts';
 import { ExecutionCancelled, requireNode24, SandboxBoundary, type SandboxLifecycleObserver } from '../../src/sandbox-boundary.ts';
 import { ExternalExecutionAuthorityError, ZERO_EXTERNAL_EXECUTION_AUTHORITY, type ExternalExecutionAuthorizer, type ExternalExecutionScope } from '../external-execution/types.ts';
+import { SandboxConfigurationError, SandboxTransportError } from '../external-execution/sandbox-auth.ts';
 import { computeCandidateIdentity, sha256 } from '../repair-candidates/identity.ts';
 import { candidatePath } from '../repair-candidates/policy.ts';
 import type { FrozenCandidateFile } from '../repair-candidates/types.ts';
@@ -92,6 +93,7 @@ function safeOutcome(error: unknown): { outcome: VerificationExecutionOutcome; c
   }
   if (error instanceof DOMException && error.name === 'TimeoutError') return { outcome: 'timed_out', code: 'overall_timeout' };
   if (error instanceof ExternalExecutionAuthorityError) return { outcome: 'infrastructure_failed', code: error.code };
+  if (error instanceof SandboxConfigurationError || error instanceof SandboxTransportError) return { outcome: 'infrastructure_failed', code: error.code };
   return { outcome: 'infrastructure_failed', code: error instanceof APIError ? `provider_http_${error.response.status}` : 'verification_operation_failed' };
 }
 

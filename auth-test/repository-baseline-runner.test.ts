@@ -7,11 +7,19 @@ import { APIError, Sandbox } from '@vercel/sandbox';
 import { gitBlobSha } from '../lib/execution-profiles/detector.ts';
 import { runFrozenRepositoryBaseline } from '../lib/repository-baselines/runner.ts';
 import type { FrozenBaselineInput } from '../lib/repository-baselines/types.ts';
-import { createTestExternalExecutionAuthorizer } from './external-execution-support.ts';
+import { createTestExternalExecutionAuthorizer, configureSandboxTestCredentials, TEST_ACCESS_TOKEN } from './external-execution-support.ts';
 
 const PACKAGE = '{"name":"fixture"}';
 const LOCK = '{"lockfileVersion":3,"packages":{"":{"name":"fixture"}}}';
-const TEST_OIDC_TOKEN = `test.${Buffer.from(JSON.stringify({ owner_id: 'team_test', project_id: 'project_test', exp: 4_102_444_800 })).toString('base64url')}.signature`;
+
+test('baseline unsupported Sandbox auth is a safe configuration failure before SDK invocation', async (t) => {
+  configureSandboxTestCredentials(t); process.env.VERCEL_OIDC_TOKEN = 'fake-oidc';
+  t.mock.method(Sandbox, 'create', () => assert.fail('SDK reached'));
+  const value = input();
+  const evidence = await runFrozenRepositoryBaseline(value, undefined, () => new Date(), undefined, sandboxAuthority(value));
+  assert.equal(evidence.error?.code, 'sandbox_auth_mode_unsupported');
+  assert.ok(!JSON.stringify(evidence).includes('fake-oidc'));
+});
 const sha256 = (value: string | Buffer) => createHash('sha256').update(value).digest('hex');
 const entries = [
   { path: 'package-lock.json', type: 'file', mode: 644, sha256: sha256(LOCK), blobSha: gitBlobSha(LOCK) },
@@ -39,9 +47,7 @@ function sandboxAuthority(value: FrozenBaselineInput) {
 }
 
 test('sandbox baseline installs before deny-all, runs only frozen npm phases, and confirms cleanup', async (t) => {
-  const originalOidc = process.env.VERCEL_OIDC_TOKEN;
-  process.env.VERCEL_OIDC_TOKEN = TEST_OIDC_TOKEN;
-  t.after(() => { if (originalOidc === undefined) delete process.env.VERCEL_OIDC_TOKEN; else process.env.VERCEL_OIDC_TOKEN = originalOidc; });
+  configureSandboxTestCredentials(t);
   let policy: unknown = { allow: ['registry.npmjs.org'] };
   let deleted = false;
   const commands: string[][] = [];
@@ -51,7 +57,7 @@ test('sandbox baseline installs before deny-all, runs only frozen npm phases, an
     currentSession() { return { sessionId: 'fresh-baseline-session', status: 'running' }; },
     async writeFiles(files: Array<{ content: Uint8Array; path: string }>) {
       assert.equal(files.length, 1); assert.equal(Buffer.from(files[0]!.content).toString(), 'trusted-provider-archive');
-      assert.ok(!JSON.stringify(files).includes(TEST_OIDC_TOKEN));
+      assert.ok(!JSON.stringify(files).includes(TEST_ACCESS_TOKEN));
       assert.doesNotMatch(JSON.stringify(files), /installation-token/);
     },
     async runCommand(params: { cmd: string; args: string[]; env?: unknown }) {
@@ -72,12 +78,15 @@ test('sandbox baseline installs before deny-all, runs only frozen npm phases, an
     async delete() { deleted = true; },
   };
   t.mock.method(console, 'log', () => {});
-  t.mock.method(Sandbox, 'create', async (params: { env?: unknown; image: string; networkPolicy: unknown; persistent: boolean; ports: unknown[]; resources: unknown; fetch: unknown; timeout: number }) => {
+  t.mock.method(Sandbox, 'create', async (params: { token: string; teamId: string; projectId: string; env?: unknown; image: string; networkPolicy: unknown; persistent: boolean; ports: unknown[]; resources: unknown; fetch: unknown; timeout: number }) => {
+    assert.deepEqual({ token: params.token, teamId: params.teamId, projectId: params.projectId }, { token: TEST_ACCESS_TOKEN, teamId: 'team_test', projectId: 'project_test' });
     assert.equal(params.env, undefined); assert.equal(params.image, 'vercel/sandbox/node:24'); assert.equal(params.persistent, false); assert.deepEqual(params.ports, []);
     assert.deepEqual(params.resources, { vcpus: 1 }); assert.equal(typeof params.fetch, 'function'); assert.equal(params.timeout, 600_000);
     return sandbox as never;
   });
-  t.mock.method(Sandbox, 'get', async (params: { resume: boolean }) => {
+  t.mock.method(Sandbox, 'get', async (params: { token: string; teamId: string; projectId: string; fetch: unknown; resume: boolean }) => {
+    assert.deepEqual({ token: params.token, teamId: params.teamId, projectId: params.projectId }, { token: TEST_ACCESS_TOKEN, teamId: 'team_test', projectId: 'project_test' });
+    assert.equal(typeof params.fetch, 'function');
     assert.equal(params.resume, false);
     if (deleted) throw new APIError(new Response(null, { status: 404 }));
     return sandbox as never;
@@ -94,7 +103,7 @@ test('sandbox baseline installs before deny-all, runs only frozen npm phases, an
     ['--ignore-scripts', 'run', 'typecheck'], ['--ignore-scripts', 'run', 'build'], ['--ignore-scripts', 'test'],
   ]);
   assert.deepEqual(result.cleanup, { stop: 'confirmed', delete: 'confirmed', lookup: 'absent' });
-  assert.ok(!JSON.stringify(result).includes(TEST_OIDC_TOKEN));
+  assert.ok(!JSON.stringify(result).includes(TEST_ACCESS_TOKEN));
   assert.doesNotMatch(JSON.stringify(result), /installation-token|DATABASE_URL/);
 });
 
@@ -110,9 +119,7 @@ test('baseline outcome vocabulary keeps failures, timeout, cancellation, and cle
 });
 
 test('failure, timeout, cancellation, source-integrity, and cleanup outcomes fail closed', async (t) => {
-  const originalOidc = process.env.VERCEL_OIDC_TOKEN;
-  process.env.VERCEL_OIDC_TOKEN = TEST_OIDC_TOKEN;
-  t.after(() => { if (originalOidc === undefined) delete process.env.VERCEL_OIDC_TOKEN; else process.env.VERCEL_OIDC_TOKEN = originalOidc; });
+  configureSandboxTestCredentials(t);
   const scenarios = {
     install: 'installation_failed', typecheck: 'typecheck_failed', build: 'build_failed', test: 'test_failed',
     command_timeout: 'timed_out', overall_timeout: 'timed_out', cancelled: 'cancelled',
@@ -175,7 +182,7 @@ test('failure, timeout, cancellation, source-integrity, and cleanup outcomes fai
       assert.equal(stopped, true);
       if (scenario !== 'cleanup') assert.deepEqual(result.cleanup, { stop: 'confirmed', delete: 'confirmed', lookup: 'absent' });
       else assert.notEqual(result.cleanup.delete, 'confirmed');
-      assert.ok(!JSON.stringify(result).includes(TEST_OIDC_TOKEN));
+      assert.ok(!JSON.stringify(result).includes(TEST_ACCESS_TOKEN));
       assert.doesNotMatch(JSON.stringify(result), /cancelled provider command|delete failed/);
     });
   }

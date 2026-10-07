@@ -55,6 +55,35 @@ ignored. Rotate a suspected credential first, revoke sessions/tokens or grants,
 then investigate with stable event codes. Hosted secret-manager selection and
 rotation drills remain future deployment acceptance work.
 
+V1 Sandbox authentication requires explicit `VERCEL_TOKEN`, `VERCEL_TEAM_ID`,
+and `VERCEL_PROJECT_ID`. The token must be a non-refreshing, team-scoped access
+token held only in the control plane, never in sandbox environments, source,
+commands, logs, evidence, or API responses. OIDC configuration (including an
+empty configured variable or a mixed mode) and three-segment JWT-shaped tokens
+fail with `sandbox_auth_mode_unsupported`; incomplete fields also fail before
+transport. Vigilo neither unsets credentials nor silently falls back to SDK
+auto-discovery. OIDC itself is not unsafe: it is deferred until a separately
+reviewed refresh implementation can meter every request. Readiness remains
+provider-independent; credential configuration is validated locally at the
+execution boundary, without any provider probe.
+
+Sandbox SDK 3.2.1 permits two retries, at most three metered fetch invocations
+per SDK HTTP operation. Vigilo forces manual redirects and rejects all 3xx
+responses without following or recording Location. Redirect and durable-authority
+errors terminate SDK retries; network errors, 429, and 5xx remain metered retries.
+Successful responses and reservation completion recheck unrevoked, unexpired
+grants and lease/fence ownership; late failures remain consumed. The unchanged 96-attempt
+reservation is a hard ceiling over application-visible Sandbox HTTP attempts
+within one reserved lifecycle, including cleanup/recovery requests and retries.
+Separately authorized recovery has its own reservation, still subject to the
+cumulative operation/account grants; 96 is not a whole-RepairRun limit.
+Each invocation checks durable authority, grants/revocations, active lease/fence,
+expiry, and remaining allowance before dispatch; its lease retains the global
+concurrency slot acquired at reservation. Failed and ambiguous attempts remain
+consumed. This does not bound DNS, TLS, TCP retransmissions, provider-internal
+work, or monetary charges. No real access token was inspected or provisioned in
+this remediation, and no live acceptance of this boundary has occurred.
+
 ## HTTP abuse boundary
 
 All API routes except dependency-free liveness pass through PostgreSQL-backed
@@ -140,13 +169,26 @@ repair quality are not validated. The local operational snapshot is not a
 monitoring service. No paid monitoring, hosted PostgreSQL, or secret manager is
 selected by Milestone 7.4.
 
-`undici@7.29.0` is installed transitively through `@vercel/sandbox`. The current
-npm audit groups several advisories under one high-severity transitive finding,
-including optional WebSocket, interceptor/cache, BalancedPool, and HTTP response
-decompression behavior. Vigilo does not invoke the SDK's interactive WebSocket,
-cache, dump, RetryHandler, or BalancedPool APIs. Its supported sandbox boundary
-does use the SDK's authenticated HTTP client and Agent, so the transitive HTTP
-response-handling dependency remains tracked rather than being described as
-unreachable. Current execution authority is zero and Task 4.3 live acceptance is
-pending. This is not evidence that unreviewed SDK paths are safe; upgrading the
-sandbox dependency remains separate reviewed work.
+The reviewed dependency patches pin Next.js 16.3.6, Sandbox's compatible Undici
+7.29.1, and PostCSS 8.5.23's source-map-js 1.2.2. Sandbox remains 3.2.1. Narrow
+parent-scoped overrides avoid unrelated upgrades. Install with lifecycle scripts
+disabled and run root and fixture audits against the lockfiles; an audit covers
+known advisories, not all possible supply-chain risk. Current execution authority
+remains zero and Task 4.3 live acceptance remains pending.
+
+Residual audit finding (2026-10-06): the independently frozen free-shipping
+fixture still resolves `source-map-js@1.2.1` through its PostCSS 8.5.28 tree and
+reports high-severity [GHSA-68fv-2mgg-jv7q](https://github.com/advisories/GHSA-68fv-2mgg-jv7q).
+The root override does not patch that independent lockfile. The controlled
+fixture contains no supplied indexed source maps; its shipping tests and the
+inspected PostCSS/Vite/Vitest paths do not call SourceNode indexed-map re-emission.
+This is not a general safety claim about arbitrary source maps or future tooling.
+Final classification: **C — MUST REPLACE THE FUTURE LIVE ACCEPTANCE FIXTURE WITH A
+CLEAN EQUIVALENT**. Exact reuse of this lockfile by the future public acceptance
+repository has not been established and is not approved by this remediation.
+Keep the historical deterministic fixture unchanged: its audited digest includes
+the lockfile, and editing it would invalidate prior identity/evidence assumptions.
+Before M7.7B, obtain separate approval for a clean equivalent public fixture with
+a freshly frozen identity and trustworthy measured failing baseline; do not reuse
+historical candidate/verification evidence for it. No fixture/repository creation
+or historical evidence change is authorized by this review.

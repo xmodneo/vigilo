@@ -6,11 +6,7 @@ import type {
   ExternalExecutionScope,
 } from "../lib/external-execution/types.js";
 
-export const TEST_OIDC_TOKEN = `test.${Buffer.from(JSON.stringify({
-  owner_id: "team_test",
-  project_id: "project_test",
-  exp: 4_102_444_800,
-})).toString("base64url")}.signature`;
+export const TEST_ACCESS_TOKEN = "fake-sandbox-access-token";
 
 export function sandboxAuthority(
   operationCategory: "sandbox_baseline" | "sandbox_verification",

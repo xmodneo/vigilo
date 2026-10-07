@@ -120,6 +120,7 @@ export async function observeSandbox(
   scope?: ExternalExecutionScope,
 ) {
   if (!scope) throw new ExternalExecutionAuthorityError("execution_authority_missing");
+  const credentials = readSandboxCredentials();
   const permit = await authority.reserve({
     scope,
     amounts: {
@@ -130,7 +131,7 @@ export async function observeSandbox(
   });
   let sandbox: Sandbox;
   try {
-    sandbox = await Sandbox.get({ ...readSandboxCredentials(), name, resume: false, signal: AbortSignal.timeout(10_000), fetch: permit.meteredFetch });
+    sandbox = await Sandbox.get({ ...credentials, name, resume: false, signal: AbortSignal.timeout(10_000), fetch: permit.meteredFetch });
   } catch (error) {
     const absent = error instanceof APIError && error.response.status === 404;
     await permit.complete(absent ? "succeeded" : "failed", absent ? undefined : "sandbox_cleanup_unresolved");

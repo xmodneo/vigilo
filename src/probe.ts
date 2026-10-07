@@ -133,7 +133,7 @@ export async function runProbe(
       if (report.outboundAfterDeny.status !== "blocked") throw new Error("network_denial_unproven");
     });
   } catch (error) {
-    const known = ["credentials_missing", "incomplete_credentials", "runtime_mismatch", "unsafe_provider_settings", "command_failed", "filesystem_failed", "network_denial_unproven", "positive_control_failed", "network_policy_transition_failed", "credentials_present", "session_changed"];
+    const known = ["sandbox_auth_mode_unsupported", "sandbox_transport_redirect", "credentials_missing", "incomplete_credentials", "runtime_mismatch", "unsafe_provider_settings", "command_failed", "filesystem_failed", "network_denial_unproven", "positive_control_failed", "network_policy_transition_failed", "credentials_present", "session_changed"];
     // Do not serialize SDK error bodies, stack traces, request headers, or secrets.
     const code = error instanceof APIError ? `provider_http_${error.response.status}`
       : error instanceof Error && known.includes(error.message) ? error.message : "operation_failed";

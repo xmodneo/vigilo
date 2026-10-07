@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import test from 'node:test';
+import { APIError, Sandbox } from '@vercel/sandbox';
 
 import { eq } from 'drizzle-orm';
 
@@ -37,14 +38,161 @@ const amount = (overrides: Partial<ExternalExecutionAmounts> = {}): ExternalExec
   ...overrides,
 });
 
-async function seeded(options: { concurrency?: number; expiresAt?: Date; limits?: Partial<typeof scopeLimits>; accountLimits?: Partial<typeof scopeLimits>; malformedOperationIdentity?: boolean } = {}) {
+test('review: success after in-flight grant revocation cannot become durable attempt or reservation success', async (t) => {
+  const value = await seeded(); t.after(() => value.context.client.close());
+  const authority = new DurableExternalExecutionAuthorizer(value.context.database, { clock: () => value.now, fetch: async () => {
+    await value.context.database.insert(executionBudgetGrantRevocation).values({ id: randomUUID(), grantId: value.grantId, revokedBy: 'test-operator', reasonCode: 'test', createdAt: value.now });
+    return Response.json({ success: true });
+  } });
+  const permit = await authority.reserve({ scope: value.scope, amounts: amount() });
+  await assert.rejects(permit.meteredFetch('https://provider.invalid'), /execution_authority_missing/);
+  await assert.rejects(permit.complete('succeeded'), /execution_authority_missing/);
+  const events = await value.context.database.select().from(externalExecutionEvent);
+  assert.equal(events.filter((event) => event.eventType === 'attempt_started').length, 1);
+  assert.equal(events.filter((event) => ['attempt_succeeded', 'completed'].includes(event.eventType)).length, 0);
+  await permit.complete('ambiguous', 'provider_attempt_ambiguous');
+});
+
+test('review: installed SDK treats authority denial and every redirect status as terminal, not retryable', async (t) => {
+  for (const status of [0, 301, 302, 303, 307, 308]) {
+    const value = await seeded({ scope: { operationCategory: 'sandbox_baseline', providerId: 'vercel-sandbox' } });
+    try {
+      let dispatches = 0; let invocations = 0;
+      t.mock.method(globalThis, 'fetch', async () => assert.fail('global refresh'));
+      const authority = new DurableExternalExecutionAuthorizer(value.context.database, { clock: () => value.now, fetch: async (_input, init) => {
+        dispatches += 1; assert.equal(init?.redirect, 'manual');
+        return new Response('private', { status, headers: { Location: 'https://redirect.invalid/?token=fake-secret' } });
+      } });
+      const permit = await authority.reserve({ scope: value.scope, amounts: amount({ providerAttempts: 3 }) });
+      const begin = permit.beginProviderAttempt;
+      t.mock.method(permit, 'beginProviderAttempt', async () => { invocations += 1; return begin(); });
+      if (status === 0) await value.context.database.insert(executionBudgetGrantRevocation).values({ id: randomUUID(), grantId: value.grantId, revokedBy: 'test-operator', reasonCode: 'test', createdAt: value.now });
+      await assert.rejects(Sandbox.get({ token: 'fake-opaque-access-token', teamId: 'team_test', projectId: 'project_test', name: 'test', resume: false, fetch: permit.meteredFetch }), { message: status === 0 ? 'execution_authority_missing' : 'sandbox_transport_redirect' });
+      assert.equal(invocations, 1); assert.equal(dispatches, status === 0 ? 0 : 1);
+      const events = await value.context.database.select().from(externalExecutionEvent);
+      assert.equal(events.filter((event) => event.eventType === 'attempt_failed').length, status === 0 ? 0 : 1);
+      assert.ok(!JSON.stringify(events).includes('fake-secret'));
+    } finally { await value.context.client.close(); }
+  }
+});
+
+test('Sandbox transport overrides redirect-follow and consumes 3xx without following or revealing Location', async (t) => {
+  const value = await seeded({ scope: { operationCategory: 'sandbox_baseline', providerId: 'vercel-sandbox' } });
+  t.after(() => value.context.client.close());
+  let calls = 0;
+  const authority = new DurableExternalExecutionAuthorizer(value.context.database, { clock: () => value.now, fetch: async (_input, init) => {
+    calls += 1;
+    assert.equal(init?.redirect, 'manual');
+    return new Response('sensitive-response', { status: 307, headers: { Location: 'https://redirect.invalid/private?token=fake-secret' } });
+  } });
+  const permit = await authority.reserve({ scope: value.scope, amounts: amount() });
+  await assert.rejects(permit.meteredFetch('https://vercel.com/api/v2/sandboxes/test', { redirect: 'follow' }), { message: 'sandbox_transport_redirect' });
+  assert.equal(calls, 1);
+  const events = await value.context.database.select().from(externalExecutionEvent);
+  assert.equal(events.filter((event) => event.eventType === 'attempt_failed').length, 1);
+  assert.ok(!JSON.stringify(events).includes('fake-secret'));
+  await assert.rejects(permit.meteredFetch('https://vercel.com/api/v2/sandboxes/test'), /execution_budget_exhausted/);
+  assert.equal(calls, 1);
+});
+
+for (const failure of ['network', '429', '503'] as const) test(`installed Sandbox SDK ${failure} retries use only the durable injected transport`, async (t) => {
+  const value = await seeded({ scope: { operationCategory: 'sandbox_baseline', providerId: 'vercel-sandbox' } });
+  t.after(() => value.context.client.close());
+  let globalCalls = 0; let rawCalls = 0;
+  t.mock.method(globalThis, 'fetch', async () => { globalCalls += 1; throw new Error('unmetered transport'); });
+  const authority = new DurableExternalExecutionAuthorizer(value.context.database, { clock: () => value.now, fetch: async (_input, init) => {
+    rawCalls += 1;
+    assert.equal(init?.redirect, 'manual');
+    assert.equal(new Headers(init?.headers).get('authorization'), 'Bearer fake-opaque-access-token');
+    if (failure === 'network') throw new TypeError('fake network failure');
+    return new Response('{}', { status: Number(failure), headers: { 'Retry-After': '0' } });
+  } });
+  const permit = await authority.reserve({ scope: value.scope, amounts: amount({ providerAttempts: 3 }) });
+  await assert.rejects(Sandbox.get({ token: 'fake-opaque-access-token', teamId: 'team_test', projectId: 'project_test', name: 'test', resume: false, fetch: permit.meteredFetch }), failure === 'network' ? TypeError : APIError);
+  assert.equal(rawCalls, 3); assert.equal(globalCalls, 0);
+  assert.equal((await value.context.database.select().from(externalExecutionEvent)).filter((event) => event.eventType === 'attempt_started').length, 3);
+  assert.equal((await value.context.database.select().from(externalExecutionEvent)).filter((event) => event.eventType === (failure === 'network' ? 'attempt_ambiguous' : 'attempt_failed')).length, 3);
+});
+
+test('cancelled transport cannot consume or dispatch the next attempt', async (t) => {
+  const value = await seeded(); t.after(() => value.context.client.close());
+  let calls = 0;
+  const authority = new DurableExternalExecutionAuthorizer(value.context.database, { clock: () => value.now, fetch: async () => { calls += 1; return new Response(null, { status: 200 }); } });
+  const permit = await authority.reserve({ scope: value.scope, amounts: amount() });
+  const signal = AbortSignal.abort();
+  await assert.rejects(permit.meteredFetch('https://provider.invalid', { signal }), { name: 'AbortError' });
+  assert.equal(calls, 0);
+  assert.equal((await value.context.database.select().from(externalExecutionEvent)).length, 1);
+});
+
+test('installed Sandbox create/get/stop/delete retain explicit credentials and the injected metered client', async (t) => {
+  const value = await seeded({ scope: { operationCategory: 'sandbox_baseline', providerId: 'vercel-sandbox' } });
+  t.after(() => value.context.client.close());
+  let globalCalls = 0; const requests: string[] = [];
+  t.mock.method(globalThis, 'fetch', async () => { globalCalls += 1; throw new Error('unmetered refresh'); });
+  const authority = new DurableExternalExecutionAuthorizer(value.context.database, { clock: () => value.now, fetch: async (input, init) => {
+    const url = new URL(String(input)); requests.push(`${init?.method} ${url.pathname}`);
+    assert.equal(init?.redirect, 'manual');
+    assert.equal(url.searchParams.get('teamId'), 'team_test');
+    assert.equal(new Headers(init?.headers).get('authorization'), 'Bearer fake-opaque-access-token');
+    assert.ok(!String(init?.body).includes('fake-opaque-access-token'));
+    const session = { id: 'test-session', memory: 2048, vcpus: 1, region: 'test', timeout: 60_000, status: 'running', requestedAt: 1, createdAt: 1, cwd: '/vercel/sandbox', updatedAt: 1 };
+    const sandbox = { name: 'test', persistent: false, createdAt: 1, updatedAt: 1, currentSessionId: session.id, status: 'running' };
+    if (url.pathname.endsWith('/stop')) { session.status = 'stopped'; sandbox.status = 'stopped'; }
+    return Response.json({ session, sandbox, routes: [] });
+  } });
+  const permit = await authority.reserve({ scope: value.scope, amounts: amount({ providerAttempts: 4 }) });
+  const credentials = { token: 'fake-opaque-access-token', teamId: 'team_test', projectId: 'project_test' };
+  await Sandbox.create({ ...credentials, name: 'test', image: 'vercel/sandbox/node:24', fetch: permit.meteredFetch });
+  const sandbox = await Sandbox.get({ ...credentials, name: 'test', resume: false, fetch: permit.meteredFetch });
+  await sandbox.stop(); await sandbox.delete();
+  assert.equal(requests.length, 4); assert.equal(globalCalls, 0);
+  assert.deepEqual(requests.map((request) => request.split(' ')[0]), ['POST', 'GET', 'POST', 'DELETE']);
+  assert.equal((await value.context.database.select().from(externalExecutionEvent)).filter((event) => event.eventType === 'attempt_succeeded').length, 4);
+});
+
+test('Sandbox attempt 97 is denied before transport and all 96 prior invocations remain consumed', async (t) => {
+  const value = await seeded({ scope: { operationCategory: 'sandbox_verification', providerId: 'vercel-sandbox' }, limits: { providerAttempts: 96 }, accountLimits: { providerAttempts: 96 } });
+  t.after(() => value.context.client.close());
+  let calls = 0;
+  const authority = new DurableExternalExecutionAuthorizer(value.context.database, { clock: () => value.now, fetch: async () => { calls += 1; return new Response(null, { status: 404 }); } });
+  const permit = await authority.reserve({ scope: value.scope, amounts: amount({ providerAttempts: 96 }) });
+  for (let index = 0; index < 96; index += 1) await permit.meteredFetch('https://vercel.com/api/v2/sandboxes/test');
+  await assert.rejects(permit.meteredFetch('https://vercel.com/api/v2/sandboxes/test'), /execution_budget_exhausted/);
+  assert.equal(calls, 96);
+  assert.equal((await value.context.database.select().from(externalExecutionEvent)).filter((event) => event.eventType === 'attempt_failed').length, 96);
+});
+
+test('installed Sandbox retries cannot dispatch after revocation, cancellation, or lease expiry', async (t) => {
+  for (const stop of ['revocation', 'cancellation', 'expiry'] as const) {
+    const value = await seeded({ scope: { operationCategory: 'sandbox_baseline', providerId: 'vercel-sandbox' } });
+    try {
+      const controller = new AbortController(); let calls = 0;
+      t.mock.method(globalThis, 'fetch', async () => { throw new Error('unmetered transport'); });
+      const authority = new DurableExternalExecutionAuthorizer(value.context.database, { clock: () => value.now, fetch: async () => {
+        calls += 1;
+        if (stop === 'revocation') await value.context.database.insert(executionBudgetGrantRevocation).values({ id: randomUUID(), grantId: value.grantId, revokedBy: 'test-operator', reasonCode: 'test', createdAt: value.now });
+        if (stop === 'cancellation') controller.abort();
+        if (stop === 'expiry') value.now = new Date(value.now.getTime() + 16 * 60_000);
+        return new Response('{}', { status: 503 });
+      } });
+      const permit = await authority.reserve({ scope: value.scope, amounts: amount({ providerAttempts: 3 }) });
+      await assert.rejects(Sandbox.get({ token: 'fake-opaque-access-token', teamId: 'team_test', projectId: 'project_test', name: 'test', resume: false, fetch: permit.meteredFetch, signal: controller.signal }));
+      assert.equal(calls, 1, stop);
+      assert.equal((await value.context.database.select().from(externalExecutionEvent)).filter((event) => event.eventType === 'attempt_started').length, 1, stop);
+    } finally { await value.context.client.close(); }
+  }
+});
+
+async function seeded(options: { scope?: Partial<ExternalExecutionScope>; concurrency?: number; expiresAt?: Date; limits?: Partial<typeof scopeLimits>; accountLimits?: Partial<typeof scopeLimits>; malformedOperationIdentity?: boolean } = {}) {
   const context = await createTestContext();
   const now = new Date('2026-09-23T10:00:00.000Z');
   const userId = randomUUID();
   const workspaceId = randomUUID();
   await context.database.insert(user).values({ id: userId, name: 'operator', email: `${userId}@example.test`, emailVerified: true, createdAt: now, updatedAt: now });
   await context.database.insert(workspace).values({ id: workspaceId, ownerUserId: userId, createdAt: now, updatedAt: now });
-  const scope: ExternalExecutionScope = { workspaceId, operationCategory: 'gemini_investigation', providerId: 'google', modelId: 'gemini-3.1-flash-lite' };
+  const scope: ExternalExecutionScope = { workspaceId, operationCategory: 'gemini_investigation', providerId: 'google', modelId: 'gemini-3.1-flash-lite', ...options.scope };
+  if (scope.operationCategory === 'sandbox_baseline') delete scope.modelId;
   const expiresAt = options.expiresAt ?? new Date('2026-09-24T10:00:00.000Z');
   const limits = { ...scopeLimits, ...options.limits };
   const accountId = randomUUID();

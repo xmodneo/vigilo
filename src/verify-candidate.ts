@@ -3,6 +3,7 @@ import { fileURLToPath } from "node:url";
 import { EXPECTED_FIXTURE_HASH, loadOriginalFixture, fixtureHash, parseRepairedTests, TEST_NAMES } from "./baseline.js";
 import { buildCandidate, collectTree, loadCandidate, sandboxTreeReader, CandidateError } from "./candidate.js";
 import { SandboxBoundary, requireNode24 } from "./sandbox-boundary.js";
+import { SandboxConfigurationError, SandboxTransportError } from "../lib/external-execution/sandbox-auth.ts";
 import { ROOT, INSTALL_POLICY, INSTALL_ARGS, commandEvidence, fixtureExecutor, boundedReport, ExecutionFailure } from "./fixture-execution.js";
 import type { ExternalExecutionAuthorizer, ExternalExecutionScope } from "../lib/external-execution/types.js";
 
@@ -123,6 +124,7 @@ export async function runVerification(
     }
     if (error instanceof ExecutionFailure && error.message === "credentials_present") report.credentialsExposure = "present";
     report.error = { phase, code: error instanceof CandidateError || error instanceof ExecutionFailure ? error.message
+      : error instanceof SandboxConfigurationError || error instanceof SandboxTransportError ? error.code
       : error instanceof APIError ? `provider_http_${error.response.status}` : "operation_failed" };
   }
   if (boundary.evidence.created && (report.cleanup.stop !== "confirmed" || report.cleanup.delete !== "confirmed" || report.cleanup.lookup !== "absent")) {

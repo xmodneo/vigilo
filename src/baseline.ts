@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { lstatSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { SandboxBoundary, requireNode24 } from "./sandbox-boundary.js";
+import { SandboxConfigurationError, SandboxTransportError } from "../lib/external-execution/sandbox-auth.ts";
 import { ROOT, INSTALL_POLICY, INSTALL_ARGS, object, commandEvidence, boundedReport, fixtureExecutor, ExecutionFailure as BaselineFailure } from "./fixture-execution.js";
 import type { ExternalExecutionAuthorizer, ExternalExecutionScope } from "../lib/external-execution/types.js";
 
@@ -160,6 +161,7 @@ export async function runBaseline(
   } catch (error) {
     report.outcome = error instanceof BaselineFailure ? error.kind : "infrastructure_failure";
     report.error = { phase, code: error instanceof BaselineFailure ? error.message
+      : error instanceof SandboxConfigurationError || error instanceof SandboxTransportError ? error.code
       : error instanceof APIError ? `provider_http_${error.response.status}` : "operation_failed" };
   }
   const cleaned = report.cleanup.stop === "confirmed" && report.cleanup.delete === "confirmed" && report.cleanup.lookup === "absent";
