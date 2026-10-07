@@ -188,22 +188,46 @@ export async function runFrozenRepositoryBaseline(
       report.credentialsExposure = 'absent';
       report.networkPolicyBeforeRepositoryExecution = 'deny-all';
 
-      if (report.typecheck) {
-        phase = 'typecheck';
-        await execution.npm(report.typecheck, 'typecheck_failure');
+      let checkFailure: { error: ExecutionFailure; phase: string } | undefined;
+      try {
+        if (report.typecheck) {
+          phase = 'typecheck';
+          await execution.npm(report.typecheck, 'typecheck_failure');
+        }
+        if (report.build) {
+          phase = 'build';
+          await execution.npm(report.build, 'build_failure');
+        }
+        phase = 'test';
+        await execution.npm(report.test, 'test_failure');
+      } catch (error) {
+        // Only normal repository failures permit observation in the active
+        // session. Timeout, cancellation and authority/session loss escape.
+        if (!(error instanceof ExecutionFailure) ||
+            !['typecheck_failure', 'build_failure', 'test_failure'].includes(error.kind)) throw error;
+        checkFailure = { error, phase };
       }
-      if (report.build) {
-        phase = 'build';
-        await execution.npm(report.build, 'build_failure');
-      }
-      phase = 'test';
-      await execution.npm(report.test, 'test_failure');
 
+      signal.throwIfAborted();
       phase = 'source_integrity_after_execution';
-      const final = await captureRepositoryManifest(execution, initial);
+      let measurement = execution;
+      if (checkFailure) {
+        // Sandbox.runCommand can auto-resume a stopped VM. Pin failure
+        // evidence to this live Session and its existing metered client;
+        // Session.runCommand fails rather than resuming if it stops mid-call.
+        boundary.assertSameSession(sandbox);
+        const session = sandbox.currentSession();
+        if (session.status !== 'running') throw new ExecutionFailure('infrastructure_failure', 'session_unavailable');
+        measurement = fixtureExecutor(sandbox, boundary, signal, session);
+      }
+      const final = await captureRepositoryManifest(measurement, initial);
       report.source.identityAfterExecution = final.identity;
       report.source.unchangedAfterExecution = final.identity === initial.identity;
       if (!report.source.unchangedAfterExecution) throw new ExecutionFailure('baseline_failure', 'source_mutated');
+      if (checkFailure) {
+        phase = checkFailure.phase;
+        throw checkFailure.error;
+      }
       report.executionOutcome = 'baseline_passed';
     }, cancellation);
   } catch (error) {

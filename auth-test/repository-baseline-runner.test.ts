@@ -141,7 +141,7 @@ test('failure, timeout, cancellation, source-integrity, and cleanup outcomes fai
       const sandbox = {
         persistent: false, timeout: 600_000,
         get networkPolicy() { return policy; },
-        currentSession() { return { sessionId: 'failure-session', status: 'running' }; },
+        currentSession() { return { sessionId: 'failure-session', status: 'running', runCommand: sandbox.runCommand.bind(sandbox) }; },
         async writeFiles() {},
         async runCommand(params: { cmd: string; args: string[] }) {
           if (scenario === 'overall_timeout' && params.cmd === 'node' && params.args[0] === '--version') throw new DOMException('deadline', 'TimeoutError');

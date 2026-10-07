@@ -67,9 +67,12 @@ export async function boundedReport(sandbox: Sandbox, signal: AbortSignal) {
   return Buffer.concat(chunks).toString("utf8");
 }
 
-export function fixtureExecutor(sandbox: Sandbox, boundary: SandboxBoundary, signal: AbortSignal) {
+export function fixtureExecutor(
+  sandbox: Sandbox, boundary: SandboxBoundary, signal: AbortSignal,
+  commandContext: Pick<Sandbox, "runCommand"> = sandbox,
+) {
   const trustedNode = async (args: string[], timeoutMs = 30_000) => {
-    const result = await sandbox.runCommand({ cmd: "node", args, signal, timeoutMs });
+    const result = await commandContext.runCommand({ cmd: "node", args, signal, timeoutMs });
     boundary.assertSameSession(sandbox);
     if (result.exitCode !== 0) throw new ExecutionFailure("infrastructure_failure", "harness_command_failed");
     return (await result.stdout()).trim();
