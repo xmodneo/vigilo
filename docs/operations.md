@@ -169,7 +169,7 @@ repair quality are not validated. The local operational snapshot is not a
 monitoring service. No paid monitoring, hosted PostgreSQL, or secret manager is
 selected by Milestone 7.4.
 
-The reviewed dependency patches pin Next.js 16.3.6, Sandbox's compatible Undici
+The reviewed dependency patches pin Next.js 16.3.8, Sandbox's compatible Undici
 7.29.1, and PostCSS 8.5.23's source-map-js 1.2.2. Sandbox remains 3.2.1. Narrow
 parent-scoped overrides avoid unrelated upgrades. Install with lifecycle scripts
 disabled and run root and fixture audits against the lockfiles; an audit covers

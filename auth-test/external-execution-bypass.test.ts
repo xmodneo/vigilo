@@ -146,7 +146,7 @@ test('installed security patch graph and scoped overrides match the approved exa
   const manifest = JSON.parse(await readFile('package.json', 'utf8'));
   const lock = JSON.parse(await readFile('package-lock.json', 'utf8'));
   assert.deepEqual(manifest.overrides, { '@vercel/sandbox@3.2.1': { undici: '7.29.1' }, 'postcss@8.5.23': { 'source-map-js': '1.2.2' } });
-  for (const [name, version] of Object.entries({ next: '16.3.6', '@vercel/sandbox': '3.2.1', '@vercel/oidc': '3.2.0', undici: '7.29.1', postcss: '8.5.23', 'source-map-js': '1.2.2' })) {
+  for (const [name, version] of Object.entries({ next: '16.3.8', '@vercel/sandbox': '3.2.1', '@vercel/oidc': '3.2.0', undici: '7.29.1', postcss: '8.5.23', 'source-map-js': '1.2.2' })) {
     assert.equal(lock.packages[`node_modules/${name}`].version, version);
     assert.equal(JSON.parse(await readFile(`node_modules/${name}/package.json`, 'utf8')).version, version);
   }
