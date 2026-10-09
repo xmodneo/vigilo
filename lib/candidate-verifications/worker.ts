@@ -8,11 +8,16 @@ import {
   candidateVerificationAttempt,
   candidateVerificationEvidence,
   candidateVerificationEvent,
+  executionBudgetGrant,
+  executionBudgetGrantRevocation,
+  externalExecutionReservation,
 } from '../../db/schema.ts';
 import { recoverSandbox, type SandboxLifecycleObserver } from '../../src/sandbox-boundary.ts';
 import type { VigiloDatabase } from '../db/types.ts';
 import { DurableExternalExecutionAuthorizer } from '../external-execution/authority.ts';
-import type { ExternalExecutionAuthorizer } from '../external-execution/types.ts';
+import { assertRunBusinessAllowed, lockExternalExecution } from '../external-execution/business-fence.ts';
+import { executionGrantIdentityMatches } from '../external-execution/identity.ts';
+import { ExternalExecutionAuthorityError, type ExternalExecutionAuthorizer } from '../external-execution/types.ts';
 import type { GitHubAppConfiguration } from '../github-app/types.ts';
 import { assertPublicRepositoryAuthority } from '../github-repositories/policy.ts';
 import type { WorkerLogger } from '../repair-runs/worker.ts';
@@ -26,6 +31,7 @@ import type { CandidateVerificationEvidence as VerificationEvidence, CandidateVe
 
 const LEASE_MS = 90_000;
 const HEARTBEAT_MS = 20_000;
+const TERMINAL_EXECUTION_CODES = new Set(['execution_authority_missing', 'execution_authority_expired', 'execution_authority_mismatch', 'execution_budget_exhausted', 'provider_attempt_ambiguous', 'sandbox_creation_failed', 'sandbox_cleanup_unresolved']);
 type VerificationRow = typeof candidateVerification.$inferSelect;
 type AttemptRow = typeof candidateVerificationAttempt.$inferSelect;
 type VerificationExecutor = typeof executeCandidateVerification;
@@ -54,14 +60,53 @@ type Claim =
 const leaseEnd = (now: Date) => new Date(now.getTime() + LEASE_MS);
 
 function safeCode(error: unknown, aborted = false): string {
+  if (error instanceof ExternalExecutionAuthorityError) return error.code;
   if (aborted) return 'worker_interrupted';
   if (error instanceof CandidateVerificationPreparationError) return error.code;
   if (error && typeof error === 'object' && 'code' in error && typeof error.code === 'string' && /^[a-z_]{1,64}$/.test(error.code)) return error.code;
   return 'verification_execution_failed';
 }
 
+// Job attempts are the durable claim history, not another execution counter.
+// The transport authorizer still reserves/charges the actual external work.
+async function assertVerificationClaimAllowed(database: VigiloDatabase, verification: VerificationRow, now: Date): Promise<void> {
+  const priorClaims = await database.select({ id: candidateVerificationAttempt.id }).from(candidateVerificationAttempt)
+    .innerJoin(candidateVerification, eq(candidateVerification.id, candidateVerificationAttempt.verificationId))
+    .where(and(eq(candidateVerification.workspaceId, verification.workspaceId), eq(candidateVerification.repairRunId, verification.repairRunId)));
+  const grants = await database.select().from(executionBudgetGrant);
+  const operations = grants.filter((grant) => grant.scope === 'operation' && grant.workspaceId === verification.workspaceId
+    && grant.repairRunId === verification.repairRunId && grant.githubRepositoryId === verification.githubRepositoryId
+    && grant.baseCommitSha === verification.baseCommitSha && grant.operationCategory === 'sandbox_verification'
+    && grant.providerId === 'vercel' && grant.modelId === null && grant.acceptancePurpose === null && grant.sandboxResourceClass === 'vcpu_1');
+  // Retain a first preflight claim with zero authority; the existing transport
+  // boundary denies external execution. No subsequent claim may use that gap.
+  if (!operations.length && !grants.length && priorClaims.length === 0) return;
+  const revocations = await database.select({ grantId: executionBudgetGrantRevocation.grantId }).from(executionBudgetGrantRevocation);
+  const revoked = new Set(revocations.map((value) => value.grantId));
+  const unrevokedAccounts = grants.filter((grant) => grant.scope === 'account' && !revoked.has(grant.id));
+  const unrevokedOperations = operations.filter((grant) => !revoked.has(grant.id));
+  const accounts = unrevokedAccounts.filter((grant) => grant.expiresAt > now);
+  const eligibleOperations = unrevokedOperations.filter((grant) => grant.expiresAt > now);
+  if (accounts.length !== 1 || eligibleOperations.length !== 1) {
+    if (accounts.length > 1 || eligibleOperations.length > 1) throw new ExternalExecutionAuthorityError('execution_authority_mismatch');
+    if ((!accounts.length && unrevokedAccounts.length) || (!eligibleOperations.length && unrevokedOperations.length)) throw new ExternalExecutionAuthorityError('execution_authority_expired');
+    throw new ExternalExecutionAuthorityError('execution_authority_missing');
+  }
+  const account = accounts[0]!; const operation = eligibleOperations[0]!;
+  if (!executionGrantIdentityMatches(account) || !executionGrantIdentityMatches(operation)) throw new ExternalExecutionAuthorityError('execution_authority_mismatch');
+  const reservations = await database.select({ accountGrantId: externalExecutionReservation.accountGrantId, grantId: externalExecutionReservation.grantId,
+    attempts: externalExecutionReservation.reservedVerificationAttempts }).from(externalExecutionReservation);
+  const accountUsed = reservations.filter((value) => value.accountGrantId === account.id).reduce((sum, value) => sum + value.attempts, 0);
+  const operationUsed = reservations.filter((value) => value.grantId === operation.id).reduce((sum, value) => sum + value.attempts, 0);
+  if (priorClaims.length >= operation.maxVerificationAttempts || priorClaims.length >= account.maxVerificationAttempts
+    || operationUsed >= operation.maxVerificationAttempts || accountUsed >= account.maxVerificationAttempts) {
+    throw new ExternalExecutionAuthorityError('execution_budget_exhausted');
+  }
+}
+
 async function claimAttempt(database: VigiloDatabase, verificationId: string, queueJobId: string, now: Date, randomId: () => string): Promise<Claim> {
   return database.transaction(async (transaction) => {
+    await lockExternalExecution(transaction);
     const [verification] = await transaction.select().from(candidateVerification).where(eq(candidateVerification.id, verificationId)).limit(1);
     if (!verification) throw new Error('verification_not_found');
     if (['completed', 'infrastructure_failed', 'cancelled'].includes(verification.state)) return { kind: 'terminal', verification };
@@ -71,6 +116,16 @@ async function claimAttempt(database: VigiloDatabase, verificationId: string, qu
     if (active) {
       if (!active.leaseExpiresAt || active.leaseExpiresAt.getTime() > now.getTime()) return { kind: 'busy', verification };
       const [existingEvidence] = await transaction.select().from(candidateVerificationEvidence).where(eq(candidateVerificationEvidence.id, active.expectedEvidenceId)).limit(1);
+      if (!existingEvidence && !active.sandboxName) {
+        try { await assertRunBusinessAllowed(transaction, { workspaceId: verification.workspaceId, repairRunId: verification.repairRunId }, now); }
+        catch (error) {
+          if (!(error instanceof ExternalExecutionAuthorityError)) throw error;
+          await transaction.update(candidateVerificationAttempt).set({ state: 'exhausted', failureCode: error.code, leaseExpiresAt: null, finishedAt: now }).where(eq(candidateVerificationAttempt.id, active.id));
+          await transaction.update(candidateVerification).set({ state: 'infrastructure_failed', verificationContract: 'infrastructure_failed', baselineComparison: 'not_comparable', failureCode: error.code, completedAt: now, updatedAt: now }).where(eq(candidateVerification.id, verification.id));
+          await transaction.insert(candidateVerificationEvent).values({ id: randomId(), verificationId: verification.id, workspaceId: verification.workspaceId, fromState: 'verifying', toState: 'infrastructure_failed', verificationContract: 'infrastructure_failed', baselineComparison: 'not_comparable', failureCode: error.code, createdAt: now });
+          return { kind: 'terminal', verification };
+        }
+      }
       const ownershipToken = randomId();
       const [recovered] = await transaction.update(candidateVerificationAttempt).set({ ownershipToken, heartbeatAt: now, leaseExpiresAt: leaseEnd(now), failureCode: 'stale_worker_recovery' }).where(and(
         eq(candidateVerificationAttempt.id, active.id), eq(candidateVerificationAttempt.ownershipToken, active.ownershipToken),
@@ -87,6 +142,16 @@ async function claimAttempt(database: VigiloDatabase, verificationId: string, qu
       if (!owned) return { kind: 'busy', verification };
       await transaction.insert(candidateVerificationEvent).values({ id: randomId(), verificationId: verification.id, workspaceId: verification.workspaceId, fromState: 'queued', toState: 'verifying', createdAt: now });
       Object.assign(verification, owned);
+    }
+    try {
+      await assertRunBusinessAllowed(transaction, { workspaceId: verification.workspaceId, repairRunId: verification.repairRunId }, now);
+      await assertVerificationClaimAllowed(transaction, verification, now);
+    }
+    catch (error) {
+      if (!(error instanceof ExternalExecutionAuthorityError)) throw error;
+      await transaction.update(candidateVerification).set({ state: 'infrastructure_failed', verificationContract: 'infrastructure_failed', baselineComparison: 'not_comparable', failureCode: error.code, completedAt: now, updatedAt: now }).where(eq(candidateVerification.id, verification.id));
+      await transaction.insert(candidateVerificationEvent).values({ id: randomId(), verificationId: verification.id, workspaceId: verification.workspaceId, fromState: 'verifying', toState: 'infrastructure_failed', verificationContract: 'infrastructure_failed', baselineComparison: 'not_comparable', failureCode: error.code, createdAt: now });
+      return { kind: 'terminal', verification };
     }
     const [attempt] = await transaction.insert(candidateVerificationAttempt).values({
       id: randomId(), verificationId: verification.id, queueJobId, attemptNumber: (latest?.attemptNumber ?? 0) + 1,
@@ -191,7 +256,7 @@ async function finalizeFromEvidence(dependencies: CandidateVerificationWorkerDep
     await finalizeInfrastructure(dependencies, verification, evidence.id, evidence.errorCode ?? evidence.executionOutcome, now, evidence.candidateArtifactIntegrity === 'invalid' ? 'invalid' : 'valid');
     return { id: attempt.queueJobId, status: 'completed' };
   }
-  const exhausted = attempt.attemptNumber >= REPAIR_JOB_MAX_ATTEMPTS;
+  const exhausted = attempt.attemptNumber >= REPAIR_JOB_MAX_ATTEMPTS || TERMINAL_EXECUTION_CODES.has(evidence.errorCode ?? '');
   const owned = await finishAttempt(dependencies.database, attempt, now, { state: exhausted ? 'exhausted' : 'retryable_failed', evidenceId: evidence.id, failureCode: evidence.errorCode ?? evidence.executionOutcome, cleanup: { stop: evidence.cleanupStop, delete: evidence.cleanupDelete, lookup: evidence.cleanupLookup } });
   if (!owned) return { id: attempt.queueJobId, status: 'failed', output: { code: 'verification_ownership_lost' } };
   if (exhausted) {
@@ -238,7 +303,7 @@ export async function processCandidateVerificationJob(job: RepairQueueJob, depen
   catch { return { id: job.id, status: 'deadletter', output: { code: 'private_repository_not_supported' } }; }
   if (claim.recovered && attempt.sandboxName) {
     const cleanup = await (dependencies.recover ?? recoverSandbox)(
-      { name: attempt.sandboxName, sessionId: attempt.sandboxSessionId },
+      { name: attempt.sandboxName, sessionId: attempt.sandboxSessionId, knownAttempt: { kind: 'verification', id: attempt.id } },
       dependencies.executionAuthority ?? new DurableExternalExecutionAuthorizer(dependencies.database),
       { workspaceId: verification.workspaceId, repairRunId: verification.repairRunId, githubRepositoryId: verification.githubRepositoryId, baseCommitSha: verification.baseCommitSha, operationCategory: 'sandbox_verification', providerId: 'vercel' },
     );
@@ -275,7 +340,7 @@ export async function processCandidateVerificationJob(job: RepairQueueJob, depen
     }
     const code = safeCode(error, controller.signal.aborted);
     const artifactInvalid = code === 'candidate_artifact_invalid';
-    const exhausted = artifactInvalid || attempt.attemptNumber >= REPAIR_JOB_MAX_ATTEMPTS;
+    const exhausted = artifactInvalid || attempt.attemptNumber >= REPAIR_JOB_MAX_ATTEMPTS || TERMINAL_EXECUTION_CODES.has(code);
     const owned = await finishAttempt(dependencies.database, attempt, (dependencies.clock ?? (() => new Date()))(), { state: exhausted ? 'exhausted' : 'retryable_failed', failureCode: code });
     if (!owned) return { id: job.id, status: 'failed', output: { code: 'verification_ownership_lost' } };
     if (exhausted) {

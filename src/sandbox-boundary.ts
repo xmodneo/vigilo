@@ -40,7 +40,7 @@ export interface SandboxLifecycleObserver {
 
 export type CleanupError = { operation: "stop" | "delete" | "lookup"; code: string };
 export function providerErrorCode(error: unknown) {
-  return error instanceof SandboxConfigurationError || error instanceof SandboxTransportError ? error.code : error instanceof APIError ? `provider_http_${error.response.status}` : "provider_operation_failed";
+  return error instanceof ExternalExecutionAuthorityError || error instanceof SandboxConfigurationError || error instanceof SandboxTransportError ? error.code : error instanceof APIError ? `provider_http_${error.response.status}` : "provider_operation_failed";
 }
 export class ExecutionCancelled extends Error {
   constructor() { super("execution_cancelled"); }
@@ -68,7 +68,7 @@ export function readSandboxCredentials(): { token: string; teamId: string; proje
 }
 
 export async function recoverSandbox(
-  identity: { name: string; sessionId: string | null },
+  identity: { name: string; sessionId: string | null; knownAttempt?: { kind: 'baseline' | 'verification'; id: string } },
   authority: ExternalExecutionAuthorizer = ZERO_EXTERNAL_EXECUTION_AUTHORITY,
   scope?: ExternalExecutionScope,
 ): Promise<{ stop: string; delete: string; lookup: string; errors: CleanupError[] }> {
@@ -76,6 +76,8 @@ export async function recoverSandbox(
   const credentials = readSandboxCredentials();
   const permit = await authority.reserve({
     scope,
+    sandbox: { name: identity.name, projectId: credentials.projectId, teamId: credentials.teamId },
+    ...(identity.knownAttempt ? { cleanup: { kind: identity.knownAttempt.kind, attemptId: identity.knownAttempt.id } } : {}),
     amounts: {
       logicalRequests: 1, providerAttempts: VERCEL_SANDBOX_PROVIDER_ATTEMPT_ALLOWANCE,
       inputTokens: 0, outputTokens: 0, sandboxIdentities: 0, sandboxRuntimeMs: 60_000,
@@ -165,12 +167,15 @@ export class SandboxBoundary {
     process.once("SIGINT", cancel);
     process.once("SIGTERM", cancel);
     const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(this.timeoutMs - 30_000), ...(cancellation ? [cancellation] : [])]);
+    let failure: unknown;
     try {
       signal.throwIfAborted();
       requireNode24(process.version);
       if (!this.scope) throw new ExternalExecutionAuthorityError("execution_authority_missing");
+      this.credentials = readSandboxCredentials();
       this.permit = await this.authority.reserve({
         scope: this.scope,
+        sandbox: { name: this.evidence.name, projectId: this.credentials.projectId, teamId: this.credentials.teamId },
         amounts: {
           logicalRequests: 1,
           providerAttempts: VERCEL_SANDBOX_PROVIDER_ATTEMPT_ALLOWANCE,
@@ -184,7 +189,6 @@ export class SandboxBoundary {
         },
       });
       await this.permit.assertOwnership();
-      this.credentials = readSandboxCredentials();
       await this.observer?.requested?.({ name: this.evidence.name });
       this.createAttempted = true;
       console.log(JSON.stringify({ event: "sandbox_requested", name: this.evidence.name }));
@@ -193,6 +197,7 @@ export class SandboxBoundary {
         persistent: false, timeout: this.timeoutMs, networkPolicy: this.policy, ports: [], signal,
         resources: { vcpus: vcpus(this.resourceClass) }, fetch: this.permit.meteredFetch,
       });
+      await this.permit.resolveSandboxCreation?.({ name: this.sandbox.name, sessionId: this.sandbox.currentSession().sessionId });
       this.evidence.created = true;
       if (this.sandbox.persistent || !isDeepStrictEqual(this.sandbox.networkPolicy, this.policy) || this.sandbox.timeout !== this.timeoutMs) {
         throw new Error("unsafe_provider_settings");
@@ -203,14 +208,32 @@ export class SandboxBoundary {
       await work(this.sandbox, signal);
       signal.throwIfAborted();
     } catch (error) {
+      failure = error;
+      if (this.createAttempted && !this.sandbox && this.permit?.resolveSandboxCreation) {
+        // SDK response parsing failed or transport lost its result. Resolve only
+        // an unmatched create attempt; never replace an existing outcome.
+        try { await this.permit.resolveSandboxCreation(); } catch { /* Durable unmatched start remains conservative evidence. */ }
+        if (!(error instanceof ExternalExecutionAuthorityError) && !(error instanceof SandboxTransportError)) {
+          failure = new ExternalExecutionAuthorityError('provider_attempt_ambiguous');
+        }
+      }
+      if (failure instanceof ExternalExecutionAuthorityError) throw failure;
       if (controller.signal.aborted || cancellation?.aborted) throw new ExecutionCancelled();
-      throw error;
+      throw failure;
     } finally {
       try {
         await this.close();
         if (this.permit) {
           const clean = this.cleanup.stop === "confirmed" && this.cleanup.delete === "confirmed" && this.cleanup.lookup === "absent";
-          await this.permit.complete(clean ? "succeeded" : "failed", clean ? undefined : "sandbox_cleanup_unresolved");
+          const uncertain = failure instanceof ExternalExecutionAuthorityError && failure.code === 'provider_attempt_ambiguous';
+          try {
+            await this.permit.complete(uncertain ? 'ambiguous' : failure ? 'failed' : clean ? 'succeeded' : 'failed',
+              uncertain ? 'provider_attempt_ambiguous' : failure instanceof ExternalExecutionAuthorityError ? failure.code : clean ? undefined : 'sandbox_cleanup_unresolved');
+          } catch (error) {
+            // Cleanup/outcome persistence must not mask a terminal authority
+            // refusal with a retryable infrastructure classification.
+            if (!(failure instanceof ExternalExecutionAuthorityError)) throw error;
+          }
         }
       }
       finally {

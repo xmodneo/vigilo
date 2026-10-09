@@ -250,7 +250,7 @@ test('provider failures retry at most three times and valid low-evidence conclus
   });
 });
 
-test('daily Gemini quota exhaustion fails once without repository or mutation capabilities', async (t) => {
+test('recorded Gemini quota-response ambiguity fails once without repository or mutation capabilities', async (t) => {
   const context = await createTestContext(); t.after(() => context.client.close()); const root = await seedRoot(context);
   const seeded = await seedReady(context, root.workspaceId); const ai = await startAiInvestigation(context.database, root.owner, seeded.investigationId, new MemoryQueue()); const gateway = new Gateway();
   const rawMarker = 'provider-secret-response-marker';
@@ -258,8 +258,8 @@ test('daily Gemini quota exhaustion fails once without repository or mutation ca
   const provider = new GeminiInvestigationProvider('test-secret-value-with-adequate-length', 'gemini-3.1-flash-lite', client as never, createTestExternalExecutionAuthorizer());
   const output = await processAiInvestigationJob(job(ai.id), { database: context.database, gateway, configuration: CONFIGURATION, createProvider: () => provider, clock: () => NOW });
   assert.equal(output.status, 'completed');
-  const stored = await getAiInvestigation(context.database, root.owner, ai.id); assert.equal(stored?.state, 'failed'); assert.equal(stored?.failureCode, 'provider_quota_exhausted');
-  const attempts = await context.database.select().from(aiInvestigationAttempt); assert.equal(attempts.length, 1); assert.equal(attempts[0]?.state, 'exhausted'); assert.equal(attempts[0]?.failureCode, 'provider_quota_exhausted');
+  const stored = await getAiInvestigation(context.database, root.owner, ai.id); assert.equal(stored?.state, 'failed'); assert.equal(stored?.failureCode, 'provider_attempt_ambiguous');
+  const attempts = await context.database.select().from(aiInvestigationAttempt); assert.equal(attempts.length, 1); assert.equal(attempts[0]?.state, 'exhausted'); assert.equal(attempts[0]?.failureCode, 'provider_attempt_ambiguous');
   assert.equal((await context.database.select().from(investigationContextEvent)).length, 0); assert.equal((await context.database.select().from(repairCandidate)).length, 0); assert.deepEqual(gateway.calls, []);
   const persistedFailureRecords = {
     investigations: await context.database.select().from(aiInvestigation),
@@ -269,6 +269,27 @@ test('daily Gemini quota exhaustion fails once without repository or mutation ca
   assert.doesNotMatch(JSON.stringify(persistedFailureRecords), new RegExp(rawMarker));
   const executionSource = `${readFileSync('lib/ai-investigations/runner.ts', 'utf8')}\n${readFileSync('lib/ai-investigations/worker.ts', 'utf8')}`;
   assert.doesNotMatch(executionSource, /@vercel\/sandbox|createCandidate|freezeCandidate|createBranch|createCommit|createPullRequest/);
+});
+
+test('controlled investigation input accounting uses serialized request bytes within a small two-request envelope', async (t) => {
+  const context = await createTestContext(); t.after(() => context.client.close()); const root = await seedRoot(context);
+  const seeded = await seedReady(context, root.workspaceId); const ai = await startAiInvestigation(context.database, root.owner, seeded.investigationId, new MemoryQueue());
+  const charges: number[] = []; const requestBytes: number[] = [];
+  const underlying = createTestExternalExecutionAuthorizer();
+  const executionAuthority = { reserve: async (request: Parameters<typeof underlying.reserve>[0]) => { charges.push(request.amounts.inputTokens); return underlying.reserve(request); } };
+  const client = { create: async (request: Record<string, any>) => {
+    requestBytes.push(Buffer.byteLength(JSON.stringify(request), 'utf8'));
+    if (requestBytes.length === 1) return { status: 'requires_action', steps: [{ type: 'function_call', id: 'read', name: 'readTextFile', arguments: { path: 'src/shipping.ts' } }] };
+    const result = request.input.findLast((step: Record<string, unknown>) => step.type === 'function_result');
+    const reference = JSON.parse(result.result[0].text).operationReference;
+    return { status: 'completed', steps: [], output_text: JSON.stringify({ status: 'diagnosis_found', summary: 'The threshold excludes equality.', suspectedFiles: [{ path: 'src/shipping.ts', reason: 'Observed exclusive comparison.' }], evidence: [{ kind: 'file', reference }], proposedApproach: 'Make the comparison inclusive.', confidence: 'high' }) };
+  } };
+  const provider = new GeminiInvestigationProvider('test-secret-value-with-adequate-length', 'gemini-3.1-flash-lite', client as never, executionAuthority);
+  assert.equal((await processAiInvestigationJob(job(ai.id), { database: context.database, gateway: new Gateway(), configuration: CONFIGURATION, createProvider: () => provider, clock: () => NOW })).status, 'completed');
+  assert.equal((await getAiInvestigation(context.database, root.owner, ai.id))?.state, 'completed');
+  assert.equal(requestBytes.length, 2); assert.deepEqual(charges, requestBytes);
+  assert.ok(charges.reduce((sum, bytes) => sum + bytes, 0) <= 12 * 1024);
+  t.diagnostic(`Controlled investigation serialized input bytes: ${charges.join(' + ')} = ${charges.reduce((sum, bytes) => sum + bytes, 0)}; tested cumulative allowance 12288 bytes (not tokenizer-measured tokens).`);
 });
 
 test('durable execution-authority failures remain exact and terminal', async (t) => {
@@ -285,6 +306,36 @@ test('durable execution-authority failures remain exact and terminal', async (t)
   assert.equal(stored?.state, 'failed'); assert.equal(stored?.failureCode, 'execution_budget_exhausted');
   const attempts = await context.database.select().from(aiInvestigationAttempt).where(eq(aiInvestigationAttempt.aiInvestigationId, ai.id));
   assert.equal(attempts.length, 1); assert.equal(attempts[0]?.state, 'exhausted');
+});
+
+test('investigation runner preserves durable budget and ambiguity errors as terminal worker outcomes', async (t) => {
+  for (const code of ['execution_budget_exhausted', 'provider_attempt_ambiguous'] as const) await t.test(code, async (t) => {
+    const context = await createTestContext(); t.after(() => context.client.close()); const root = await seedRoot(context);
+    const seeded = await seedReady(context, root.workspaceId); const ai = await startAiInvestigation(context.database, root.owner, seeded.investigationId, new MemoryQueue());
+    let requests = 0;
+    const provider = new TurnProvider(() => { requests += 1; throw new ExternalExecutionAuthorityError(code); });
+    const dependencies = { database: context.database, gateway: new Gateway(), configuration: CONFIGURATION, createProvider: () => provider, clock: () => NOW };
+    assert.equal((await processAiInvestigationJob(job(ai.id), dependencies)).status, 'completed');
+    assert.equal((await getAiInvestigation(context.database, root.owner, ai.id))?.failureCode, code);
+    assert.equal((await processAiInvestigationJob(job(ai.id), dependencies)).status, 'completed');
+    assert.equal(requests, 1);
+    const attempts = await context.database.select().from(aiInvestigationAttempt).where(eq(aiInvestigationAttempt.aiInvestigationId, ai.id));
+    assert.equal(attempts.length, 1); assert.equal(attempts[0]?.state, 'exhausted');
+    if (code === 'execution_budget_exhausted') {
+      const queue = new MemoryQueue();
+      await assert.rejects(startAiInvestigation(context.database, root.owner, seeded.investigationId, queue, { idempotencyKey: randomUUID(), clock: () => NOW }), (error: unknown) => error instanceof ExternalExecutionAuthorityError && error.code === code);
+      assert.equal(queue.payloads.length, 0);
+      assert.equal((await context.database.select().from(aiInvestigation).where(eq(aiInvestigation.investigationId, seeded.investigationId))).length, 1);
+    }
+  });
+});
+
+test('investigation durable ambiguity takes precedence over a simultaneous abort', async (t) => {
+  const context = await createTestContext(); t.after(() => context.client.close()); const root = await seedRoot(context);
+  const seeded = await seedReady(context, root.workspaceId); const ai = await startAiInvestigation(context.database, root.owner, seeded.investigationId, new MemoryQueue());
+  const audit = await activateAiInvestigation(context, ai.id); const controller = new AbortController();
+  const provider = new TurnProvider(() => { controller.abort(); throw new ExternalExecutionAuthorityError('provider_attempt_ambiguous'); });
+  await assert.rejects(runAiInvestigation(context.database, new Gateway(), CONFIGURATION, provider, { ...audit, investigationId: seeded.investigationId, workspaceId: root.workspaceId, baseCommitSha: COMMIT, profileIdentity: PROFILE, baselineId: seeded.baselineId }, { signal: controller.signal }), (error: unknown) => error instanceof ExternalExecutionAuthorityError && error.code === 'provider_attempt_ambiguous');
 });
 
 test('short-lived provider rate limits remain bounded by three worker attempts', async (t) => {

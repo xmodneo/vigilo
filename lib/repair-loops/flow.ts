@@ -16,6 +16,8 @@ import {
 } from '../../db/schema.ts';
 import type { AuthenticatedWorkspace } from '../auth/protected-context.ts';
 import type { VigiloDatabase } from '../db/types.ts';
+import { assertRunBusinessAllowed, lockExternalExecution } from '../external-execution/business-fence.ts';
+import { ExternalExecutionAuthorityError } from '../external-execution/types.ts';
 import { RepositoryPolicyError, assertPublicRepositoryAuthority } from '../github-repositories/policy.ts';
 import { AI_MODEL_ID, AI_PROVIDER_ID } from '../ai-investigations/types.ts';
 import { REPAIR_LOOP_AI_CANDIDATE_GENERATION_PROTOCOL_VERSION } from '../ai-candidate-generations/types.ts';
@@ -80,6 +82,7 @@ export async function startRepairLoop(
   let created: typeof repairLoop.$inferSelect;
   try {
     created = await database.transaction(async (transaction) => {
+      await lockExternalExecution(transaction);
       const [run] = await transaction.select().from(repairRun).where(and(eq(repairRun.id, repairRunId), eq(repairRun.workspaceId, context.workspace.id))).for('update').limit(1);
       if (!run) throw new RepairLoopFlowError('repair_loop_not_eligible');
       try { await assertPublicRepositoryAuthority(transaction, run.workspaceId, run.githubRepositoryId); }
@@ -102,6 +105,7 @@ export async function startRepairLoop(
       const [ordinalValue] = await transaction.select({ value: max(aiCandidateGeneration.executionOrdinal) }).from(aiCandidateGeneration).where(eq(aiCandidateGeneration.aiInvestigationId, source.id));
       const loopId = randomId();
       const wakeJobId = randomId();
+      await assertRunBusinessAllowed(transaction, { workspaceId: run.workspaceId, repairRunId: run.id }, now);
       const generationId = randomId();
       const iterationId = randomId();
       const [loop] = await transaction.insert(repairLoop).values({
@@ -138,7 +142,7 @@ export async function startRepairLoop(
       return loop;
     });
   } catch (error) {
-    if (error instanceof RepairLoopFlowError) throw error;
+    if (error instanceof RepairLoopFlowError || error instanceof ExternalExecutionAuthorityError) throw error;
     const [existing] = await database.select().from(repairLoop).where(and(eq(repairLoop.repairRunId, repairRunId), eq(repairLoop.workspaceId, context.workspace.id))).limit(1);
     if (existing) return result(database, existing);
     throw new RepairLoopFlowError('repair_loop_handoff_failed');

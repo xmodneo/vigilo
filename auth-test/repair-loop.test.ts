@@ -184,6 +184,38 @@ test('RepairLoop execution fails terminally before reconciliation when durable i
   assert.equal(queues.verifications.length, 0);
 });
 
+test('durable ambiguity rejects a new loop before initial generation insertion or queueing', async (t) => {
+  const context = await createTestContext(); t.after(() => context.client.close()); const seeded = await seed(context);
+  const { authority } = await createDurableLoopAuthority(context, seeded);
+  const permit = await authority.reserve({ scope: { workspaceId: seeded.workspaceId, repairRunId: seeded.runId, githubRepositoryId: REPOSITORY_ID,
+    baseCommitSha: COMMIT, operationCategory: 'repair_loop_iteration', providerId: 'vigilo' },
+    amounts: { logicalRequests: 1, providerAttempts: 0, inputTokens: 0, outputTokens: 0, sandboxIdentities: 0, sandboxRuntimeMs: 0, verificationAttempts: 0, repairLoopIterations: 1 } });
+  await permit.complete('ambiguous', 'provider_attempt_ambiguous');
+  const queues = new Queues();
+  await assert.rejects(startRepairLoop(context.database, seeded.workspaceContext, seeded.runId, queues, { clock: () => NOW }), /provider_attempt_ambiguous/);
+  assert.equal((await context.database.select().from(repairLoop)).length, 0);
+  assert.equal((await context.database.select().from(aiCandidateGeneration)).length, 0);
+});
+
+test('restart of a queued loop after durable ambiguity terminates without new children', async (t) => {
+  const context = await createTestContext(); t.after(() => context.client.close());
+  const { seeded, queues, loop } = await createLoop(context);
+  const { authority } = await createDurableLoopAuthority(context, seeded);
+  const permit = await authority.reserve({ operationKey: loop.id, scope: { workspaceId: seeded.workspaceId, repairRunId: seeded.runId,
+    githubRepositoryId: REPOSITORY_ID, baseCommitSha: COMMIT, operationCategory: 'repair_loop_iteration', providerId: 'vigilo' },
+    amounts: { logicalRequests: 1, providerAttempts: 0, inputTokens: 0, outputTokens: 0, sandboxIdentities: 0, sandboxRuntimeMs: 0, verificationAttempts: 0, repairLoopIterations: 1 } });
+  await permit.complete('ambiguous', 'provider_attempt_ambiguous');
+  const wakeJobId = await currentWake(context, loop.id);
+  const dependencies = { database: context.database, queues, clock: () => NOW, executionAuthority: new DurableExternalExecutionAuthorizer(context.database, { clock: () => NOW }) };
+  const queued = { id: wakeJobId, data: { version: 1, repairLoopId: loop.id } } as never;
+  assert.equal((await processRepairLoopJob(queued, dependencies)).status, 'completed');
+  assert.equal((await processRepairLoopJob(queued, dependencies)).status, 'completed');
+  assert.equal((await getRepairLoop(context.database, seeded.workspaceContext, loop.id))?.failureCode, 'provider_attempt_ambiguous');
+  assert.equal((await context.database.select().from(aiCandidateGeneration)).length, 1);
+  assert.equal((await context.database.select().from(candidateVerification)).length, 0);
+  assert.equal((await context.database.select().from(repairLoopIteration)).length, 1);
+});
+
 test('RepairLoop restart revalidates a completed reservation against current grant revocation', async (t) => {
   const context = await createTestContext(); t.after(() => context.client.close());
   const { seeded, queues, loop } = await createLoop(context);
@@ -268,6 +300,25 @@ test('repairable iteration 1 schedules one protocol-v4 replacement with canonica
   const secondCandidate = await freezeGeneration(context, secondGeneration!.id, seeded, 2); await runWake(context, loop.id, queues);
   const [second] = await context.database.select().from(repairLoopIteration).where(eq(repairLoopIteration.id, iterations[1]!.id)); await completeVerification(context, second!.candidateVerificationId!, secondCandidate.candidateId, secondCandidate.candidateIdentity, seeded, false); await runWake(context, loop.id, queues);
   assert.equal((await getRepairLoop(context.database, seeded.workspaceContext, loop.id))?.state, 'limit_reached'); assert.equal((await context.database.select().from(repairLoopIteration).where(eq(repairLoopIteration.repairLoopId, loop.id))).length, 2);
+});
+
+test('one durable iteration grant rejects iteration two before replacement row or queue insertion', async (t) => {
+  const context = await createTestContext(); t.after(() => context.client.close());
+  const { seeded, queues, loop } = await createLoop(context);
+  const { authority } = await createDurableLoopAuthority(context, seeded);
+  const wake = async () => processRepairLoopJob({ id: await currentWake(context, loop.id), data: { version: 1, repairLoopId: loop.id } } as never,
+    { database: context.database, queues, clock: () => NOW, executionAuthority: authority });
+  assert.equal((await wake()).status, 'completed');
+  const candidate = await freezeGeneration(context, loop.iterations[0]!.aiCandidateGenerationId, seeded, 1);
+  assert.equal((await wake()).status, 'completed');
+  const [iteration] = await context.database.select().from(repairLoopIteration).where(eq(repairLoopIteration.repairLoopId, loop.id));
+  await completeVerification(context, iteration!.candidateVerificationId!, candidate.candidateId, candidate.candidateIdentity, seeded, false);
+  const generationCount = (await context.database.select().from(aiCandidateGeneration)).length;
+  assert.equal((await wake()).status, 'completed');
+  const terminal = await getRepairLoop(context.database, seeded.workspaceContext, loop.id);
+  assert.equal(terminal?.state, 'failed'); assert.equal(terminal?.failureCode, 'execution_budget_exhausted');
+  assert.equal((await context.database.select().from(aiCandidateGeneration)).length, generationCount);
+  assert.equal((await context.database.select().from(repairLoopIteration)).length, 1);
 });
 
 test('protocol-v4 execution receives only the exact canonical immediate-predecessor feedback', async (t) => {

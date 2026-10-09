@@ -9,7 +9,7 @@ import { InvestigationContextError, listPaths, readBaselineSummary, readTextFile
 import type { InvestigationSourceGateway } from '../investigations/types.ts';
 import { buildInitialInput, CONCLUSION_SCHEMA, encodeToolOutput, MODEL_INSTRUCTIONS, MODEL_TOOLS, parseConclusion, parseToolArguments } from './protocol.ts';
 import { AI_LIMITS, ModelProviderError, type InvestigationConclusion, type InvestigationModelProvider, type ModelProviderFailureCode, type ToolName } from './types.ts';
-import type { ExternalExecutionFailureCode } from '../external-execution/types.ts';
+import { ExternalExecutionAuthorityError, type ExternalExecutionFailureCode } from '../external-execution/types.ts';
 
 export type AiAgentErrorCode =
   | 'private_repository_not_supported'
@@ -135,6 +135,7 @@ export async function runAiInvestigation(
     let turn;
     try { turn = await session.next({ ...(outputs ? { toolOutputs: outputs } : {}), ...(finalization ? { finalization: true } : {}), signal: controller.signal }); }
     catch (error) {
+      if (error instanceof ExternalExecutionAuthorityError) throw error;
       if (controller.signal.aborted) throw new AiAgentError('model_timeout');
       if (error instanceof ModelProviderError) throw new AiAgentError(error.code, error.retryAfterMs);
       if (error instanceof Error && error.message === 'model_protocol_error') throw new AiAgentError(finalization ? 'model_limit_exceeded' : 'model_protocol_error');

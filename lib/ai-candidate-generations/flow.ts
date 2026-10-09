@@ -5,6 +5,7 @@ import { and, desc, eq, inArray } from 'drizzle-orm';
 import { aiCandidateGeneration, aiCandidateGenerationEvent, aiInvestigation, executionProfile, humanReviewDecision, investigation, repairLoop, repairRun, repositoryBaseline } from '../../db/schema.ts';
 import type { AuthenticatedWorkspace } from '../auth/protected-context.ts';
 import type { VigiloDatabase } from '../db/types.ts';
+import { assertRunBusinessAllowed, lockExternalExecution } from '../external-execution/business-fence.ts';
 import { RepositoryPolicyError, assertPublicRepositoryAuthority } from '../github-repositories/policy.ts';
 import { AI_MODEL_ID, AI_PROVIDER_ID } from '../ai-investigations/types.ts';
 import type { TransactionalAiCandidateGenerationQueue } from '../repair-runs/queue.ts';
@@ -24,6 +25,7 @@ export async function startAiCandidateGeneration(database: VigiloDatabase, conte
   const randomId = options.randomId ?? randomUUID; const now = (options.clock ?? (() => new Date()))(); const idempotencyKey = options.idempotencyKey ?? randomUUID();
   if (!UUID.test(aiInvestigationId) || !UUID.test(idempotencyKey)) throw new AiCandidateGenerationFlowError('candidate_generation_not_eligible');
   const created = await database.transaction(async (transaction) => {
+    await lockExternalExecution(transaction);
     const [source] = await transaction.select({ source: aiInvestigation, parent: investigation, run: repairRun, baseline: repositoryBaseline, profile: executionProfile })
       .from(aiInvestigation).innerJoin(investigation, eq(investigation.id, aiInvestigation.investigationId)).innerJoin(repairRun, eq(repairRun.id, aiInvestigation.repairRunId)).innerJoin(repositoryBaseline, eq(repositoryBaseline.id, aiInvestigation.baselineId)).innerJoin(executionProfile, and(eq(executionProfile.githubRepositoryId, aiInvestigation.githubRepositoryId), eq(executionProfile.workspaceId, aiInvestigation.workspaceId)))
       .where(and(eq(aiInvestigation.id, aiInvestigationId), eq(aiInvestigation.workspaceId, context.workspace.id))).for('update').limit(1);
@@ -42,6 +44,7 @@ export async function startAiCandidateGeneration(database: VigiloDatabase, conte
     if (existing.some((row) => ['created', 'queued', 'generating'].includes(row.state))) throw new AiCandidateGenerationFlowError('candidate_generation_active');
     const latest = existing.at(-1);
     if (latest?.state === 'frozen' || latest?.state === 'abstained') throw new AiCandidateGenerationFlowError('candidate_generation_not_eligible');
+    await assertRunBusinessAllowed(transaction, { workspaceId: source.run.workspaceId, repairRunId: source.run.id }, now);
     const id = randomId();
     const executionOrdinal = (latest?.executionOrdinal ?? 0) + 1;
     const [row] = await transaction.insert(aiCandidateGeneration).values({ id, aiInvestigationId: source.source.id, executionOrdinal, investigationId: source.source.investigationId, repairRunId: source.source.repairRunId, baselineId: source.source.baselineId, workspaceId: source.source.workspaceId, githubRepositoryId: source.source.githubRepositoryId, installationId: source.source.installationId, baseCommitSha: source.source.baseCommitSha, profileIdentity: source.source.profileIdentity, providerId: AI_PROVIDER_ID, modelId: AI_MODEL_ID, protocolVersion: AI_CANDIDATE_GENERATION_PROTOCOL_VERSION, idempotencyKey, state: 'created', createdAt: now, updatedAt: now }).returning();

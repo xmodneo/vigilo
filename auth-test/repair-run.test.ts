@@ -19,6 +19,7 @@ import type { VigiloDatabase } from '../lib/db/types.ts';
 import { computeExecutionProfileIdentity, gitBlobSha } from '../lib/execution-profiles/detector.ts';
 import type { GitHubAppConfiguration } from '../lib/github-app/types.ts';
 import { BaselineAuthorityError } from '../lib/repository-baselines/authority.ts';
+import { ExternalExecutionAuthorityError } from '../lib/external-execution/types.ts';
 import { executeSelectedRepositoryBaseline } from '../lib/repository-baselines/flow.ts';
 import type { BaselineEvidence, GitHubBaselineGateway } from '../lib/repository-baselines/types.ts';
 import {
@@ -383,6 +384,39 @@ test('infrastructure failures retry within bounds and exhaust accurately', async
   const stored = await getRepairRun(context.database, owner, run.id);
   assert.equal(stored?.state, 'infrastructure_failed'); assert.equal(stored?.failureCode, 'installation_failed');
   assert.deepEqual((await context.database.select().from(repairRunAttempt)).map((attempt) => attempt.state), ['retryable_failed', 'retryable_failed', 'exhausted']);
+});
+
+test('durable budget and ambiguity errors end baseline execution without retry or abort relabeling', async (t) => {
+  for (const code of ['execution_budget_exhausted', 'provider_attempt_ambiguous', 'sandbox_creation_failed'] as const) {
+    const context = await createTestContext(); t.after(() => context.client.close());
+    const owner = await authenticated(context); await seed(context, owner); const { run } = await queuedRun(context, owner);
+    let calls = 0;
+    const cancellation = new AbortController();
+    const executor = (async () => {
+      calls++;
+      cancellation.abort();
+      throw new ExternalExecutionAuthorityError(code);
+    }) as typeof executeSelectedRepositoryBaseline;
+    const dependencies = workerDependencies(context.database, executor);
+    assert.equal((await processRepairJob({ ...job(run.id), signal: cancellation.signal }, dependencies)).status, 'completed');
+    assert.equal((await processRepairJob(job(run.id), dependencies)).status, 'completed');
+    assert.equal(calls, 1);
+    assert.equal((await getRepairRun(context.database, owner, run.id))?.failureCode, code);
+    assert.deepEqual((await context.database.select().from(repairRunAttempt)).map((attempt) => attempt.state), ['exhausted']);
+  }
+});
+
+test('baseline evidence preserves terminal authority errors instead of scheduling infrastructure retry', async (t) => {
+  for (const code of ['execution_budget_exhausted', 'provider_attempt_ambiguous', 'sandbox_creation_failed']) {
+    const context = await createTestContext(); t.after(() => context.client.close());
+    const owner = await authenticated(context); await seed(context, owner); const { run } = await queuedRun(context, owner);
+    const calls = { count: 0 };
+    const dependencies = workerDependencies(context.database, executorFor('infrastructure_failed', { error: { phase: 'sandbox', code } }, calls));
+    assert.equal((await processRepairJob(job(run.id), dependencies)).status, 'completed');
+    assert.equal((await processRepairJob(job(run.id), dependencies)).status, 'completed');
+    assert.equal(calls.count, 1); assert.equal((await getRepairRun(context.database, owner, run.id))?.failureCode, code);
+    assert.deepEqual((await context.database.select().from(repairRunAttempt)).map((attempt) => attempt.state), ['exhausted']);
+  }
 });
 
 test('malformed payload and unknown run IDs dead-letter safely', async (t) => {

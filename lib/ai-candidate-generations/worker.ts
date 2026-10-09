@@ -12,12 +12,15 @@ import { CandidatePolicyError } from '../repair-candidates/policy.ts';
 import { parseAiCandidateGenerationJobPayload, REPAIR_JOB_MAX_ATTEMPTS, type RepairQueueJob } from '../repair-runs/queue.ts';
 import { AiCandidateGenerationError, runAiCandidateGeneration, type AiCandidateGenerationErrorCode, type AiCandidateGenerationExecution } from './runner.ts';
 import { ExternalExecutionAuthorityError } from '../external-execution/types.ts';
+import { assertRunBusinessAllowed, lockExternalExecution } from '../external-execution/business-fence.ts';
 import { assertPublicRepositoryAuthority, RepositoryPolicyError } from '../github-repositories/policy.ts';
 
 const LEASE_MS = 4 * 60_000; const HEARTBEAT_MS = 30_000;
 type Row = typeof aiCandidateGeneration.$inferSelect; type Attempt = typeof aiCandidateGenerationAttempt.$inferSelect;
 type JobResult = { id: string; status: 'completed' | 'failed' | 'deadletter'; output?: { code: string } };
 const NON_RETRYABLE = new Set<AiCandidateGenerationErrorCode>(['private_repository_not_supported', 'candidate_generation_authority_mismatch', 'candidate_generation_ownership_lost', 'invalid_model_proposal', 'schema_mismatch', 'invalid_operation_shape', 'invalid_path', 'proposal_limit_exceeded', 'fresh_observation_missing', 'model_limit_exceeded', 'model_protocol_error', 'model_provider_mismatch', 'provider_configuration_failed', 'provider_quota_exhausted', 'unread_existing_file', 'context_source_unavailable', 'execution_authority_missing', 'execution_authority_expired', 'execution_budget_exhausted', 'execution_authority_mismatch', 'provider_attempt_ambiguous', 'sandbox_cleanup_unresolved']);
+
+NON_RETRYABLE.add('sandbox_creation_failed');
 
 function candidatePolicyFailureCode(code: string | null): AiCandidateGenerationErrorCode {
   if (['invalid_path', 'denied_path', 'package_manifest_change_not_allowed', 'unsupported_file_type'].includes(String(code))) return 'invalid_path';
@@ -51,6 +54,7 @@ type Claim = { kind: 'attempt'; row: Row; attempt: Attempt } | { kind: 'busy' | 
 
 async function claim(database: VigiloDatabase, id: string, queueJobId: string, now: Date, randomId: () => string): Promise<Claim> {
   return database.transaction(async (transaction) => {
+    await lockExternalExecution(transaction);
     const [row] = await transaction.select().from(aiCandidateGeneration).where(eq(aiCandidateGeneration.id, id)).for('update').limit(1);
     if (!row) throw new Error('ai_candidate_generation_not_found');
     if (['frozen', 'abstained', 'failed', 'cancelled'].includes(row.state)) return { kind: 'terminal' };
@@ -77,6 +81,13 @@ async function claim(database: VigiloDatabase, id: string, queueJobId: string, n
       await transaction.insert(aiCandidateGenerationEvent).values({ id: randomId(), generationId: id, workspaceId: updated.workspaceId, fromState: 'queued', toState: 'generating', createdAt: now });
     }
     if (current.state !== 'generating') return { kind: 'terminal' };
+    try { await assertRunBusinessAllowed(transaction, { workspaceId: row.workspaceId, repairRunId: row.repairRunId }, now); }
+    catch (error) {
+      if (!(error instanceof ExternalExecutionAuthorityError)) throw error;
+      await transaction.update(aiCandidateGeneration).set({ state: 'failed', failureCode: error.code, completedAt: now, updatedAt: now }).where(eq(aiCandidateGeneration.id, id));
+      await transaction.insert(aiCandidateGenerationEvent).values({ id: randomId(), generationId: id, workspaceId: row.workspaceId, fromState: 'generating', toState: 'failed', failureCode: error.code, createdAt: now });
+      return { kind: 'terminal' };
+    }
     const [attempt] = await transaction.insert(aiCandidateGenerationAttempt).values({ id: randomId(), generationId: id, queueJobId, attemptNumber, ownershipToken: randomId(), state: 'active', claimedAt: now, heartbeatAt: now, leaseExpiresAt: new Date(now.getTime() + LEASE_MS) }).returning();
     if (!attempt) throw new Error('ai_candidate_generation_claim_failed');
     return { kind: 'attempt', row: current, attempt };
@@ -143,6 +154,10 @@ export async function processAiCandidateGenerationJob(job: RepairQueueJob, depen
     const provider = dependencies.createProvider(); if (provider.providerId !== row.providerId || provider.modelId !== row.modelId) throw new AiCandidateGenerationError('model_provider_mismatch');
     const execution = await (dependencies.executor ?? runAiCandidateGeneration)(dependencies.database, dependencies.gateway, dependencies.configuration, provider, { generationId: row.id, generationAttemptId: attempt.id, ownershipToken: attempt.ownershipToken, aiInvestigationId: row.aiInvestigationId, investigationId: row.investigationId, workspaceId: row.workspaceId, baseCommitSha: row.baseCommitSha, profileIdentity: row.profileIdentity, baselineId: row.baselineId }, { signal: controller.signal, randomId });
     if (execution.result.status === 'insufficient_evidence') return await abstain(dependencies.database, row, attempt, execution.usage, clock(), randomId) ? { id: job.id, status: 'completed' } : { id: job.id, status: 'failed', output: { code: 'candidate_generation_ownership_lost' } };
+    await dependencies.database.transaction(async (transaction) => {
+      await lockExternalExecution(transaction);
+      await assertRunBusinessAllowed(transaction, { workspaceId: row.workspaceId, repairRunId: row.repairRunId }, clock());
+    });
     const candidate = await proposeRepairCandidate(dependencies.database, { workspace: { id: row.workspaceId } } as never, dependencies.gateway, dependencies.configuration, { proposalKey: row.id, investigationId: row.investigationId, files: execution.result.proposal.files.map((file) => ({ ...file, resultingContent: file.resultingContent === null ? null : Buffer.from(file.resultingContent, 'utf8') })) });
     if (candidate.state !== 'frozen') throw new AiCandidateGenerationError(candidatePolicyFailureCode(candidate.rejectionCode));
     await dependencies.afterCandidateFrozen?.();

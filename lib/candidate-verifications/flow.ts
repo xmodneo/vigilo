@@ -16,6 +16,8 @@ import {
 } from '../../db/schema.ts';
 import type { AuthenticatedWorkspace } from '../auth/protected-context.ts';
 import type { VigiloDatabase } from '../db/types.ts';
+import { assertRunBusinessAllowed, lockExternalExecution } from '../external-execution/business-fence.ts';
+import { ExternalExecutionAuthorityError } from '../external-execution/types.ts';
 import { RepositoryPolicyError, assertPublicRepositoryAuthority } from '../github-repositories/policy.ts';
 import { selfCheckRepairCandidate } from '../repair-candidates/flow.ts';
 import { frozenBaselineProfile } from '../repository-baselines/authority.ts';
@@ -142,6 +144,7 @@ export async function startCandidateVerification(
   const now = clock();
   try {
     return await database.transaction(async (transaction) => {
+      await lockExternalExecution(transaction);
       const [lockedRun] = await transaction.select({ id: repairRun.id }).from(repairRun).where(and(eq(repairRun.id, candidate.repairRunId), eq(repairRun.workspaceId, context.workspace.id))).for('update').limit(1);
       if (!lockedRun) throw new CandidateVerificationError('verification_authority_mismatch');
       const [review] = await transaction.select({ id: humanReviewDecision.id }).from(humanReviewDecision).where(eq(humanReviewDecision.repairRunId, candidate.repairRunId)).limit(1);
@@ -154,6 +157,7 @@ export async function startCandidateVerification(
           : eq(candidateVerification.candidateId, candidate.id),
       ).orderBy(desc(candidateVerification.createdAt), desc(candidateVerification.id)).limit(1);
       if (existing) return candidateVerificationResult(existing);
+      await assertRunBusinessAllowed(transaction, { workspaceId: candidate.workspaceId, repairRunId: candidate.repairRunId }, now);
       const id = randomId();
       const [created] = await transaction.insert(candidateVerification).values({
         id, candidateId: candidate.id, investigationId: candidate.investigationId, repairRunId: candidate.repairRunId,
@@ -172,7 +176,7 @@ export async function startCandidateVerification(
       return candidateVerificationResult(created);
     });
   } catch (error) {
-    if (error instanceof CandidateVerificationError) throw error;
+    if (error instanceof CandidateVerificationError || error instanceof ExternalExecutionAuthorityError) throw error;
     const [existing] = await database.select().from(candidateVerification).where(eq(candidateVerification.candidateId, candidate.id)).orderBy(desc(candidateVerification.createdAt), desc(candidateVerification.id)).limit(1);
     if (existing) return candidateVerificationResult(existing);
     throw new CandidateVerificationError('verification_handoff_failed');

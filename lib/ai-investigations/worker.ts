@@ -10,6 +10,7 @@ import { parseAiInvestigationJobPayload, REPAIR_JOB_MAX_ATTEMPTS, type RepairQue
 import { AiAgentError, runAiInvestigation, type AiAgentErrorCode, type AiAgentExecution } from './runner.ts';
 import { ModelProviderError, type InvestigationModelProvider } from './types.ts';
 import { ExternalExecutionAuthorityError } from '../external-execution/types.ts';
+import { assertRunBusinessAllowed, lockExternalExecution } from '../external-execution/business-fence.ts';
 import { assertPublicRepositoryAuthority, RepositoryPolicyError } from '../github-repositories/policy.ts';
 
 const LEASE_MS = 4 * 60_000;
@@ -33,6 +34,7 @@ const NON_RETRYABLE_FAILURES = new Set<AiAgentErrorCode>([
   'execution_authority_mismatch',
   'provider_attempt_ambiguous',
   'sandbox_cleanup_unresolved',
+  'sandbox_creation_failed',
   'unobserved_suspected_file',
 ]);
 
@@ -65,6 +67,7 @@ type Claim = { kind: 'attempt'; row: Row; attempt: Attempt } | { kind: 'busy' | 
 
 async function claim(database: VigiloDatabase, id: string, queueJobId: string, now: Date, randomId: () => string): Promise<Claim> {
   return database.transaction(async (transaction) => {
+    await lockExternalExecution(transaction);
     const [row] = await transaction.select().from(aiInvestigation).where(eq(aiInvestigation.id, id)).for('update').limit(1);
     if (!row) throw new Error('ai_investigation_not_found');
     if (['completed', 'failed', 'cancelled'].includes(row.state)) return { kind: 'terminal' };
@@ -91,6 +94,13 @@ async function claim(database: VigiloDatabase, id: string, queueJobId: string, n
       await transaction.insert(aiInvestigationEvent).values({ id: randomId(), aiInvestigationId: id, workspaceId: updated.workspaceId, fromState: 'queued', toState: 'investigating', createdAt: now });
     }
     if (current.state !== 'investigating') return { kind: 'terminal' };
+    try { await assertRunBusinessAllowed(transaction, { workspaceId: row.workspaceId, repairRunId: row.repairRunId }, now); }
+    catch (error) {
+      if (!(error instanceof ExternalExecutionAuthorityError)) throw error;
+      await transaction.update(aiInvestigation).set({ state: 'failed', failureCode: error.code, completedAt: now, updatedAt: now }).where(eq(aiInvestigation.id, id));
+      await transaction.insert(aiInvestigationEvent).values({ id: randomId(), aiInvestigationId: id, workspaceId: row.workspaceId, fromState: 'investigating', toState: 'failed', failureCode: error.code, createdAt: now });
+      return { kind: 'terminal' };
+    }
     const [attempt] = await transaction.insert(aiInvestigationAttempt).values({ id: randomId(), aiInvestigationId: id, queueJobId, attemptNumber, ownershipToken: randomId(), state: 'active', claimedAt: now, heartbeatAt: now, leaseExpiresAt: new Date(now.getTime() + LEASE_MS) }).returning();
     if (!attempt) throw new Error('ai_investigation_claim_failed');
     return { kind: 'attempt', row: current, attempt };

@@ -5,6 +5,7 @@ export type ExternalExecutionFailureCode =
   | 'external_concurrency_unavailable'
   | 'execution_authority_mismatch'
   | 'provider_attempt_ambiguous'
+  | 'sandbox_creation_failed'
   | 'sandbox_cleanup_unresolved';
 
 export type ExternalOperationCategory =
@@ -46,6 +47,10 @@ export interface ExternalExecutionReservationRequest {
   operationKey?: string;
   grantId?: string;
   accountGrantId?: string;
+  /** Exact SDK transport binding. No credentials are stored in this context. */
+  sandbox?: { name: string; projectId: string; teamId: string };
+  /** Resolved against a server-owned attempt; not a caller-provided cleanup flag. */
+  cleanup?: { kind: 'baseline' | 'verification'; attemptId: string };
 }
 
 export type ProviderAttemptOutcome = 'succeeded' | 'failed' | 'ambiguous';
@@ -60,6 +65,8 @@ export interface ExternalExecutionPermit {
   finishProviderAttempt(ordinal: number, outcome: ProviderAttemptOutcome, usage?: { inputTokens?: number; outputTokens?: number }): Promise<void>;
   renew(): Promise<void>;
   complete(outcome: 'succeeded' | 'failed' | 'ambiguous', failureCode?: ExternalExecutionFailureCode): Promise<void>;
+  /** SDK parsing must succeed before a create response becomes trustworthy. */
+  resolveSandboxCreation?(identity?: { name: string; sessionId: string }): Promise<void>;
   meteredFetch(input: string | URL | Request, init?: RequestInit): Promise<Response>;
 }
 

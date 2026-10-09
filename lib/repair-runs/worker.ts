@@ -16,7 +16,8 @@ import { recoverSandbox, type SandboxLifecycleObserver } from '../../src/sandbox
 import type { AuthenticatedWorkspace } from '../auth/protected-context.ts';
 import type { VigiloDatabase } from '../db/types.ts';
 import { DurableExternalExecutionAuthorizer } from '../external-execution/authority.ts';
-import type { ExternalExecutionAuthorizer } from '../external-execution/types.ts';
+import { assertRunBusinessAllowed, lockExternalExecution } from '../external-execution/business-fence.ts';
+import { ExternalExecutionAuthorityError, type ExternalExecutionAuthorizer } from '../external-execution/types.ts';
 import type { GitHubAppConfiguration } from '../github-app/types.ts';
 import { assertPublicRepositoryAuthority } from '../github-repositories/policy.ts';
 import { writeOperationalLog } from '../operations/logging.ts';
@@ -38,6 +39,7 @@ const BASELINE_OUTCOMES = new Set<BaselineOutcome>([
   'test_failed', 'timed_out', 'cancelled', 'infrastructure_failed', 'cleanup_failed',
 ]);
 const CUSTOMER_FAILURE_OUTCOMES = new Set<BaselineOutcome>(['baseline_failed', 'typecheck_failed', 'build_failed', 'test_failed']);
+const TERMINAL_EXECUTION_CODES = new Set(['execution_authority_missing', 'execution_authority_expired', 'execution_authority_mismatch', 'execution_budget_exhausted', 'provider_attempt_ambiguous', 'sandbox_creation_failed', 'sandbox_cleanup_unresolved']);
 
 type StoredRun = typeof repairRun.$inferSelect;
 type StoredAttempt = typeof repairRunAttempt.$inferSelect;
@@ -126,6 +128,7 @@ async function claimAttempt(
   randomId: () => string,
 ): Promise<Claim> {
   return database.transaction(async (transaction) => {
+    await lockExternalExecution(transaction);
     const [run] = await transaction.select().from(repairRun).where(eq(repairRun.id, runId)).limit(1);
     if (!run) throw new Error('run_not_found');
     if (!['created', 'baseline_running'].includes(run.state)) return { kind: 'terminal', run };
@@ -173,6 +176,13 @@ async function claimAttempt(
       Object.assign(run, claimedRun);
     }
 
+    try { await assertRunBusinessAllowed(transaction, { workspaceId: run.workspaceId, repairRunId: run.id }, now); }
+    catch (error) {
+      if (!(error instanceof ExternalExecutionAuthorityError)) throw error;
+      await transaction.update(repairRun).set({ state: 'infrastructure_failed', failureCode: error.code, completedAt: now, stateChangedAt: now, updatedAt: now }).where(eq(repairRun.id, run.id));
+      await transaction.insert(repairRunEvent).values({ id: randomId(), repairRunId: run.id, fromState: 'baseline_running', toState: 'infrastructure_failed', failureCode: error.code, createdAt: now });
+      return { kind: 'terminal', run };
+    }
     const ownershipToken = randomId();
     const [attempt] = await transaction.insert(repairRunAttempt).values({
       id: randomId(),
@@ -277,13 +287,14 @@ async function finalizeFromEvidence(
     return { id: attempt.queueJobId, status: 'completed' };
   }
 
-  const exhausted = attempt.attemptNumber >= REPAIR_JOB_MAX_ATTEMPTS;
+  const code = evidence.errorCode && TERMINAL_EXECUTION_CODES.has(evidence.errorCode) ? evidence.errorCode : evidence.overallOutcome === 'cancelled' ? 'worker_interrupted' : evidence.overallOutcome;
+  const exhausted = attempt.attemptNumber >= REPAIR_JOB_MAX_ATTEMPTS || TERMINAL_EXECUTION_CODES.has(code);
   const state = exhausted ? 'exhausted' : 'retryable_failed';
   const owned = await finishAttempt(dependencies.database, attempt, now, {
     state,
     baselineId: evidence.id,
     failureClassification: 'infrastructure_failure',
-    failureCode: evidence.overallOutcome === 'cancelled' ? 'worker_interrupted' : evidence.overallOutcome,
+    failureCode: code,
     cleanup,
   });
   if (!owned) return { id: attempt.queueJobId, status: 'failed', output: { code: 'attempt_ownership_lost' } };
@@ -294,7 +305,7 @@ async function finalizeFromEvidence(
   await transitionRepairRun(dependencies.database, run.workspaceId, run.id, 'baseline_running', 'infrastructure_failed', now, {
     baselineId: evidence.id,
     eventId: (dependencies.randomId ?? randomUUID)(),
-    failureCode: evidence.overallOutcome === 'cancelled' ? 'worker_interrupted' : evidence.overallOutcome,
+    failureCode: code,
   });
   dependencies.logger.write({ event: 'run_finalized', runId: run.id, attemptId: attempt.id, outcome: 'infrastructure_failed' });
   return { id: attempt.queueJobId, status: 'completed' };
@@ -344,7 +355,7 @@ async function recoverStaleAttempt(dependencies: RepairWorkerDependencies, run: 
   const executionAuthority = dependencies.executionAuthority ?? new DurableExternalExecutionAuthorizer(dependencies.database);
   const cleanup = attempt.sandboxName
     ? await (dependencies.recover ?? recoverSandbox)(
-      { name: attempt.sandboxName, sessionId: attempt.sandboxSessionId },
+      { name: attempt.sandboxName, sessionId: attempt.sandboxSessionId, knownAttempt: { kind: 'baseline', id: attempt.id } },
       executionAuthority,
       { workspaceId: run.workspaceId, repairRunId: run.id, githubRepositoryId: run.githubRepositoryId, baseCommitSha: run.baseCommitSha, operationCategory: 'sandbox_baseline', providerId: 'vercel' },
     )
@@ -455,8 +466,9 @@ async function executeAttempt(dependencies: RepairWorkerDependencies, run: Store
     return finalizeFromEvidence(dependencies, run, attempt, persisted);
   } catch (error) {
     const now = (dependencies.clock ?? (() => new Date()))();
-    const code = controller.signal.aborted ? 'worker_interrupted' : safeFailureCode(error);
-    const exhausted = attempt.attemptNumber >= REPAIR_JOB_MAX_ATTEMPTS || code === 'attempt_ownership_lost';
+    const safeCode = safeFailureCode(error);
+    const code = TERMINAL_EXECUTION_CODES.has(safeCode) ? safeCode : controller.signal.aborted ? 'worker_interrupted' : safeCode;
+    const exhausted = attempt.attemptNumber >= REPAIR_JOB_MAX_ATTEMPTS || code === 'attempt_ownership_lost' || TERMINAL_EXECUTION_CODES.has(code);
     const owned = await finishAttempt(dependencies.database, attempt, now, {
       state: exhausted ? 'exhausted' : 'retryable_failed',
       failureClassification: 'infrastructure_failure',

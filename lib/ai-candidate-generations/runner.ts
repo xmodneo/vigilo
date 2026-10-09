@@ -12,7 +12,7 @@ import type { InvestigationSourceGateway } from '../investigations/types.ts';
 import { AI_CANDIDATE_GENERATION_LIMITS, AI_CANDIDATE_GENERATION_PROTOCOL_VERSION, REPAIR_LOOP_AI_CANDIDATE_GENERATION_PROTOCOL_VERSION, type AiCandidateGenerationModelResult } from './types.ts';
 import { AI_CANDIDATE_PROPOSAL_FINALIZATION_INPUT, AI_CANDIDATE_PROPOSAL_INSTRUCTIONS, AI_CANDIDATE_PROPOSAL_PROVIDER_SCHEMA, AI_CANDIDATE_PROPOSAL_TOOLS, AiCandidateProposalValidationError, aiCandidateProposalToolOutput, buildAiCandidateProposalInput, parseAiCandidateProposal } from './protocol.ts';
 import { buildRepairLoopFeedback, validateStoredRepairLoopFeedback } from '../repair-loops/feedback.ts';
-import type { ExternalExecutionFailureCode } from '../external-execution/types.ts';
+import { ExternalExecutionAuthorityError, type ExternalExecutionFailureCode } from '../external-execution/types.ts';
 
 export type AiCandidateGenerationErrorCode = 'private_repository_not_supported' | 'candidate_generation_authority_mismatch' | 'candidate_generation_ownership_lost' | 'invalid_model_proposal' | 'schema_mismatch' | 'invalid_operation_shape' | 'invalid_path' | 'proposal_limit_exceeded' | 'fresh_observation_missing' | 'model_limit_exceeded' | 'model_protocol_error' | 'model_timeout' | 'unread_existing_file' | 'model_provider_mismatch' | 'model_provider_failed' | 'context_source_unavailable' | ExternalExecutionFailureCode | ModelProviderFailureCode;
 
@@ -165,6 +165,7 @@ export async function runAiCandidateGeneration(database: VigiloDatabase, gateway
     let turn;
     try { turn = await session.next({ ...(outputs ? { toolOutputs: outputs } : {}), ...(finalization ? { finalization: true } : {}), signal: controller.signal }); }
     catch (error) {
+      if (error instanceof ExternalExecutionAuthorityError) throw error;
       if (controller.signal.aborted) throw new AiCandidateGenerationError('model_timeout');
       if (error instanceof ModelProviderError) throw new AiCandidateGenerationError(error.code, error.retryAfterMs);
       if (error instanceof Error && error.message === 'model_protocol_error') throw new AiCandidateGenerationError(finalization ? 'model_limit_exceeded' : 'model_protocol_error');

@@ -10,6 +10,7 @@ import {
   candidateVerificationAttempt,
   candidateVerificationEvidence,
   candidateVerificationEvent,
+  executionBudgetGrant,
   executionProfile,
   githubInstallation,
   investigation,
@@ -29,6 +30,9 @@ import { expectedCandidateManifest } from '../lib/candidate-verifications/runner
 import type { CandidateVerificationEvidence as VerificationEvidence, CandidateVerificationGateway, FrozenVerificationInput } from '../lib/candidate-verifications/types.ts';
 import { processCandidateVerificationJob } from '../lib/candidate-verifications/worker.ts';
 import { computeExecutionProfileIdentity } from '../lib/execution-profiles/detector.ts';
+import { ExternalExecutionAuthorityError } from '../lib/external-execution/types.ts';
+import { computeExecutionGrantIdentity } from '../lib/external-execution/identity.ts';
+import { DurableExternalExecutionAuthorizer } from '../lib/external-execution/authority.ts';
 import type { GitHubAppConfiguration } from '../lib/github-app/types.ts';
 import { computeCandidateIdentity, sha256 } from '../lib/repair-candidates/identity.ts';
 import type { FrozenCandidateFile } from '../lib/repair-candidates/types.ts';
@@ -207,6 +211,134 @@ test('successful worker execution persists sanitized evidence and completes with
   await assert.rejects(context.database.delete(candidateVerificationEvent).where(eq(candidateVerificationEvent.id, event.id)));
 });
 
+test('durable budget and ambiguity errors end verification without another claim', async (t) => {
+  for (const code of ['execution_budget_exhausted', 'provider_attempt_ambiguous', 'sandbox_creation_failed'] as const) {
+    const context = await createTestContext(); t.after(() => context.client.close());
+    const owner = await authenticated(context); const seeded = await seed(context, owner);
+    const verification = await startCandidateVerification(context.database, owner, seeded.candidateId, new MemoryQueue());
+    let calls = 0;
+    const cancellation = new AbortController();
+    const dependencies = { configuration: CONFIGURATION, database: context.database, gateway: new Gateway(), logger,
+      executor: (async () => { calls++; cancellation.abort(); throw new ExternalExecutionAuthorityError(code); }) as never, clock: () => NOW };
+    assert.equal((await processCandidateVerificationJob({ ...job(verification.id), signal: cancellation.signal }, dependencies)).status, 'completed');
+    assert.equal((await processCandidateVerificationJob(job(verification.id), dependencies)).status, 'completed');
+    assert.equal(calls, 1);
+    assert.equal((await getCandidateVerification(context.database, owner, verification.id))?.failureCode, code);
+    assert.deepEqual((await context.database.select().from(candidateVerificationAttempt)).map((attempt) => attempt.state), ['exhausted']);
+  }
+});
+
+test('verification evidence preserves terminal authority errors without scheduling another attempt', async (t) => {
+  for (const code of ['execution_budget_exhausted', 'provider_attempt_ambiguous', 'sandbox_creation_failed']) {
+    const context = await createTestContext(); t.after(() => context.client.close());
+    const owner = await authenticated(context); const seeded = await seed(context, owner);
+    const verification = await startCandidateVerification(context.database, owner, seeded.candidateId, new MemoryQueue());
+    let calls = 0;
+    const executor = async (_d: never, _g: never, _c: never, input: { verificationId: string; attemptId: string; evidenceId: string }) => {
+      calls++;
+      return { ...report({ ...input, candidateId: seeded.candidateId, candidateIdentity: seeded.candidateIdentity, workspaceId: owner.workspace.id,
+        githubRepositoryId: REPOSITORY_ID, installationId: INSTALLATION_ID, baseCommitSha: COMMIT, profileIdentity: seeded.profileIdentity,
+        baselineId: seeded.baselineId, baselineSandbox: { name: 'baseline-sandbox', sessionId: null }, baselineOutcome: 'baseline_passed',
+        profile: {} as never, files: [seeded.file], archive: Buffer.alloc(0), archiveSha256: '0'.repeat(64), startedAt: NOW }, 'infrastructure_failed'),
+        error: { phase: 'sandbox', code } };
+    };
+    const dependencies = { configuration: CONFIGURATION, database: context.database, gateway: new Gateway(), logger, executor: executor as never, clock: () => NOW };
+    assert.equal((await processCandidateVerificationJob(job(verification.id), dependencies)).status, 'completed');
+    assert.equal((await processCandidateVerificationJob(job(verification.id), dependencies)).status, 'completed');
+    assert.equal(calls, 1); assert.equal((await getCandidateVerification(context.database, owner, verification.id))?.failureCode, code);
+    assert.deepEqual((await context.database.select().from(candidateVerificationAttempt)).map((attempt) => attempt.state), ['exhausted']);
+  }
+});
+
+async function verificationGrants(context: Awaited<ReturnType<typeof createTestContext>>, owner: AuthenticatedWorkspace, seeded: Awaited<ReturnType<typeof seed>>, maximum: number, issuedAt = NOW) {
+  const expiresAt = new Date(issuedAt.getTime() + 60_000); const authorizedBy = 'test-operator';
+  const limits = { logicalRequests: maximum, providerAttempts: 96 * maximum, inputTokens: 0, outputTokens: 0, sandboxIdentities: maximum, sandboxRuntimeMs: 600_000 * maximum, verificationAttempts: maximum, repairLoopIterations: 0, maxConcurrentExternalOperations: 1 };
+  for (const scope of ['account', 'operation'] as const) {
+    const binding = { version: 1 as const, scope, workspaceId: scope === 'account' ? null : owner.workspace.id,
+      repairRunId: scope === 'account' ? null : seeded.runId, githubRepositoryId: scope === 'account' ? null : REPOSITORY_ID,
+      baseCommitSha: scope === 'account' ? null : COMMIT, operationCategory: scope === 'account' ? null : 'sandbox_verification' as const,
+      providerId: scope === 'account' ? null : 'vercel', modelId: null, acceptancePurpose: null,
+      sandboxResourceClass: scope === 'account' ? null : 'vcpu_1' as const };
+    const { sandboxResourceClass, ...identityBinding } = binding;
+    const grantLimits = { ...limits, ...(sandboxResourceClass ? { sandboxResourceClass } : {}), maxConcurrentExternalOperations: scope === 'account' ? 1 : 0 };
+    await context.database.insert(executionBudgetGrant).values({ ...binding, id: randomUUID(), maxLogicalRequests: maximum, maxProviderAttempts: 96 * maximum,
+      maxInputTokens: 0, maxOutputTokens: 0, maxSandboxIdentities: maximum, maxSandboxRuntimeMs: 600_000 * maximum, maxVerificationAttempts: maximum,
+      maxRepairLoopIterations: 0, maxConcurrentExternalOperations: grantLimits.maxConcurrentExternalOperations, expiresAt, authorizedBy,
+      grantIdentity: computeExecutionGrantIdentity({ ...identityBinding, limits: grantLimits, expiresAt: expiresAt.toISOString(), authorizedBy }), createdAt: issuedAt });
+  }
+}
+
+test('the exact immutable one-verification grant rejects attempt two before creating its row', async (t) => {
+  const context = await createTestContext(); t.after(() => context.client.close());
+  const owner = await authenticated(context); const seeded = await seed(context, owner);
+  await verificationGrants(context, owner, seeded, 1);
+  const verification = await startCandidateVerification(context.database, owner, seeded.candidateId, new MemoryQueue());
+  let calls = 0;
+  const dependencies = { configuration: CONFIGURATION, database: context.database, gateway: new Gateway(), logger,
+    executor: (async () => { calls++; throw new Error('known_pre_transport_failure'); }) as never, clock: () => NOW };
+  assert.equal((await processCandidateVerificationJob(job(verification.id), dependencies)).status, 'failed');
+  assert.equal((await processCandidateVerificationJob(job(verification.id), dependencies)).status, 'completed');
+  assert.equal(calls, 1);
+  assert.equal((await context.database.select().from(candidateVerificationAttempt)).length, 1);
+  assert.equal((await getCandidateVerification(context.database, owner, verification.id))?.failureCode, 'execution_budget_exhausted');
+});
+
+test('expired historical grants do not hide the exact active verification grant or reopen its limit', async (t) => {
+  const context = await createTestContext(); t.after(() => context.client.close());
+  const owner = await authenticated(context); const seeded = await seed(context, owner);
+  await verificationGrants(context, owner, seeded, 1, new Date(NOW.getTime() - 120_000));
+  await verificationGrants(context, owner, seeded, 1);
+  const verification = await startCandidateVerification(context.database, owner, seeded.candidateId, new MemoryQueue());
+  let calls = 0;
+  const dependencies = { configuration: CONFIGURATION, database: context.database, gateway: new Gateway(), logger,
+    executor: (async () => { calls++; throw new Error('known_pre_transport_failure'); }) as never, clock: () => NOW };
+  assert.equal((await processCandidateVerificationJob(job(verification.id), dependencies)).status, 'failed');
+  assert.equal((await processCandidateVerificationJob(job(verification.id), dependencies)).status, 'completed');
+  assert.equal(calls, 1); assert.equal((await context.database.select().from(candidateVerificationAttempt)).length, 1);
+  assert.equal((await getCandidateVerification(context.database, owner, verification.id))?.failureCode, 'execution_budget_exhausted');
+});
+
+test('durable run ambiguity rejects explicit verification start before row insertion or queueing', async (t) => {
+  const context = await createTestContext(); t.after(() => context.client.close());
+  const owner = await authenticated(context); const seeded = await seed(context, owner);
+  await verificationGrants(context, owner, seeded, 1);
+  const authority = new DurableExternalExecutionAuthorizer(context.database, { clock: () => NOW });
+  const permit = await authority.reserve({ scope: { workspaceId: owner.workspace.id, repairRunId: seeded.runId, githubRepositoryId: REPOSITORY_ID,
+    baseCommitSha: COMMIT, operationCategory: 'sandbox_verification', providerId: 'vercel' },
+    amounts: { logicalRequests: 1, providerAttempts: 1, inputTokens: 0, outputTokens: 0, sandboxIdentities: 0, sandboxRuntimeMs: 0,
+      verificationAttempts: 0, repairLoopIterations: 0, sandboxResourceClass: 'vcpu_1' },
+    sandbox: { name: 'known-verifier', projectId: 'project_test', teamId: 'team_test' } });
+  const ordinal = await permit.beginProviderAttempt();
+  await permit.finishProviderAttempt(ordinal, 'ambiguous'); await permit.complete('ambiguous', 'provider_attempt_ambiguous');
+  const queue = new MemoryQueue();
+  await assert.rejects(startCandidateVerification(context.database, owner, seeded.candidateId, queue, { clock: () => NOW }), /provider_attempt_ambiguous/);
+  assert.equal(queue.payloads.length, 0); assert.equal((await context.database.select().from(candidateVerification)).length, 0);
+});
+
+test('expired unmatched provider start blocks stale verification restart without a known Sandbox identity', async (t) => {
+  const context = await createTestContext(); t.after(() => context.client.close());
+  const owner = await authenticated(context); const seeded = await seed(context, owner);
+  await verificationGrants(context, owner, seeded, 1);
+  const verification = await startCandidateVerification(context.database, owner, seeded.candidateId, new MemoryQueue(), { clock: () => NOW });
+  await context.database.update(candidateVerification).set({ state: 'verifying', verificationStartedAt: NOW }).where(eq(candidateVerification.id, verification.id));
+  await context.database.insert(candidateVerificationAttempt).values({ id: randomUUID(), verificationId: verification.id, queueJobId: verification.id,
+    attemptNumber: 1, expectedEvidenceId: randomUUID(), ownershipToken: randomUUID(), state: 'active', claimedAt: NOW, heartbeatAt: NOW,
+    leaseExpiresAt: new Date(NOW.getTime() + 90_000) });
+  const permit = await new DurableExternalExecutionAuthorizer(context.database, { clock: () => NOW }).reserve({
+    scope: { workspaceId: owner.workspace.id, repairRunId: seeded.runId, githubRepositoryId: REPOSITORY_ID, baseCommitSha: COMMIT,
+      operationCategory: 'sandbox_verification', providerId: 'vercel' },
+    amounts: { logicalRequests: 1, providerAttempts: 1, inputTokens: 0, outputTokens: 0, sandboxIdentities: 0, sandboxRuntimeMs: 0,
+      verificationAttempts: 0, repairLoopIterations: 0, sandboxResourceClass: 'vcpu_1' },
+    sandbox: { name: 'unresolved-verifier', projectId: 'project_test', teamId: 'team_test' } });
+  await permit.beginProviderAttempt(); // Lost ownership before any trustworthy outcome was persisted.
+  let executions = 0;
+  const result = await processCandidateVerificationJob(job(verification.id), { configuration: CONFIGURATION, database: context.database, gateway: new Gateway(), logger,
+    executor: (async () => { executions++; throw new Error('must not execute'); }) as never, clock: () => new Date(NOW.getTime() + 16 * 60_000) });
+  assert.equal(result.status, 'completed'); assert.equal(executions, 0);
+  assert.equal((await getCandidateVerification(context.database, owner, verification.id))?.failureCode, 'provider_attempt_ambiguous');
+  assert.equal((await context.database.select().from(candidateVerificationAttempt)).length, 1);
+});
+
 test('customer check failures complete without retry and classify baseline comparison accurately', async (t) => {
   const context = await createTestContext(); t.after(() => context.client.close()); const owner = await authenticated(context); const seeded = await seed(context, owner); const verification = await startCandidateVerification(context.database, owner, seeded.candidateId, new MemoryQueue()); let calls = 0;
   const executor = async (_d: never, _g: never, _c: never, input: { verificationId: string; attemptId: string; evidenceId: string }) => { calls++; return report({ ...input, candidateId: seeded.candidateId, candidateIdentity: seeded.candidateIdentity, workspaceId: owner.workspace.id, githubRepositoryId: REPOSITORY_ID, installationId: INSTALLATION_ID, baseCommitSha: COMMIT, profileIdentity: seeded.profileIdentity, baselineId: seeded.baselineId, baselineSandbox: { name: 'baseline-sandbox', sessionId: null }, baselineOutcome: 'baseline_passed', profile: {} as never, files: [seeded.file], archive: Buffer.alloc(0), archiveSha256: '0'.repeat(64), startedAt: NOW }, 'test_failed'); };
@@ -253,6 +385,7 @@ test('duplicate delivery has one owner and a stale worker cannot persist evidenc
 
 test('transient infrastructure failure retries at most three times while check failures do not', async (t) => {
   const context = await createTestContext(); t.after(() => context.client.close()); const owner = await authenticated(context); const seeded = await seed(context, owner); const verification = await startCandidateVerification(context.database, owner, seeded.candidateId, new MemoryQueue());
+  await verificationGrants(context, owner, seeded, 3);
   const executor = async () => { throw Object.assign(new Error('controlled'), { code: 'source_unavailable' }); };
   for (let attempt = 1; attempt <= 3; attempt++) assert.equal((await processCandidateVerificationJob(job(verification.id), { configuration: CONFIGURATION, database: context.database, gateway: new Gateway(), logger, executor: executor as never, clock: () => new Date(NOW.getTime() + attempt) })).status, attempt < 3 ? 'failed' : 'completed');
   assert.equal((await getCandidateVerification(context.database, owner, verification.id))?.state, 'infrastructure_failed'); assert.equal((await context.database.select().from(candidateVerificationAttempt)).length, 3);

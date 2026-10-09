@@ -8,10 +8,62 @@ import { buildInitialInput, CONCLUSION_SCHEMA, encodeToolOutput, MODEL_INSTRUCTI
 import { AI_LIMITS, AI_MODEL_ID } from '../lib/ai-investigations/types.ts';
 import { parseAiInvestigationJobPayload } from '../lib/repair-runs/queue.ts';
 import { createTestExternalExecutionAuthorizer, TEST_EXTERNAL_EXECUTION_SCOPE } from './external-execution-support.ts';
+import { ExternalExecutionAuthorityError, type ExternalExecutionAuthorizer } from '../lib/external-execution/types.ts';
 
 const conclusion = { status: 'diagnosis_found', summary: 'The boundary comparison is exclusive.', suspectedFiles: [{ path: 'src/shipping.ts', reason: 'Contains the threshold check.' }], evidence: [{ kind: 'file', reference: randomUUID() }], proposedApproach: 'Make the threshold inclusive.', confidence: 'high' } as const;
 const authority = createTestExternalExecutionAuthorizer();
 const providerConfiguration = { instructions: MODEL_INSTRUCTIONS, initialInput: '{}', tools: MODEL_TOOLS, conclusionSchema: CONCLUSION_SCHEMA, maxOutputTokens: AI_LIMITS.maxOutputTokens, externalExecutionScope: TEST_EXTERNAL_EXECUTION_SCOPE } as const;
+
+test('every recorded Gemini client ambiguity is terminal without leaking the provider response', async (t) => {
+  for (const failure of [new Error('private-network-response'), { status: 429, message: 'private-rate-response' }, { status: 503, message: 'private-infrastructure-response' }]) {
+    await t.test(failure instanceof Error ? 'network' : `HTTP ${failure.status}`, async () => {
+      const outcomes: string[] = [];
+      const underlying = createTestExternalExecutionAuthorizer();
+      const executionAuthority: ExternalExecutionAuthorizer = { reserve: async (request) => {
+        const permit = await underlying.reserve(request);
+        return { ...permit, finishProviderAttempt: async (_ordinal, outcome) => { outcomes.push(`attempt:${outcome}`); }, complete: async (outcome, code) => { outcomes.push(`reservation:${outcome}:${code}`); } };
+      } };
+      let dispatches = 0;
+      const client = { create: async () => { dispatches += 1; throw failure; } };
+      const session = new GeminiInvestigationProvider('test-secret-value-with-adequate-length', AI_MODEL_ID, client as never, executionAuthority).createSession(providerConfiguration);
+      await assert.rejects(session.next({ signal: new AbortController().signal }), (error: unknown) => {
+        assert.ok(error instanceof ExternalExecutionAuthorityError);
+        assert.equal(error.code, 'provider_attempt_ambiguous');
+        assert.doesNotMatch(JSON.stringify(error), /private-/);
+        return true;
+      });
+      assert.equal(dispatches, 1);
+      assert.deepEqual(outcomes, ['attempt:ambiguous', 'reservation:ambiguous:provider_attempt_ambiguous']);
+    });
+  }
+});
+
+test('Gemini durable budget refusal happens before transport and keeps its original authority code', async () => {
+  let dispatches = 0;
+  const client = { create: async () => { dispatches += 1; throw new Error('transport must not run'); } };
+  const executionAuthority: ExternalExecutionAuthorizer = { reserve: async () => { throw new ExternalExecutionAuthorityError('execution_budget_exhausted'); } };
+  const session = new GeminiInvestigationProvider('test-secret-value-with-adequate-length', AI_MODEL_ID, client as never, executionAuthority).createSession(providerConfiguration);
+  await assert.rejects(session.next({ signal: new AbortController().signal }), (error: unknown) => error instanceof ExternalExecutionAuthorityError && error.code === 'execution_budget_exhausted');
+  assert.equal(dispatches, 0);
+});
+
+test('Gemini ambiguity remains terminal when outcome persistence fails', async (t) => {
+  for (const failurePoint of ['attempt', 'reservation'] as const) await t.test(failurePoint, async () => {
+    const underlying = createTestExternalExecutionAuthorizer();
+    const executionAuthority: ExternalExecutionAuthorizer = { reserve: async (request) => {
+      const permit = await underlying.reserve(request);
+      return { ...permit,
+        finishProviderAttempt: async () => { if (failurePoint === 'attempt') throw new Error('private-ledger-failure'); },
+        complete: async () => { throw new Error('private-ledger-failure'); },
+      };
+    } };
+    let dispatches = 0;
+    const client = { create: async () => { dispatches += 1; throw new Error('private-provider-failure'); } };
+    const session = new GeminiInvestigationProvider('test-secret-value-with-adequate-length', AI_MODEL_ID, client as never, executionAuthority).createSession(providerConfiguration);
+    await assert.rejects(session.next({ signal: new AbortController().signal }), (error: unknown) => error instanceof ExternalExecutionAuthorityError && error.code === 'provider_attempt_ambiguous');
+    assert.equal(dispatches, 1);
+  });
+});
 
 test('the model protocol exposes exactly four read-only investigation tools', async (t) => {
   const expected = ['listPaths', 'readTextFile', 'searchText', 'readBaselineSummary'];

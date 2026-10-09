@@ -2,7 +2,7 @@ import { GoogleGenAI, type Interactions } from '@google/genai';
 
 import { ModelProviderError, type InvestigationModelProvider, type InvestigationModelSession, type ModelTurn } from './types.ts';
 import { FINALIZATION_INPUT } from './protocol.ts';
-import { ZERO_EXTERNAL_EXECUTION_AUTHORITY, type ExternalExecutionAuthorizer } from '../external-execution/types.ts';
+import { ExternalExecutionAuthorityError, ZERO_EXTERNAL_EXECUTION_AUTHORITY, type ExternalExecutionAuthorizer } from '../external-execution/types.ts';
 
 interface GeminiInteractionsClient {
   create(
@@ -165,10 +165,18 @@ export class GeminiInvestigationProvider implements InvestigationModelProvider {
         let response: Interactions.Interaction;
         try {
           response = await this.client.create(request, { signal, retries: { strategy: 'none' } });
-        } catch (error) {
-          await permit.finishProviderAttempt(attempt, 'ambiguous');
-          await permit.complete('ambiguous', 'provider_attempt_ambiguous');
-          throw classifyGeminiProviderError(error);
+        } catch {
+          try {
+            await permit.finishProviderAttempt(attempt, 'ambiguous');
+            await permit.complete('ambiguous', 'provider_attempt_ambiguous');
+          } catch {
+            // Failed persistence does not make an on-wire outcome safe to retry.
+            // The durable start or any recorded ambiguity remains fence evidence;
+            // do not claim that outcome persistence completed successfully.
+          }
+          // Once an on-wire outcome is recorded as ambiguous, retryable provider
+          // classification must not authorize another request for this run.
+          throw new ExternalExecutionAuthorityError('provider_attempt_ambiguous');
         }
         await permit.finishProviderAttempt(attempt, 'succeeded', observedUsage(response.usage));
         await permit.complete('succeeded');

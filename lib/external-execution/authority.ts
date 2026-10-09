@@ -9,10 +9,13 @@ import {
   externalExecutionLease,
   externalExecutionReservation,
   externalExecutionSemaphore,
+  repairRunAttempt, repairRun, candidateVerificationAttempt, candidateVerification,
 } from '../../db/schema.ts';
 import type { VigiloDatabase } from '../db/types.ts';
 import { computeExecutionReservationIdentity, executionGrantIdentityMatches } from './identity.ts';
 import { SandboxTransportError } from './sandbox-auth.ts';
+import { assertRunBusinessAllowed, lockExternalExecution } from './business-fence.ts';
+import { SandboxTransportPolicy, type SandboxTransportBinding, type SandboxTransportKind } from './sandbox-transport.ts';
 import {
   ExternalExecutionAuthorityError,
   type ExternalExecutionAuthorizer,
@@ -70,9 +73,34 @@ export class DurableExternalExecutionAuthorizer implements ExternalExecutionAuth
     const leaseMs = this.options.leaseMs ?? DEFAULT_LEASE_MS;
     try {
       const stored = await this.database.transaction(async (transaction) => {
+        await lockExternalExecution(transaction);
         const [semaphore] = await transaction.select().from(externalExecutionSemaphore)
-          .where(eq(externalExecutionSemaphore.id, 'global')).for('update').limit(1);
+          .where(eq(externalExecutionSemaphore.id, 'global')).limit(1);
         if (!semaphore) throw new ExternalExecutionAuthorityError('execution_authority_missing');
+
+        let binding: SandboxTransportBinding | undefined = request.sandbox;
+        if (request.cleanup) {
+          const { kind, attemptId } = request.cleanup;
+          if (!binding || !request.scope.repairRunId || request.amounts.sandboxIdentities !== 0
+            || request.amounts.verificationAttempts !== 0 || request.amounts.repairLoopIterations !== 0
+            || request.amounts.inputTokens !== 0 || request.amounts.outputTokens !== 0
+            || request.scope.operationCategory !== (kind === 'baseline' ? 'sandbox_baseline' : 'sandbox_verification')) {
+            throw new ExternalExecutionAuthorityError('execution_authority_mismatch');
+          }
+          const rows = kind === 'baseline'
+            ? await transaction.select({ name: repairRunAttempt.sandboxName, sessionId: repairRunAttempt.sandboxSessionId, workspaceId: repairRun.workspaceId, repairRunId: repairRun.id, githubRepositoryId: repairRun.githubRepositoryId, baseCommitSha: repairRun.baseCommitSha })
+              .from(repairRunAttempt).innerJoin(repairRun, eq(repairRunAttempt.repairRunId, repairRun.id)).where(eq(repairRunAttempt.id, attemptId))
+            : await transaction.select({ name: candidateVerificationAttempt.sandboxName, sessionId: candidateVerificationAttempt.sandboxSessionId, workspaceId: candidateVerification.workspaceId, repairRunId: candidateVerification.repairRunId, githubRepositoryId: candidateVerification.githubRepositoryId, baseCommitSha: candidateVerification.baseCommitSha })
+              .from(candidateVerificationAttempt).innerJoin(candidateVerification, eq(candidateVerificationAttempt.verificationId, candidateVerification.id)).where(eq(candidateVerificationAttempt.id, attemptId));
+          const row = rows[0];
+          if (!row?.name || row.name !== binding.name || row.workspaceId !== request.scope.workspaceId || row.repairRunId !== request.scope.repairRunId
+            || row.githubRepositoryId !== request.scope.githubRepositoryId || row.baseCommitSha !== request.scope.baseCommitSha) {
+            throw new ExternalExecutionAuthorityError('execution_authority_mismatch');
+          }
+          binding = { ...binding, sessionId: row.sessionId };
+        } else {
+          await assertRunBusinessAllowed(transaction, request.scope, now);
+        }
 
         const grants = await transaction.select().from(executionBudgetGrant)
           .orderBy(asc(executionBudgetGrant.id)).for('update');
@@ -207,9 +235,9 @@ export class DurableExternalExecutionAuthorizer implements ExternalExecutionAuth
           leaseExpiresAt: new Date(now.getTime() + leaseMs),
         });
         await transaction.insert(externalExecutionEvent).values({ id: randomId(), reservationId: id, eventType: 'reserved', createdAt: now });
-        return { reservation, ownershipToken };
+        return { reservation, ownershipToken, binding };
       });
-      return this.permit(stored.reservation, stored.ownershipToken, clock, randomId, leaseMs);
+      return this.permit(stored.reservation, stored.ownershipToken, clock, randomId, leaseMs, stored.binding, request.cleanup !== undefined);
     } catch (error) {
       if (error instanceof ExternalExecutionAuthorityError) throw error;
       throw databaseFailure(error);
@@ -222,9 +250,15 @@ export class DurableExternalExecutionAuthorizer implements ExternalExecutionAuth
     clock: () => Date,
     randomId: () => string,
     leaseMs: number,
+    binding: SandboxTransportBinding | undefined,
+    recovery: boolean,
   ): ExternalExecutionPermit {
     const database = this.database;
     const fetchImplementation = this.options.fetch ?? globalThis.fetch;
+    const sandbox = reservation.operationCategory === 'sandbox_baseline' || reservation.operationCategory === 'sandbox_verification';
+    const policy = sandbox && binding ? new SandboxTransportPolicy(binding, recovery, {
+      runtimeMs: reservation.reservedSandboxRuntimeMs, vcpus: Number(reservation.sandboxResourceClass?.slice('vcpu_'.length)),
+    }) : undefined;
     const owned = async (transaction: VigiloDatabase, options: { lock?: boolean; requireFresh?: boolean; requireGrant?: boolean } = {}) => {
       const { lock = false, requireFresh = true, requireGrant = true } = options;
       const now = clock();
@@ -233,9 +267,6 @@ export class DurableExternalExecutionAuthorizer implements ExternalExecutionAuth
         eq(externalExecutionLease.fence, reservation.fence), eq(externalExecutionLease.state, 'active'),
         ...(requireFresh ? [gt(externalExecutionLease.leaseExpiresAt, now)] : []),
       ));
-      if (lock) query = query.for('update') as typeof query;
-      const [row] = await query.limit(1);
-      if (!row) throw new ExternalExecutionAuthorityError('execution_authority_expired');
       if (requireGrant) {
         let grantQuery = transaction.select().from(executionBudgetGrant)
           .where(inArray(executionBudgetGrant.id, [reservation.accountGrantId, reservation.grantId]))
@@ -249,32 +280,51 @@ export class DurableExternalExecutionAuthorizer implements ExternalExecutionAuth
         if (revocations.length > 0) throw new ExternalExecutionAuthorityError('execution_authority_missing');
         if (grants.some((grant) => grant.expiresAt <= now)) throw new ExternalExecutionAuthorityError('execution_authority_expired');
       }
+      if (lock) query = query.for('update') as typeof query;
+      const [row] = await query.limit(1);
+      if (!row) throw new ExternalExecutionAuthorityError('execution_authority_expired');
     };
+    const begin = async (kind: SandboxTransportKind = 'business') => authorityOperation(() => database.transaction(async (transaction) => {
+      await lockExternalExecution(transaction);
+      await owned(transaction, { lock: true });
+      const starts = await transaction.select().from(externalExecutionEvent).where(and(eq(externalExecutionEvent.reservationId, reservation.id), eq(externalExecutionEvent.eventType, 'attempt_started')));
+      // Cleanup requires either a server-resolved recovery capability or a
+      // recorded dispatch against the exact identity bound to this permit.
+      if (kind === 'cleanup' && (!policy || (!recovery && (reservation.reservedSandboxIdentities !== 1 || starts.length === 0)))) {
+        await assertRunBusinessAllowed(transaction, reservation, clock());
+      } else if (kind !== 'cleanup') {
+        if (recovery) throw new ExternalExecutionAuthorityError('execution_authority_mismatch');
+        await assertRunBusinessAllowed(transaction, reservation, clock());
+      }
+      const ordinal = starts.length + 1;
+      if (sandbox && !recovery && reservation.reservedSandboxIdentities === 1 && ordinal === 1 && kind !== 'create') throw new ExternalExecutionAuthorityError('execution_authority_mismatch');
+      if (kind === 'create' && (reservation.reservedSandboxIdentities !== 1 || ordinal !== 1)) throw new ExternalExecutionAuthorityError('sandbox_creation_failed');
+      if (ordinal > reservation.reservedProviderAttempts) throw new ExternalExecutionAuthorityError('execution_budget_exhausted');
+      await transaction.insert(externalExecutionEvent).values({ id: randomId(), reservationId: reservation.id, eventType: 'attempt_started', attemptOrdinal: ordinal, createdAt: clock() });
+      return ordinal;
+    }));
+    const finish = async (ordinal: number, outcome: ProviderAttemptOutcome, usage: { inputTokens?: number; outputTokens?: number } = {}, kind: SandboxTransportKind = 'business') => authorityOperation(() => database.transaction(async (transaction) => {
+      await lockExternalExecution(transaction);
+      await owned(transaction, { lock: true, requireFresh: outcome === 'succeeded', requireGrant: outcome === 'succeeded' });
+      // A valid lease is insufficient once another operation fences this run.
+      // Only the privately classified exact cleanup transport may still succeed.
+      if (outcome === 'succeeded' && kind !== 'cleanup') await assertRunBusinessAllowed(transaction, reservation, clock());
+      await transaction.insert(externalExecutionEvent).values({
+        id: randomId(), reservationId: reservation.id, eventType: terminalEvent(outcome), attemptOrdinal: ordinal,
+        failureCode: outcome === 'ambiguous' ? 'provider_attempt_ambiguous' : null,
+        inputTokens: usage.inputTokens ?? null, outputTokens: usage.outputTokens ?? null, createdAt: clock(),
+      });
+    }));
     const permit: ExternalExecutionPermit = {
       reservationId: reservation.id,
       ownershipToken,
       fence: reservation.fence,
       sandboxResourceClass: reservation.sandboxResourceClass as ExternalExecutionPermit['sandboxResourceClass'],
       assertOwnership: () => authorityOperation(() => owned(database)),
-      beginProviderAttempt: async () => authorityOperation(() => database.transaction(async (transaction) => {
-        await owned(transaction, { lock: true });
-        const [countRow] = await transaction.select({ count: sql<number>`count(*)::int` }).from(externalExecutionEvent).where(and(
-          eq(externalExecutionEvent.reservationId, reservation.id), eq(externalExecutionEvent.eventType, 'attempt_started'),
-        ));
-        const ordinal = (countRow?.count ?? 0) + 1;
-        if (ordinal > reservation.reservedProviderAttempts) throw new ExternalExecutionAuthorityError('execution_budget_exhausted');
-        await transaction.insert(externalExecutionEvent).values({ id: randomId(), reservationId: reservation.id, eventType: 'attempt_started', attemptOrdinal: ordinal, createdAt: clock() });
-        return ordinal;
-      })),
-      finishProviderAttempt: async (ordinal, outcome, usage = {}) => authorityOperation(() => database.transaction(async (transaction) => {
-        await owned(transaction, { lock: true, requireFresh: true, requireGrant: outcome === 'succeeded' });
-        await transaction.insert(externalExecutionEvent).values({
-          id: randomId(), reservationId: reservation.id, eventType: terminalEvent(outcome), attemptOrdinal: ordinal,
-          failureCode: outcome === 'ambiguous' ? 'provider_attempt_ambiguous' : null,
-          inputTokens: usage.inputTokens ?? null, outputTokens: usage.outputTokens ?? null, createdAt: clock(),
-        });
-      })),
+      beginProviderAttempt: () => begin(),
+      finishProviderAttempt: (ordinal, outcome, usage) => finish(ordinal, outcome, usage),
       renew: async () => authorityOperation(() => database.transaction(async (transaction) => {
+        await lockExternalExecution(transaction);
         await owned(transaction, { lock: true });
         const now = clock();
         await transaction.update(externalExecutionLease).set({ heartbeatAt: now, leaseExpiresAt: new Date(now.getTime() + leaseMs) }).where(and(
@@ -283,7 +333,13 @@ export class DurableExternalExecutionAuthorizer implements ExternalExecutionAuth
         await transaction.insert(externalExecutionEvent).values({ id: randomId(), reservationId: reservation.id, eventType: 'lease_renewed', createdAt: now });
       })),
       complete: async (outcome, failureCode) => authorityOperation(() => database.transaction(async (transaction) => {
+        await lockExternalExecution(transaction);
+        const audit = await transaction.select().from(externalExecutionEvent).where(eq(externalExecutionEvent.reservationId, reservation.id));
+        const uncertain = audit.some((event) => event.eventType === 'attempt_ambiguous') || audit.some((event) => event.eventType === 'attempt_started'
+          && !audit.some((terminal) => terminal.attemptOrdinal === event.attemptOrdinal && ['attempt_succeeded', 'attempt_failed', 'attempt_ambiguous'].includes(terminal.eventType)));
+        if (uncertain) { outcome = 'ambiguous'; failureCode = 'provider_attempt_ambiguous'; }
         await owned(transaction, { lock: true, requireFresh: outcome === 'succeeded', requireGrant: outcome === 'succeeded' });
+        if (outcome === 'succeeded' && !recovery) await assertRunBusinessAllowed(transaction, reservation, clock());
         const now = clock();
         const state = outcome === 'succeeded' ? 'succeeded' : outcome === 'failed' ? 'failed' : 'ambiguous';
         const code = state === 'succeeded' ? null : failureCode ?? (state === 'ambiguous' ? 'provider_attempt_ambiguous' : 'execution_authority_mismatch');
@@ -292,25 +348,68 @@ export class DurableExternalExecutionAuthorizer implements ExternalExecutionAuth
         ));
         await transaction.insert(externalExecutionEvent).values({ id: randomId(), reservationId: reservation.id, eventType: state === 'succeeded' ? 'completed' : 'failed', failureCode: code, createdAt: now });
       })),
+      resolveSandboxCreation: async (identity) => {
+        if (!policy || recovery) throw new ExternalExecutionAuthorityError('execution_authority_mismatch');
+        await authorityOperation(() => database.transaction(async (transaction) => {
+          await lockExternalExecution(transaction);
+          await owned(transaction, { lock: true, requireFresh: identity !== undefined, requireGrant: identity !== undefined });
+          const audit = await transaction.select().from(externalExecutionEvent).where(eq(externalExecutionEvent.reservationId, reservation.id));
+          const started = audit.some((event) => event.attemptOrdinal === 1 && event.eventType === 'attempt_started');
+          const existing = audit.find((event) => event.attemptOrdinal === 1 && ['attempt_succeeded', 'attempt_failed', 'attempt_ambiguous'].includes(event.eventType));
+          if (identity) {
+            if (!started) throw new ExternalExecutionAuthorityError('execution_authority_mismatch');
+            if (existing && existing.eventType !== 'attempt_succeeded') throw new ExternalExecutionAuthorityError(existing.eventType === 'attempt_ambiguous' ? 'provider_attempt_ambiguous' : 'sandbox_creation_failed');
+            // Retain exact parsed identity for cleanup, not as business success.
+            policy.confirm(identity);
+            await assertRunBusinessAllowed(transaction, reservation, clock());
+          }
+          if (started && !existing) {
+            await transaction.insert(externalExecutionEvent).values({ id: randomId(), reservationId: reservation.id, eventType: identity ? 'attempt_succeeded' : 'attempt_ambiguous', attemptOrdinal: 1, failureCode: identity ? null : 'provider_attempt_ambiguous', createdAt: clock() });
+          }
+        }));
+      },
       meteredFetch: async (input, init) => {
-        const sandbox = reservation.operationCategory === 'sandbox_baseline' || reservation.operationCategory === 'sandbox_verification';
         try {
+          if (sandbox && !policy) throw new ExternalExecutionAuthorityError('execution_authority_mismatch');
+          const kind = policy ? policy.classify(input, init) : 'business';
           const signal = init?.signal ?? (input instanceof Request ? input.signal : undefined);
           signal?.throwIfAborted();
-          const ordinal = await permit.beginProviderAttempt();
+          const ordinal = await begin(kind);
           let response: Response;
           try {
             signal?.throwIfAborted();
             response = await fetchImplementation(input, sandbox ? { ...init, redirect: 'manual' } : init);
           } catch (error) {
+            if (kind === 'create') {
+              try { await permit.finishProviderAttempt(ordinal, 'ambiguous'); }
+              finally { throw new ExternalExecutionAuthorityError('provider_attempt_ambiguous'); }
+            }
             await permit.finishProviderAttempt(ordinal, 'ambiguous');
             throw error;
           }
-          await permit.finishProviderAttempt(ordinal, response.ok ? 'succeeded' : 'failed');
+          if (kind === 'create' && response.status >= 500) {
+            try { await permit.finishProviderAttempt(ordinal, 'ambiguous'); }
+            finally {
+              await response.body?.cancel().catch(() => undefined);
+              throw new ExternalExecutionAuthorityError('provider_attempt_ambiguous');
+            }
+          }
+          // A successful create remains unresolved until the SDK has parsed its
+          // response and the boundary confirms the exact identity. Malformed
+          // responses cannot be prematurely recorded as trustworthy success.
+          if (!(kind === 'create' && response.ok)) {
+            if (kind === 'cleanup') await finish(ordinal, response.ok ? 'succeeded' : 'failed', {}, kind);
+            else await permit.finishProviderAttempt(ordinal, response.ok ? 'succeeded' : 'failed');
+          }
           if (sandbox && response.status >= 300 && response.status < 400) {
             await response.body?.cancel().catch(() => undefined);
             throw new SandboxTransportError();
           }
+          if (kind === 'create' && !response.ok) {
+            await response.body?.cancel().catch(() => undefined);
+            throw new ExternalExecutionAuthorityError('sandbox_creation_failed');
+          }
+          if (policy && kind === 'cleanup' && (init?.method ?? (input instanceof Request ? input.method : 'GET')).toUpperCase() === 'GET') await policy.observeLookup(response);
           return response;
         } catch (error) {
           // async-retry honors `bail` without replacing the stable domain error.

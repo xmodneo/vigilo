@@ -8,6 +8,9 @@ import { account, aiCandidateGeneration, aiCandidateGenerationAttempt, aiCandida
 import { startAiInvestigation } from '../lib/ai-investigations/flow.ts';
 import { getAiCandidateGenerationForAiInvestigation, startAiCandidateGeneration, AiCandidateGenerationFlowError } from '../lib/ai-candidate-generations/flow.ts';
 import { processAiCandidateGenerationJob } from '../lib/ai-candidate-generations/worker.ts';
+import { runAiCandidateGeneration } from '../lib/ai-candidate-generations/runner.ts';
+import { GeminiInvestigationProvider } from '../lib/ai-investigations/gemini-provider.ts';
+import { createTestExternalExecutionAuthorizer } from './external-execution-support.ts';
 import type { AuthenticatedWorkspace } from '../lib/auth/protected-context.ts';
 import type { GitHubAppConfiguration } from '../lib/github-app/types.ts';
 import type { InvestigationSourceGateway } from '../lib/investigations/types.ts';
@@ -359,6 +362,65 @@ test('candidate generation preserves terminal durable execution-authority failur
   assert.equal(output.status, 'completed'); assert.equal(generation?.state, 'failed');
   assert.equal(generation?.failureCode, 'execution_authority_expired');
   assert.equal(attempts.length, 1); assert.equal(attempts[0]?.state, 'exhausted');
+});
+
+test('generation runner preserves durable budget and ambiguity errors without retry or candidate creation', async (t) => {
+  for (const code of ['execution_budget_exhausted', 'provider_attempt_ambiguous'] as const) await t.test(code, async (t) => {
+    const context = await createTestContext(); t.after(() => context.client.close()); const seeded = await seed(context);
+    const queued = await startAiCandidateGeneration(context.database, seeded.workspaceContext, seeded.aiId, new CandidateQueue(), { clock: () => NOW });
+    let requests = 0;
+    const provider: InvestigationModelProvider = { providerId: 'google', modelId: 'gemini-3.1-flash-lite', createSession: () => ({ next: async () => { requests += 1; throw new ExternalExecutionAuthorityError(code); } }) };
+    const job = { id: queued.id, name: 'ai-candidate-generation-v1', data: { version: 1, proposalGenerationId: queued.id }, signal: new AbortController().signal } as never;
+    const dependencies = { database: context.database, gateway: new Gateway(), configuration: CONFIGURATION, createProvider: () => provider, clock: () => new Date(NOW.getTime() + 1) };
+    assert.equal((await processAiCandidateGenerationJob(job, dependencies)).status, 'completed');
+    const [generation] = await context.database.select().from(aiCandidateGeneration).where(eq(aiCandidateGeneration.id, queued.id));
+    assert.equal(generation?.state, 'failed'); assert.equal(generation?.failureCode, code);
+    assert.equal((await processAiCandidateGenerationJob(job, dependencies)).status, 'completed');
+    assert.equal(requests, 1);
+    const attempts = await context.database.select().from(aiCandidateGenerationAttempt).where(eq(aiCandidateGenerationAttempt.generationId, queued.id));
+    assert.equal(attempts.length, 1); assert.equal(attempts[0]?.state, 'exhausted');
+    assert.equal((await context.database.select().from(repairCandidate)).length, 0);
+    if (code === 'execution_budget_exhausted') {
+      const queue = new CandidateQueue();
+      await assert.rejects(startAiCandidateGeneration(context.database, seeded.workspaceContext, seeded.aiId, queue, { idempotencyKey: randomUUID(), clock: () => NOW }), (error: unknown) => error instanceof ExternalExecutionAuthorityError && error.code === code);
+      assert.equal(queue.payloads.length, 0);
+      assert.equal((await context.database.select().from(aiCandidateGeneration).where(eq(aiCandidateGeneration.aiInvestigationId, seeded.aiId))).length, 1);
+    }
+  });
+});
+
+test('generation durable ambiguity takes precedence over a simultaneous model abort', async (t) => {
+  const context = await createTestContext(); t.after(() => context.client.close()); const seeded = await seed(context);
+  const queued = await startAiCandidateGeneration(context.database, seeded.workspaceContext, seeded.aiId, new CandidateQueue(), { clock: () => NOW });
+  const controller = new AbortController();
+  const provider: InvestigationModelProvider = { providerId: 'google', modelId: 'gemini-3.1-flash-lite', createSession: () => ({ next: async () => { controller.abort(); throw new ExternalExecutionAuthorityError('provider_attempt_ambiguous'); } }) };
+  const output = await processAiCandidateGenerationJob({ id: queued.id, name: 'ai-candidate-generation-v1', data: { version: 1, proposalGenerationId: queued.id }, signal: new AbortController().signal } as never, {
+    database: context.database, gateway: new Gateway(), configuration: CONFIGURATION, createProvider: () => provider,
+    executor: (database, gateway, configuration, selectedProvider, input) => runAiCandidateGeneration(database, gateway, configuration, selectedProvider, input, { signal: controller.signal }),
+    clock: () => new Date(NOW.getTime() + 1),
+  });
+  const [generation] = await context.database.select().from(aiCandidateGeneration).where(eq(aiCandidateGeneration.id, queued.id));
+  assert.equal(output.status, 'completed'); assert.equal(generation?.failureCode, 'provider_attempt_ambiguous');
+});
+
+test('controlled generation input accounting uses serialized request bytes within a small three-request envelope', async (t) => {
+  const context = await createTestContext(); t.after(() => context.client.close()); const seeded = await seed(context);
+  const queued = await startAiCandidateGeneration(context.database, seeded.workspaceContext, seeded.aiId, new CandidateQueue(), { clock: () => NOW });
+  const charges: number[] = []; const requestBytes: number[] = [];
+  const underlying = createTestExternalExecutionAuthorizer();
+  const executionAuthority = { reserve: async (request: Parameters<typeof underlying.reserve>[0]) => { charges.push(request.amounts.inputTokens); return underlying.reserve(request); } };
+  const client = { create: async (request: Record<string, unknown>) => {
+    requestBytes.push(Buffer.byteLength(JSON.stringify(request), 'utf8'));
+    if (requestBytes.length <= 2) return { status: 'requires_action', steps: [{ type: 'function_call', id: `call-${requestBytes.length}`, name: requestBytes.length === 1 ? 'readBaselineSummary' : 'readTextFile', arguments: requestBytes.length === 1 ? {} : { path: SOURCE_PATH } }] };
+    return { status: 'completed', steps: [], output_text: JSON.stringify({ status: 'insufficient_evidence', files: [] }) };
+  } };
+  const provider = new GeminiInvestigationProvider('test-secret-value-with-adequate-length', 'gemini-3.1-flash-lite', client as never, executionAuthority);
+  assert.equal((await processAiCandidateGenerationJob({ id: queued.id, name: 'ai-candidate-generation-v1', data: { version: 1, proposalGenerationId: queued.id }, signal: new AbortController().signal } as never, { database: context.database, gateway: new Gateway(), configuration: CONFIGURATION, createProvider: () => provider, clock: () => new Date(NOW.getTime() + 1) })).status, 'completed');
+  const [generation] = await context.database.select().from(aiCandidateGeneration).where(eq(aiCandidateGeneration.id, queued.id));
+  assert.equal(generation?.state, 'abstained'); assert.equal((await context.database.select().from(repairCandidate)).length, 0);
+  assert.equal(requestBytes.length, 3); assert.deepEqual(charges, requestBytes);
+  assert.ok(charges.reduce((sum, bytes) => sum + bytes, 0) <= 20 * 1024);
+  t.diagnostic(`Controlled generation serialized input bytes: ${charges.join(' + ')} = ${charges.reduce((sum, bytes) => sum + bytes, 0)}; tested cumulative allowance 20480 bytes (not tokenizer-measured tokens).`);
 });
 
 test('a stale worker cannot checkpoint usage after its ownership lease is lost', async (t) => {

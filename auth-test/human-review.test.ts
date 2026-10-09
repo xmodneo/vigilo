@@ -1,13 +1,14 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import test from 'node:test';
+import { Sandbox } from '@vercel/sandbox';
 
 import { and, eq, sql } from 'drizzle-orm';
 
 import {
   account, aiCandidateGeneration, aiCandidateGenerationAttempt, aiInvestigation,
   candidateVerification, candidateVerificationAttempt, candidateVerificationEvidence,
-  executionBudgetGrant, executionBudgetGrantRevocation, executionProfile, externalExecutionLease, externalExecutionReservation,
+  executionBudgetGrant, executionBudgetGrantRevocation, executionProfile, externalExecutionEvent, externalExecutionLease, externalExecutionReservation,
   githubInstallation, humanReviewDecision, investigation, repairCandidate,
   repairCandidateFile, repairIntent, repairLoop, repairLoopIteration, repairRun,
   releaseAcceptance, releaseAcceptanceRevocation, repairPublication, repairPublicationAttempt, repairPublicationEvent, repository, repositoryBaseline, user, workspace,
@@ -37,7 +38,7 @@ import type { PublicationPullRequest, RepairPublicationGateway } from '../lib/re
 import { createRepairPublicationHandlers } from '../lib/repair-publications/handlers.ts';
 import { DurableExternalExecutionAuthorizer } from '../lib/external-execution/authority.ts';
 import { computeExecutionGrantIdentity, computeReleaseAcceptanceIdentity } from '../lib/external-execution/identity.ts';
-import { acceptanceIdentityPayload, ReleaseAcceptanceError } from '../lib/release-acceptance/resolver.ts';
+import { acceptanceIdentityPayload, ReleaseAcceptanceError, resolveReleaseAcceptance } from '../lib/release-acceptance/resolver.ts';
 import { computePublicationBootstrapPurpose, resolvePublicationReleaseAuthority } from '../lib/release-acceptance/publication-gate.ts';
 
 const NOW = new Date('2032-02-03T04:05:06.000Z');
@@ -247,7 +248,18 @@ async function seedPublicationAcceptances(context: Awaited<ReturnType<typeof cre
       operationCategory: 'repair_loop_iteration', providerId: 'vigilo', modelId: null, acceptancePurpose: null,
       limits: operationLimits, expiresAt: expiresAt.toISOString(), authorizedBy: operatorId }),
   });
-  const authorizer = new DurableExternalExecutionAuthorizer(context.database, { clock: () => NOW });
+  const sandboxBinding = { name: 'verification-review', teamId: 'team_test', projectId: 'project_test' };
+  let sandboxCreateDispatches = 0;
+  const authorizer = new DurableExternalExecutionAuthorizer(context.database, { clock: () => NOW, fetch: async (input, init) => {
+    const url = new URL(String(input));
+    assert.equal(url.origin, 'https://vercel.com'); assert.equal(url.pathname, '/api/v3/sandboxes');
+    assert.equal(init?.method, 'POST'); assert.equal(JSON.parse(String(init.body)).name, sandboxBinding.name);
+    assert.equal(++sandboxCreateDispatches, 1, 'acceptance fixture permits exactly one fake creation dispatch');
+    const session = { id: 'test-review-session', memory: 2048, vcpus: 1, region: 'test', timeout: 1000,
+      status: 'running', requestedAt: 1, createdAt: 1, cwd: '/vercel/sandbox', updatedAt: 1 };
+    return Response.json({ session, sandbox: { name: sandboxBinding.name, persistent: false,
+      createdAt: 1, updatedAt: 1, currentSessionId: session.id, status: session.status }, routes: [] });
+  } });
   const execution = await authorizer.reserve({
     grantId: operationGrantId, accountGrantId,
     scope: { workspaceId: seeded.authority.workspaceId, repairRunId: seeded.authority.repairRunId,
@@ -275,12 +287,22 @@ async function seedPublicationAcceptances(context: Awaited<ReturnType<typeof cre
       grantIdentity: computeExecutionGrantIdentity({ version: 1, scope: 'operation', ...scope, modelId: model ? 'gemini-3.1-flash-lite' : null,
         acceptancePurpose: null, limits: { ...amounts, maxConcurrentExternalOperations: 0 }, expiresAt: expiresAt.toISOString(), authorizedBy: operatorId }),
     });
-    const permit = await authorizer.reserve({ grantId, accountGrantId, scope, amounts });
-    const ordinal = await permit.beginProviderAttempt();
-    await permit.finishProviderAttempt(ordinal, 'succeeded');
+    const permit = await authorizer.reserve({ grantId, accountGrantId, scope, amounts, ...(!model ? { sandbox: sandboxBinding } : {}) });
+    if (model) {
+      const ordinal = await permit.beginProviderAttempt();
+      await permit.finishProviderAttempt(ordinal, 'succeeded');
+    } else {
+      // Exercise the real identity-bearing admission/SDK parsing contract, not
+      // a generic attempt API that cannot authorize a Sandbox creation.
+      const sandbox = await Sandbox.create({ ...sandboxBinding, token: 'test-only-not-real-vercel-token',
+        image: 'vercel/sandbox/node:24', persistent: false, timeout: 1000, resources: { vcpus: 1 }, fetch: permit.meteredFetch });
+      assert.ok(permit.resolveSandboxCreation);
+      await permit.resolveSandboxCreation({ name: sandbox.name, sessionId: sandbox.currentSession().sessionId });
+    }
     await permit.complete('succeeded');
     liveReservations.push(permit.reservationId);
   }
+  assert.equal(sandboxCreateDispatches, 1);
   const [evidence] = await context.database.select().from(candidateVerificationEvidence)
     .where(eq(candidateVerificationEvidence.id, seeded.authority.verificationEvidenceId));
   assert.ok(evidence);
@@ -310,6 +332,41 @@ async function seedPublicationAcceptances(context: Awaited<ReturnType<typeof cre
     executionBudgetGrantId: accountGrantId, executionReservationIds: liveReservations,
   });
   return { ...seeded, accountGrantId, authorizer, repair, human, security, expiresAt };
+}
+
+for (const defect of ['ambiguous_outcome', 'ambiguous_lease', 'unresolved_outcome', 'missing_authority'] as const) {
+  test(`M7.7 release audit: ${defect} cannot be laundered through an otherwise passed acceptance`, async (t) => {
+    const context = await createTestContext(); t.after(() => context.client.close());
+    const seeded = await seedPublicationAcceptances(context);
+    const boundary = { kind: 'repair_loop_live' as const, workspaceId: seeded.authority.workspaceId,
+      releasedCommitSha: RELEASE_SHA, boundaryVersion: 'repair-loop-live-v1', protocolVersion: 4,
+      providerId: 'google', modelId: 'gemini-3.1-flash-lite' };
+    assert.equal((await resolveReleaseAcceptance(context.database, boundary)).id, seeded.repair.id);
+    const [reservation] = await context.database.select().from(externalExecutionReservation).where(and(
+      eq(externalExecutionReservation.repairRunId, seeded.authority.repairRunId),
+      eq(externalExecutionReservation.operationCategory, 'sandbox_verification'),
+    ));
+    assert.ok(reservation);
+    // Deliberate catalog tampering is confined to this isolated PGlite fixture:
+    // prove the unchanged resolver independently refuses forged/incomplete audit.
+    if (defect === 'ambiguous_lease') {
+      await context.database.execute(sql`drop trigger external_execution_lease_mutation_guard on external_execution_lease`);
+      await context.database.update(externalExecutionLease).set({ state: 'ambiguous', failureCode: 'provider_attempt_ambiguous' })
+        .where(eq(externalExecutionLease.reservationId, reservation.id));
+    } else if (defect === 'missing_authority') {
+      await context.database.execute(sql`drop trigger release_acceptance_mutation_guard on release_acceptance`);
+      const changed = { ...seeded.repair, executionReservationIds: seeded.repair.executionReservationIds.filter((id) => id !== reservation.id) };
+      await context.database.update(releaseAcceptance).set({ executionReservationIds: changed.executionReservationIds,
+        acceptanceIdentity: computeReleaseAcceptanceIdentity(acceptanceIdentityPayload(changed)) }).where(eq(releaseAcceptance.id, changed.id));
+    } else {
+      await context.database.execute(sql`drop trigger external_execution_event_mutation_guard on external_execution_event`);
+      const outcome = and(eq(externalExecutionEvent.reservationId, reservation.id), eq(externalExecutionEvent.eventType, 'attempt_succeeded'));
+      if (defect === 'unresolved_outcome') await context.database.delete(externalExecutionEvent).where(outcome);
+      else await context.database.update(externalExecutionEvent).set({ eventType: 'attempt_ambiguous', failureCode: 'provider_attempt_ambiguous' }).where(outcome);
+    }
+    await assert.rejects(resolveReleaseAcceptance(context.database, boundary),
+      (error: unknown) => error instanceof ReleaseAcceptanceError && error.code === 'acceptance_boundary_mismatch');
+  });
 }
 
 async function insertBootstrapGrant(

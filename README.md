@@ -69,6 +69,37 @@ attempt limits, leases, and provider-call ceilings. Application budgets limit
 resource use but do not guarantee a provider bill or dollar amount. With no valid
 grant, effective external execution authority is zero and history remains read-only.
 
+An ambiguous external business outcome permanently fences that RepairRun against
+new business execution, including after restart or cleanup. The fence uses the
+append-only execution audit and unresolved attempt starts after ownership loss;
+a live in-flight attempt is not itself ambiguity. Exact known-resource lookup,
+stop/delete and token revocation do not confer permission to restart work.
+Recovery still needs its own valid remaining bounded authority. Cleanup cannot
+turn ambiguous evidence into release-acceptance evidence.
+
+Each Sandbox identity permits at most one creation HTTP dispatch, including SDK
+retry invocations. A lost/ambiguous create response never authorizes another
+create. This bounds Vigilo's dispatches, not the number of resources a provider
+actually created. Successful create responses become trustworthy only after SDK
+parsing and exact name/session confirmation.
+
+The prospective M7.7 envelope is one fixed account grant and five exact run-scoped
+operation grants: two investigation requests, three generation requests, one
+baseline identity, one verifier identity/attempt and one repair-loop iteration;
+external concurrency is one. No supplemental/replacement grant is authorized.
+The existing 96-provider-attempt/600,000-ms/`vcpu_1` ceiling applies separately to
+each Sandbox operation, including its bounded read/cleanup calls. Budget denial
+is terminal; internal model-loop ceilings and finalization behavior are unchanged.
+Success within five Gemini requests is not guaranteed or required.
+
+Deterministic controlled-request input totals were 8,207 investigation bytes and
+18,493 generation bytes. Test-only prospective input allowances are 12 KiB and
+20 KiB respectively (32 KiB account aggregate); larger real requests may safely
+exhaust them. The ledger field named `inputTokens` charges serialized UTF-8 Gemini
+request bytes, not tokenizer-measured input tokens. Output allowances are at most
+5,000 investigation and 18,000 generation tokens. These are planning/test limits,
+not issued grants or live validation; live acceptance remains pending.
+
 The development and live acceptance model is Google Gemini
 `gemini-3.1-flash-lite`; this is not the final production model. The Gemini Free
 Tier is used only for development and live acceptance against the public Vigilo
