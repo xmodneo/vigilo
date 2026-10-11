@@ -27,13 +27,14 @@ test('journal orders reconciliation, RepairLoop, review, publication, execution 
   const journal = JSON.parse(await readFile(migrationPath('meta', '_journal.json'), 'utf8')) as {
     entries: Array<{ idx: number; when: number; tag: string }>;
   };
-  assert.deepEqual(journal.entries.slice(-6).map(({ idx, tag }) => ({ idx, tag })), [
+  assert.deepEqual(journal.entries.slice(-7).map(({ idx, tag }) => ({ idx, tag })), [
     { idx: 18, tag: '0018_historical-schema-reconciliation' },
     { idx: 19, tag: '0019_repair-loop' },
     { idx: 20, tag: '0020_human-review' },
     { idx: 21, tag: '0021_repair-publication' },
     { idx: 22, tag: '0022_external-execution-authority' },
     { idx: 23, tag: '0023_operational-readiness' },
+    { idx: 24, tag: '0024_execution-provenance' },
   ]);
   assert.ok(journal.entries.every((entry, index, entries) => index === 0 || entry.when > entries[index - 1]!.when));
 });

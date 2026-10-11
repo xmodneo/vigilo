@@ -44,6 +44,8 @@ export interface ExternalExecutionAmounts {
 export interface ExternalExecutionReservationRequest {
   scope: ExternalExecutionScope;
   amounts: ExternalExecutionAmounts;
+  /** Captured with the provider credential bundle, never from a job or UI payload. */
+  providerAccountIdentity?: import('./provider-account.ts').ProviderAccountIdentity;
   operationKey?: string;
   grantId?: string;
   accountGrantId?: string;

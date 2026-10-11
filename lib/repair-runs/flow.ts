@@ -5,6 +5,7 @@ import { and, desc, eq, inArray } from 'drizzle-orm';
 import { repairIntent, repairRun, repairRunEvent, repositoryBaseline } from '../../db/schema.ts';
 import type { AuthenticatedWorkspace } from '../auth/protected-context.ts';
 import type { VigiloDatabase } from '../db/types.ts';
+import { finalizeSourceCheckpointIfStaged } from '../external-execution/source-checkpoint.ts';
 import { resolveBaselineAuthority } from '../repository-baselines/authority.ts';
 import { normalizeRepairObjective, RepairIntentValidationError } from './intent.ts';
 import { REPAIR_JOB_VERSION, type TransactionalRepairQueue } from './queue.ts';
@@ -101,7 +102,7 @@ export async function transitionRepairRun(
   expected: RepairRunState,
   target: RepairRunState,
   now: Date,
-  options: { baselineId?: string; failureCode?: string; eventId: string },
+  options: { baselineId?: string; failureCode?: string; eventId: string; finalizeSourceCheckpoint?: boolean },
 ): Promise<RepairRunResult> {
   validateTransition(expected, target);
   return database.transaction(async (transaction) => {
@@ -129,6 +130,7 @@ export async function transitionRepairRun(
       failureCode: updated.failureCode,
       createdAt: now,
     });
+    if (options.finalizeSourceCheckpoint && baseline) await finalizeSourceCheckpointIfStaged(transaction, runId, baseline.id);
     return result(updated);
   });
 }

@@ -1,9 +1,10 @@
 import { canonicalRecord } from '../repair-loops/canonical.ts';
 import { executionBudgetGrant, externalExecutionReservation } from '../../db/schema.ts';
 import type { ExternalExecutionAmounts, ExternalExecutionScope } from './types.ts';
+import { canonicalProviderAccountIdentity, type ProviderAccountIdentity } from './provider-account.ts';
 
 export function computeExecutionGrantIdentity(input: {
-  version: 1;
+  version: 1 | 2;
   scope: 'account' | 'operation' | 'one_shot';
   workspaceId: string | null;
   repairRunId: string | null;
@@ -16,20 +17,36 @@ export function computeExecutionGrantIdentity(input: {
   limits: ExternalExecutionAmounts & { maxConcurrentExternalOperations: number };
   expiresAt: string;
   authorizedBy: string;
+  authorizedReleaseSha?: string | null;
+  authorizedProviderAccountIdentity?: ProviderAccountIdentity | null;
 }): string {
-  return canonicalRecord(input, 16 * 1024).hash;
+  const { authorizedReleaseSha, authorizedProviderAccountIdentity, ...historical } = input;
+  return canonicalRecord(input.version === 1 ? historical : {
+    ...historical,
+    authorizedReleaseSha: authorizedReleaseSha ?? null,
+    authorizedProviderAccountIdentity: authorizedProviderAccountIdentity === null || authorizedProviderAccountIdentity === undefined
+      ? null : JSON.parse(canonicalProviderAccountIdentity(authorizedProviderAccountIdentity)) as ProviderAccountIdentity,
+  }, 16 * 1024).hash;
 }
 
 export function computeExecutionReservationIdentity(input: {
-  version: 1;
+  version: 1 | 2;
   grantId: string;
   accountGrantId: string;
   scope: ExternalExecutionScope;
   amounts: ExternalExecutionAmounts;
   operationKey: string;
   fence: number;
+  executingReleaseSha?: string | null;
+  executingProviderAccountIdentity?: ProviderAccountIdentity | null;
 }): string {
-  return canonicalRecord(input, 16 * 1024).hash;
+  const { executingReleaseSha, executingProviderAccountIdentity, ...historical } = input;
+  return canonicalRecord(input.version === 1 ? historical : {
+    ...historical,
+    executingReleaseSha: executingReleaseSha ?? null,
+    executingProviderAccountIdentity: executingProviderAccountIdentity === null || executingProviderAccountIdentity === undefined
+      ? null : JSON.parse(canonicalProviderAccountIdentity(executingProviderAccountIdentity)) as ProviderAccountIdentity,
+  }, 16 * 1024).hash;
 }
 
 export function computeReleaseAcceptanceIdentity(input: Record<string, unknown>): string {
@@ -38,7 +55,7 @@ export function computeReleaseAcceptanceIdentity(input: Record<string, unknown>)
 
 export function executionGrantIdentityMatches(grant: typeof executionBudgetGrant.$inferSelect): boolean {
   return grant.grantIdentity === computeExecutionGrantIdentity({
-    version: 1,
+    version: grant.version as 1 | 2,
     scope: grant.scope as 'account' | 'operation' | 'one_shot',
     workspaceId: grant.workspaceId,
     repairRunId: grant.repairRunId,
@@ -62,12 +79,14 @@ export function executionGrantIdentityMatches(grant: typeof executionBudgetGrant
     },
     expiresAt: grant.expiresAt.toISOString(),
     authorizedBy: grant.authorizedBy,
+    authorizedReleaseSha: grant.authorizedReleaseSha,
+    authorizedProviderAccountIdentity: grant.authorizedProviderAccountIdentity,
   });
 }
 
 export function executionReservationIdentityMatches(reservation: typeof externalExecutionReservation.$inferSelect): boolean {
   return reservation.reservationIdentity === computeExecutionReservationIdentity({
-    version: 1,
+    version: reservation.version as 1 | 2,
     grantId: reservation.grantId,
     accountGrantId: reservation.accountGrantId,
     scope: {
@@ -93,5 +112,7 @@ export function executionReservationIdentityMatches(reservation: typeof external
     },
     operationKey: reservation.operationKey,
     fence: reservation.fence,
+    executingReleaseSha: reservation.executingReleaseSha,
+    executingProviderAccountIdentity: reservation.executingProviderAccountIdentity,
   });
 }

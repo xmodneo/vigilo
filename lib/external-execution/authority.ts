@@ -13,9 +13,11 @@ import {
 } from '../../db/schema.ts';
 import type { VigiloDatabase } from '../db/types.ts';
 import { computeExecutionReservationIdentity, executionGrantIdentityMatches } from './identity.ts';
+import { accountIdentityMatches, canonicalProviderAccountIdentity, vercelTeamProjectIdentity } from './provider-account.ts';
 import { SandboxTransportError } from './sandbox-auth.ts';
 import { assertRunBusinessAllowed, lockExternalExecution } from './business-fence.ts';
 import { SandboxTransportPolicy, type SandboxTransportBinding, type SandboxTransportKind } from './sandbox-transport.ts';
+import { assertMatchedSourceCheckpoint } from './source-checkpoint.ts';
 import {
   ExternalExecutionAuthorityError,
   type ExternalExecutionAuthorizer,
@@ -63,7 +65,7 @@ function terminalEvent(outcome: ProviderAttemptOutcome): 'attempt_succeeded' | '
 export class DurableExternalExecutionAuthorizer implements ExternalExecutionAuthorizer {
   constructor(
     private readonly database: VigiloDatabase,
-    private readonly options: { clock?: () => Date; randomId?: () => string; leaseMs?: number; fetch?: typeof fetch } = {},
+    private readonly options: { clock?: () => Date; randomId?: () => string; leaseMs?: number; fetch?: typeof fetch; runtimeReleaseSha?: string } = {},
   ) {}
 
   async reserve(request: ExternalExecutionReservationRequest): Promise<ExternalExecutionPermit> {
@@ -100,6 +102,8 @@ export class DurableExternalExecutionAuthorizer implements ExternalExecutionAuth
           binding = { ...binding, sessionId: row.sessionId };
         } else {
           await assertRunBusinessAllowed(transaction, request.scope, now);
+          if (request.scope.repairRunId && request.scope.operationCategory.startsWith('gemini_'))
+            await assertMatchedSourceCheckpoint(transaction, request.scope.repairRunId);
         }
 
         const grants = await transaction.select().from(executionBudgetGrant)
@@ -149,6 +153,21 @@ export class DurableExternalExecutionAuthorizer implements ExternalExecutionAuth
         const account = accounts[0]!;
         const grant = operations[0]!;
         if (!executionGrantIdentityMatches(account) || !executionGrantIdentityMatches(grant)) {
+          throw new ExternalExecutionAuthorityError('execution_authority_mismatch');
+        }
+        const runtimeReleaseSha = this.options.runtimeReleaseSha;
+        const providerAccountIdentity = request.scope.providerId === 'vigilo' ? null : request.providerAccountIdentity ?? null;
+        if (!runtimeReleaseSha || !/^[0-9a-f]{40}$/.test(runtimeReleaseSha) || grant.version !== 2 ||
+            grant.authorizedReleaseSha !== runtimeReleaseSha ||
+            !accountIdentityMatches(request.scope.providerId, providerAccountIdentity) ||
+            !accountIdentityMatches(request.scope.providerId, grant.authorizedProviderAccountIdentity) ||
+            (providerAccountIdentity === null ? grant.authorizedProviderAccountIdentity !== null :
+              canonicalProviderAccountIdentity(providerAccountIdentity) !== canonicalProviderAccountIdentity(grant.authorizedProviderAccountIdentity))) {
+          throw new ExternalExecutionAuthorityError('execution_authority_mismatch');
+        }
+        if ((request.scope.providerId === 'vercel' || request.scope.providerId === 'vercel-sandbox') &&
+            (!request.sandbox || canonicalProviderAccountIdentity(providerAccountIdentity) !==
+              canonicalProviderAccountIdentity(vercelTeamProjectIdentity(request.sandbox.teamId, request.sandbox.projectId)))) {
           throw new ExternalExecutionAuthorityError('execution_authority_mismatch');
         }
 
@@ -211,15 +230,17 @@ export class DurableExternalExecutionAuthorizer implements ExternalExecutionAuth
         const operationKey = request.operationKey ?? randomId();
         const ownershipToken = randomId();
         const reservationIdentity = computeExecutionReservationIdentity({
-          version: 1, grantId: grant.id, accountGrantId: account.id, scope: request.scope,
+          version: 2, grantId: grant.id, accountGrantId: account.id, scope: request.scope,
           amounts: request.amounts, operationKey, fence,
+          executingReleaseSha: runtimeReleaseSha, executingProviderAccountIdentity: providerAccountIdentity,
         });
         const [reservation] = await transaction.insert(externalExecutionReservation).values({
-          id, version: 1, grantId: grant.id, accountGrantId: account.id,
+          id, version: 2, grantId: grant.id, accountGrantId: account.id,
           workspaceId: request.scope.workspaceId, repairRunId: request.scope.repairRunId ?? null,
           githubRepositoryId: request.scope.githubRepositoryId ?? null, baseCommitSha: request.scope.baseCommitSha ?? null,
           operationCategory: request.scope.operationCategory, providerId: request.scope.providerId,
           modelId: request.scope.modelId ?? null, acceptancePurpose: request.scope.acceptancePurpose ?? null,
+          executingReleaseSha: runtimeReleaseSha, executingProviderAccountIdentity: providerAccountIdentity,
           operationKey, reservedLogicalRequests: request.amounts.logicalRequests,
           reservedProviderAttempts: request.amounts.providerAttempts, reservedInputTokens: request.amounts.inputTokens,
           reservedOutputTokens: request.amounts.outputTokens, reservedSandboxIdentities: request.amounts.sandboxIdentities,
@@ -275,6 +296,17 @@ export class DurableExternalExecutionAuthorizer implements ExternalExecutionAuth
         const grants = await grantQuery;
         if (grants.length !== 2) throw new ExternalExecutionAuthorityError('execution_authority_missing');
         if (grants.some((grant) => !executionGrantIdentityMatches(grant))) throw new ExternalExecutionAuthorityError('execution_authority_mismatch');
+        const operation = grants.find((grant) => grant.id === reservation.grantId);
+        if (!operation || operation.version !== 2 || reservation.version !== 2 ||
+            operation.authorizedReleaseSha !== reservation.executingReleaseSha ||
+            reservation.executingReleaseSha !== this.options.runtimeReleaseSha ||
+            !accountIdentityMatches(reservation.providerId, operation.authorizedProviderAccountIdentity) ||
+            !accountIdentityMatches(reservation.providerId, reservation.executingProviderAccountIdentity) ||
+            (reservation.executingProviderAccountIdentity === null
+              ? operation.authorizedProviderAccountIdentity !== null
+              : canonicalProviderAccountIdentity(reservation.executingProviderAccountIdentity) !== canonicalProviderAccountIdentity(operation.authorizedProviderAccountIdentity))) {
+          throw new ExternalExecutionAuthorityError('execution_authority_mismatch');
+        }
         const revocations = await transaction.select({ grantId: executionBudgetGrantRevocation.grantId })
           .from(executionBudgetGrantRevocation).where(inArray(executionBudgetGrantRevocation.grantId, [reservation.accountGrantId, reservation.grantId]));
         if (revocations.length > 0) throw new ExternalExecutionAuthorityError('execution_authority_missing');
@@ -295,6 +327,8 @@ export class DurableExternalExecutionAuthorizer implements ExternalExecutionAuth
       } else if (kind !== 'cleanup') {
         if (recovery) throw new ExternalExecutionAuthorityError('execution_authority_mismatch');
         await assertRunBusinessAllowed(transaction, reservation, clock());
+        if (reservation.repairRunId && reservation.operationCategory.startsWith('gemini_'))
+          await assertMatchedSourceCheckpoint(transaction, reservation.repairRunId);
       }
       const ordinal = starts.length + 1;
       if (sandbox && !recovery && reservation.reservedSandboxIdentities === 1 && ordinal === 1 && kind !== 'create') throw new ExternalExecutionAuthorityError('execution_authority_mismatch');

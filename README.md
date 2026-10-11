@@ -158,7 +158,9 @@ endpoint contacts an external provider.
 
 ## Current release and acceptance state
 
-- The checked clean-install migration ledger is `0000` through `0023`.
+- The checked source migration ledger is `0000` through `0024`. Migration
+  `0024_execution-provenance.sql` is not applied to the persistent local
+  development database by this implementation task.
 - Migration `0023_operational-readiness.sql` has been applied to the positively
   identified local development database. This local fact says nothing about
   production, staging, shared databases, or arbitrary deployments.
@@ -182,6 +184,13 @@ endpoint contacts an external provider.
   subject-bound durable grant; no bootstrap grant or reservation exists today.
 - Effective external execution authority is zero. No current UI state creates a
   grant or acceptance.
+- Future external execution requires a server-derived exact `VIGILO_RELEASE_SHA`
+  and a matching non-secret provider-account identity on the immutable grant
+  and reservation. Gemini uses `GEMINI_PROJECT_ID`; Vercel uses
+  `VERCEL_TEAM_ID` and `VERCEL_PROJECT_ID` from the same validated transport
+  configuration. The Gemini project binding is operator-attested consistency,
+  not cryptographic proof that an opaque API key belongs to that project.
+  Credentials are never persisted as execution provenance.
 - The zero-spend policy remains in force. No live acceptance, provider request,
   Sandbox creation, or GitHub publication occurred while wiring this gate.
 - Milestone 7.4 operational readiness is local and deterministic, not deployed

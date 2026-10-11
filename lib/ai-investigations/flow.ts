@@ -6,6 +6,7 @@ import { aiInvestigation, aiInvestigationEvent, executionProfile, investigation,
 import type { AuthenticatedWorkspace } from '../auth/protected-context.ts';
 import type { VigiloDatabase } from '../db/types.ts';
 import { assertRunBusinessAllowed, lockExternalExecution } from '../external-execution/business-fence.ts';
+import { assertMatchedSourceCheckpoint } from '../external-execution/source-checkpoint.ts';
 import { RepositoryPolicyError, assertPublicRepositoryAuthority } from '../github-repositories/policy.ts';
 import { trustworthyComparableBaseline } from '../candidate-verifications/classification.ts';
 import { AI_INVESTIGATION_JOB_VERSION, type TransactionalAiInvestigationQueue } from '../repair-runs/queue.ts';
@@ -43,6 +44,7 @@ export async function startAiInvestigation(database: VigiloDatabase, context: Au
     const values = [authority.run, authority.baseline, authority.profile];
     if (values.some((value) => value.workspaceId !== authority.current.workspaceId || value.githubRepositoryId !== authority.current.githubRepositoryId || value.installationId !== authority.current.installationId || value.baseCommitSha !== authority.current.baseCommitSha || value.profileIdentity !== authority.current.profileIdentity)) throw new AiInvestigationFlowError('investigation_not_ready');
     await assertRunBusinessAllowed(transaction, { workspaceId: parent.workspaceId, repairRunId: parent.repairRunId }, now);
+    await assertMatchedSourceCheckpoint(transaction, parent.repairRunId);
     const id = randomId();
     const [row] = await transaction.insert(aiInvestigation).values({ id, investigationId: authority.current.id, executionOrdinal: (latest?.executionOrdinal ?? 0) + 1, idempotencyKey, repairRunId: authority.current.repairRunId, baselineId: authority.current.baselineId, workspaceId: authority.current.workspaceId, githubRepositoryId: authority.current.githubRepositoryId, installationId: authority.current.installationId, baseCommitSha: authority.current.baseCommitSha, profileIdentity: authority.current.profileIdentity, providerId: AI_PROVIDER_ID, modelId: AI_MODEL_ID, protocolVersion: AI_INVESTIGATION_PROTOCOL_VERSION, state: 'created', createdAt: now, queuedAt: null, updatedAt: now }).returning();
     if (!row) throw new AiInvestigationFlowError('ai_investigation_handoff_failed');

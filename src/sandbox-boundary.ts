@@ -2,6 +2,7 @@ import { APIError, Sandbox, type NetworkPolicy } from "@vercel/sandbox";
 import { randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import { sandboxCredentials, SandboxConfigurationError, SandboxTransportError } from "../lib/external-execution/sandbox-auth.ts";
+import { vercelTeamProjectIdentity } from "../lib/external-execution/provider-account.ts";
 
 import { ExternalExecutionAuthorityError, ZERO_EXTERNAL_EXECUTION_AUTHORITY, type ExternalExecutionAuthorizer, type ExternalExecutionPermit, type ExternalExecutionScope, type SandboxResourceClass } from "../lib/external-execution/types.ts";
 
@@ -76,6 +77,7 @@ export async function recoverSandbox(
   const credentials = readSandboxCredentials();
   const permit = await authority.reserve({
     scope,
+    providerAccountIdentity: vercelTeamProjectIdentity(credentials.teamId, credentials.projectId),
     sandbox: { name: identity.name, projectId: credentials.projectId, teamId: credentials.teamId },
     ...(identity.knownAttempt ? { cleanup: { kind: identity.knownAttempt.kind, attemptId: identity.knownAttempt.id } } : {}),
     amounts: {
@@ -175,6 +177,7 @@ export class SandboxBoundary {
       this.credentials = readSandboxCredentials();
       this.permit = await this.authority.reserve({
         scope: this.scope,
+        providerAccountIdentity: vercelTeamProjectIdentity(this.credentials.teamId, this.credentials.projectId),
         sandbox: { name: this.evidence.name, projectId: this.credentials.projectId, teamId: this.credentials.teamId },
         amounts: {
           logicalRequests: 1,

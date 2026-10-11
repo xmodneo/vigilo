@@ -169,6 +169,13 @@
       "when": 1790762400000,
       "tag": "0023_operational-readiness",
       "breakpoints": true
+    },
+    {
+      "idx": 24,
+      "version": "7",
+      "when": 1790848800000,
+      "tag": "0024_execution-provenance",
+      "breakpoints": true
     }
   ]
 }

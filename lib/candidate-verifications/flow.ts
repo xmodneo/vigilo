@@ -18,6 +18,7 @@ import type { AuthenticatedWorkspace } from '../auth/protected-context.ts';
 import type { VigiloDatabase } from '../db/types.ts';
 import { assertRunBusinessAllowed, lockExternalExecution } from '../external-execution/business-fence.ts';
 import { ExternalExecutionAuthorityError } from '../external-execution/types.ts';
+import { assertMatchedSourceCheckpoint } from '../external-execution/source-checkpoint.ts';
 import { RepositoryPolicyError, assertPublicRepositoryAuthority } from '../github-repositories/policy.ts';
 import { selfCheckRepairCandidate } from '../repair-candidates/flow.ts';
 import { frozenBaselineProfile } from '../repository-baselines/authority.ts';
@@ -147,6 +148,7 @@ export async function startCandidateVerification(
       await lockExternalExecution(transaction);
       const [lockedRun] = await transaction.select({ id: repairRun.id }).from(repairRun).where(and(eq(repairRun.id, candidate.repairRunId), eq(repairRun.workspaceId, context.workspace.id))).for('update').limit(1);
       if (!lockedRun) throw new CandidateVerificationError('verification_authority_mismatch');
+      await assertMatchedSourceCheckpoint(transaction, lockedRun.id);
       const [review] = await transaction.select({ id: humanReviewDecision.id }).from(humanReviewDecision).where(eq(humanReviewDecision.repairRunId, candidate.repairRunId)).limit(1);
       if (review) throw new CandidateVerificationError('repair_run_reviewed');
       const [activeLoop] = await transaction.select({ id: repairLoop.id }).from(repairLoop).where(and(eq(repairLoop.repairRunId, candidate.repairRunId), inArray(repairLoop.state, ['queued', 'running']))).limit(1);

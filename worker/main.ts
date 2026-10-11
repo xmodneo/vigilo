@@ -27,7 +27,7 @@ import { inArray } from 'drizzle-orm';
 import { processInvestigationJob } from '../lib/investigations/worker.ts';
 import { processCandidateVerificationJob } from '../lib/candidate-verifications/worker.ts';
 import { aiInvestigation } from '../db/schema.ts';
-import { GeminiInvestigationProvider, readModelApiKey } from '../lib/ai-investigations/gemini-provider.ts';
+import { GeminiInvestigationProvider, readGeminiProviderConfiguration } from '../lib/ai-investigations/gemini-provider.ts';
 import { processAiInvestigationJob } from '../lib/ai-investigations/worker.ts';
 import { aiCandidateGeneration } from '../db/schema.ts';
 import { processAiCandidateGenerationJob } from '../lib/ai-candidate-generations/worker.ts';
@@ -47,7 +47,7 @@ async function main(): Promise<void> {
   const client = postgres(environment.databaseUrl, { max: 2, prepare: false });
   const heartbeatClient = postgres(environment.databaseUrl, { max: 1, prepare: false, connect_timeout: 5, idle_timeout: 5, connection: { statement_timeout: 5_000, lock_timeout: 2_000 } });
   const database = drizzle(client, { schema });
-  const executionAuthority = new DurableExternalExecutionAuthorizer(database);
+  const executionAuthority = new DurableExternalExecutionAuthorizer(database, { runtimeReleaseSha: releaseSha });
   const logger = createConsoleWorkerLogger();
   const shutdown = new AbortController();
   const heartbeat = new WorkerHeartbeatLifecycle(new PostgresWorkerHeartbeatStore(heartbeatClient), {
@@ -136,13 +136,13 @@ async function main(): Promise<void> {
     workerIds.push({ id: verificationWorkerId, queue: CANDIDATE_VERIFICATION_QUEUE });
     const aiWorkerId = await boss.work<unknown, { code?: string }, typeof workOptions>(AI_INVESTIGATION_QUEUE, workOptions, async (jobs) => {
       const job = jobs[0]; if (!job) return [];
-      try { return [await processAiInvestigationJob(job, { configuration, database, gateway, shutdownSignal: shutdown.signal, createProvider: () => new GeminiInvestigationProvider(readModelApiKey(), undefined, undefined, executionAuthority) })]; }
+      try { return [await processAiInvestigationJob(job, { configuration, database, gateway, shutdownSignal: shutdown.signal, createProvider: () => { const provider = readGeminiProviderConfiguration(); return new GeminiInvestigationProvider(provider.apiKey, undefined, undefined, executionAuthority, provider.accountIdentity); } })]; }
       catch { return [{ id: job.id, status: 'failed' as const, output: { code: 'ai_investigation_worker_failed' } }]; }
     });
     workerIds.push({ id: aiWorkerId, queue: AI_INVESTIGATION_QUEUE });
     const aiCandidateGenerationWorkerId = await boss.work<unknown, { code?: string }, typeof workOptions>(AI_CANDIDATE_GENERATION_QUEUE, workOptions, async (jobs) => {
       const job = jobs[0]; if (!job) return [];
-      try { return [await processAiCandidateGenerationJob(job, { configuration, database, gateway, shutdownSignal: shutdown.signal, createProvider: () => new GeminiInvestigationProvider(readModelApiKey(), undefined, undefined, executionAuthority) })]; }
+      try { return [await processAiCandidateGenerationJob(job, { configuration, database, gateway, shutdownSignal: shutdown.signal, createProvider: () => { const provider = readGeminiProviderConfiguration(); return new GeminiInvestigationProvider(provider.apiKey, undefined, undefined, executionAuthority, provider.accountIdentity); } })]; }
       catch { return [{ id: job.id, status: 'failed' as const, output: { code: 'ai_candidate_generation_worker_failed' } }]; }
     });
     workerIds.push({ id: aiCandidateGenerationWorkerId, queue: AI_CANDIDATE_GENERATION_QUEUE });

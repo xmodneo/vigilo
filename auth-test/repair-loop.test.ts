@@ -141,21 +141,22 @@ async function createDurableLoopAuthority(context: Awaited<ReturnType<typeof cre
   });
   const operationGrantId = randomUUID();
   await context.database.insert(executionBudgetGrant).values({
-    id: operationGrantId, version: 1, scope: 'operation', workspaceId: seeded.workspaceId,
+    id: operationGrantId, version: 2, scope: 'operation', workspaceId: seeded.workspaceId,
     repairRunId: seeded.runId, githubRepositoryId: REPOSITORY_ID, baseCommitSha: COMMIT,
-    operationCategory: 'repair_loop_iteration', providerId: 'vigilo', maxLogicalRequests: 1,
+    operationCategory: 'repair_loop_iteration', providerId: 'vigilo', authorizedReleaseSha: 'd'.repeat(40), maxLogicalRequests: 1,
     maxProviderAttempts: 0, maxInputTokens: 0, maxOutputTokens: 0, maxSandboxIdentities: 0,
     maxSandboxRuntimeMs: 0, maxVerificationAttempts: 0, maxRepairLoopIterations: 1,
     maxConcurrentExternalOperations: 0, expiresAt, authorizedBy,
     grantIdentity: computeExecutionGrantIdentity({
-      version: 1, scope: 'operation', workspaceId: seeded.workspaceId, repairRunId: seeded.runId,
+      version: 2, scope: 'operation', workspaceId: seeded.workspaceId, repairRunId: seeded.runId,
       githubRepositoryId: REPOSITORY_ID, baseCommitSha: COMMIT, operationCategory: 'repair_loop_iteration',
       providerId: 'vigilo', modelId: null, acceptancePurpose: null,
       limits: { ...limits, maxConcurrentExternalOperations: 0 }, expiresAt: expiresAt.toISOString(), authorizedBy,
+      authorizedReleaseSha: 'd'.repeat(40), authorizedProviderAccountIdentity: null,
     }), createdAt: NOW,
   });
   return {
-    authority: new DurableExternalExecutionAuthorizer(context.database, { clock: () => NOW }),
+    authority: new DurableExternalExecutionAuthorizer(context.database, { clock: () => NOW, runtimeReleaseSha: 'd'.repeat(40) }),
     operationGrantId,
   };
 }

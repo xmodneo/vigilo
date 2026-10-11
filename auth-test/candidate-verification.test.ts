@@ -32,6 +32,7 @@ import { processCandidateVerificationJob } from '../lib/candidate-verifications/
 import { computeExecutionProfileIdentity } from '../lib/execution-profiles/detector.ts';
 import { ExternalExecutionAuthorityError } from '../lib/external-execution/types.ts';
 import { computeExecutionGrantIdentity } from '../lib/external-execution/identity.ts';
+import { vercelTeamProjectIdentity } from '../lib/external-execution/provider-account.ts';
 import { DurableExternalExecutionAuthorizer } from '../lib/external-execution/authority.ts';
 import type { GitHubAppConfiguration } from '../lib/github-app/types.ts';
 import { computeCandidateIdentity, sha256 } from '../lib/repair-candidates/identity.ts';
@@ -76,14 +77,14 @@ class MemoryQueue implements TransactionalCandidateVerificationQueue {
   async enqueueVerification(_transaction: never, payload: { version: 1; verificationId: string }) { this.payloads.push(payload); return payload.verificationId; }
 }
 
-async function seed(context: Awaited<ReturnType<typeof createTestContext>>, owner: AuthenticatedWorkspace, baselineOutcome = 'baseline_passed') {
+async function seed(context: Awaited<ReturnType<typeof createTestContext>>, owner: AuthenticatedWorkspace, baselineOutcome = 'baseline_passed', networkPolicy = 'deny-all') {
   const profile = profileIdentity(owner.workspace.id);
   await context.database.insert(githubInstallation).values({ installationId: INSTALLATION_ID, workspaceId: owner.workspace.id, githubAccountId: 7, accountLogin: 'owner', accountType: 'User', status: 'active', createdAt: NOW, updatedAt: NOW });
   await context.database.insert(repository).values({ githubRepositoryId: REPOSITORY_ID, workspaceId: owner.workspace.id, installationId: INSTALLATION_ID, ownerId: 7, ownerLogin: 'owner', name: 'repo', fullName: 'owner/repo', defaultBranch: 'main', isPrivate: false, createdAt: NOW, updatedAt: NOW });
   await context.database.insert(executionProfile).values({ githubRepositoryId: REPOSITORY_ID, workspaceId: owner.workspace.id, installationId: INSTALLATION_ID, profileVersion: 2, profileIdentity: profile, baseCommitSha: COMMIT, runtimeFamily: 'node', nodeMajor: 24, packageManager: 'npm', lockfileType: 'package-lock', installOperation: 'ci', typecheckScript: 'typecheck', buildScript: 'build', testScript: 'test', testRunner: 'vitest', packageJsonBlobSha: PACKAGE_JSON_SHA, packageJsonContentSha256: PACKAGE_JSON_CONTENT, packageLockBlobSha: PACKAGE_LOCK_SHA, packageLockContentSha256: PACKAGE_LOCK_CONTENT, status: 'ready', createdAt: NOW, updatedAt: NOW });
   const baselineId = randomUUID();
   const passed = baselineOutcome === 'baseline_passed';
-  await context.database.insert(repositoryBaseline).values({ id: baselineId, workspaceId: owner.workspace.id, githubRepositoryId: REPOSITORY_ID, installationId: INSTALLATION_ID, evidenceVersion: 1, profileIdentity: profile, baseCommitSha: COMMIT, archiveSha256: 'f'.repeat(64), sandboxName: 'baseline-sandbox', sandboxSessionId: 'baseline-session', sourceIdentityBefore: '1'.repeat(64), sourceIdentityAfter: passed ? '1'.repeat(64) : null, sourceUnchanged: passed ? true : null, credentialsExposure: 'absent', networkPolicy: 'deny-all', installStatus: 'completed', installExitCode: 0, installTimedOut: false, typecheckStatus: 'completed', typecheckExitCode: 0, typecheckTimedOut: false, buildStatus: 'completed', buildExitCode: 0, buildTimedOut: false, testStatus: passed ? 'completed' : 'failed', testExitCode: passed ? 0 : 1, testTimedOut: false, executionOutcome: baselineOutcome, overallOutcome: baselineOutcome, cleanupStop: 'confirmed', cleanupDelete: 'confirmed', cleanupLookup: 'absent', errorPhase: passed ? null : 'test', errorCode: passed ? null : 'npm_command_failed', startedAt: NOW, completedAt: NOW, durationMs: 1 });
+  await context.database.insert(repositoryBaseline).values({ id: baselineId, workspaceId: owner.workspace.id, githubRepositoryId: REPOSITORY_ID, installationId: INSTALLATION_ID, evidenceVersion: 1, profileIdentity: profile, baseCommitSha: COMMIT, archiveSha256: 'f'.repeat(64), sandboxName: 'baseline-sandbox', sandboxSessionId: 'baseline-session', sourceIdentityBefore: '1'.repeat(64), sourceIdentityAfter: passed ? '1'.repeat(64) : null, sourceUnchanged: passed ? true : null, credentialsExposure: 'absent', networkPolicy, installStatus: 'completed', installExitCode: 0, installTimedOut: false, typecheckStatus: 'completed', typecheckExitCode: 0, typecheckTimedOut: false, buildStatus: 'completed', buildExitCode: 0, buildTimedOut: false, testStatus: passed ? 'completed' : 'failed', testExitCode: passed ? 0 : 1, testTimedOut: false, executionOutcome: baselineOutcome, overallOutcome: baselineOutcome, cleanupStop: 'confirmed', cleanupDelete: 'confirmed', cleanupLookup: 'absent', errorPhase: passed ? null : 'test', errorCode: passed ? null : 'npm_command_failed', startedAt: NOW, completedAt: NOW, durationMs: 1 });
   const runId = randomUUID();
   await context.database.insert(repairRun).values({ id: runId, workspaceId: owner.workspace.id, githubRepositoryId: REPOSITORY_ID, installationId: INSTALLATION_ID, profileIdentity: profile, baseCommitSha: COMMIT, idempotencyKey: randomUUID(), state: 'ready_for_investigation', baselineId, baselineOutcome, ...(passed ? {} : { failureClassification: 'customer_baseline_failure', failureCode: baselineOutcome }), createdAt: NOW, baselineStartedAt: NOW, completedAt: NOW, stateChangedAt: NOW, updatedAt: NOW });
   const intentId = randomUUID();
@@ -179,15 +180,17 @@ test('exact-source acquisition uses frozen commit, repository-scoped token, and 
 
 test('missing or untrustworthy baseline evidence fails before source acquisition and cannot become comparable', async (t) => {
   const context = await createTestContext(); t.after(() => context.client.close());
-  const owner = await authenticated(context); const seeded = await seed(context, owner, 'test_failed');
-  await context.database.update(repositoryBaseline).set({ networkPolicy: 'unconfirmed' }).where(eq(repositoryBaseline.id, seeded.baselineId));
+  const owner = await authenticated(context); const seeded = await seed(context, owner, 'test_failed', 'unconfirmed');
   await assert.rejects(startCandidateVerification(context.database, owner, seeded.candidateId, new MemoryQueue()), /verification_authority_mismatch/);
 
-  await context.database.update(repositoryBaseline).set({ networkPolicy: 'deny-all' }).where(eq(repositoryBaseline.id, seeded.baselineId));
-  const verification = await startCandidateVerification(context.database, owner, seeded.candidateId, new MemoryQueue());
-  await context.database.update(repositoryBaseline).set({ credentialsExposure: 'present' }).where(eq(repositoryBaseline.id, seeded.baselineId));
+  const second = await createTestContext(); t.after(() => second.client.close());
+  const secondOwner = await authenticated(second); const clean = await seed(second, secondOwner, 'test_failed');
+  const verification = await startCandidateVerification(second.database, secondOwner, clean.candidateId, new MemoryQueue());
+  // Simulate compromised storage to retain defense-in-depth coverage; ordinary updates are now rejected by the DB guard.
+  await second.database.execute(sql`drop trigger repository_baseline_provenance_guard on repository_baseline`);
+  await second.database.update(repositoryBaseline).set({ credentialsExposure: 'present' }).where(eq(repositoryBaseline.id, clean.baselineId));
   const gateway = new Gateway(); let runnerCalls = 0;
-  await assert.rejects(executeCandidateVerification(context.database, gateway, CONFIGURATION, { verificationId: verification.id, attemptId: randomUUID(), evidenceId: randomUUID() }, { runner: async () => { runnerCalls++; throw new Error('must not run'); } }), /verification_authority_mismatch/);
+  await assert.rejects(executeCandidateVerification(second.database, gateway, CONFIGURATION, { verificationId: verification.id, attemptId: randomUUID(), evidenceId: randomUUID() }, { runner: async () => { runnerCalls++; throw new Error('must not run'); } }), /verification_authority_mismatch/);
   assert.equal(runnerCalls, 0); assert.equal(gateway.calls.length, 0);
 });
 
@@ -252,13 +255,16 @@ test('verification evidence preserves terminal authority errors without scheduli
 
 async function verificationGrants(context: Awaited<ReturnType<typeof createTestContext>>, owner: AuthenticatedWorkspace, seeded: Awaited<ReturnType<typeof seed>>, maximum: number, issuedAt = NOW) {
   const expiresAt = new Date(issuedAt.getTime() + 60_000); const authorizedBy = 'test-operator';
+  const releaseSha = 'd'.repeat(40); const providerAccount = vercelTeamProjectIdentity('team_test', 'project_test');
   const limits = { logicalRequests: maximum, providerAttempts: 96 * maximum, inputTokens: 0, outputTokens: 0, sandboxIdentities: maximum, sandboxRuntimeMs: 600_000 * maximum, verificationAttempts: maximum, repairLoopIterations: 0, maxConcurrentExternalOperations: 1 };
   for (const scope of ['account', 'operation'] as const) {
-    const binding = { version: 1 as const, scope, workspaceId: scope === 'account' ? null : owner.workspace.id,
+    const binding = { version: (scope === 'account' ? 1 : 2) as 1 | 2, scope, workspaceId: scope === 'account' ? null : owner.workspace.id,
       repairRunId: scope === 'account' ? null : seeded.runId, githubRepositoryId: scope === 'account' ? null : REPOSITORY_ID,
       baseCommitSha: scope === 'account' ? null : COMMIT, operationCategory: scope === 'account' ? null : 'sandbox_verification' as const,
       providerId: scope === 'account' ? null : 'vercel', modelId: null, acceptancePurpose: null,
-      sandboxResourceClass: scope === 'account' ? null : 'vcpu_1' as const };
+      sandboxResourceClass: scope === 'account' ? null : 'vcpu_1' as const,
+      authorizedReleaseSha: scope === 'account' ? null : releaseSha,
+      authorizedProviderAccountIdentity: scope === 'account' ? null : providerAccount };
     const { sandboxResourceClass, ...identityBinding } = binding;
     const grantLimits = { ...limits, ...(sandboxResourceClass ? { sandboxResourceClass } : {}), maxConcurrentExternalOperations: scope === 'account' ? 1 : 0 };
     await context.database.insert(executionBudgetGrant).values({ ...binding, id: randomUUID(), maxLogicalRequests: maximum, maxProviderAttempts: 96 * maximum,
@@ -302,12 +308,13 @@ test('durable run ambiguity rejects explicit verification start before row inser
   const context = await createTestContext(); t.after(() => context.client.close());
   const owner = await authenticated(context); const seeded = await seed(context, owner);
   await verificationGrants(context, owner, seeded, 1);
-  const authority = new DurableExternalExecutionAuthorizer(context.database, { clock: () => NOW });
+  const authority = new DurableExternalExecutionAuthorizer(context.database, { clock: () => NOW, runtimeReleaseSha: 'd'.repeat(40) });
   const permit = await authority.reserve({ scope: { workspaceId: owner.workspace.id, repairRunId: seeded.runId, githubRepositoryId: REPOSITORY_ID,
     baseCommitSha: COMMIT, operationCategory: 'sandbox_verification', providerId: 'vercel' },
     amounts: { logicalRequests: 1, providerAttempts: 1, inputTokens: 0, outputTokens: 0, sandboxIdentities: 0, sandboxRuntimeMs: 0,
       verificationAttempts: 0, repairLoopIterations: 0, sandboxResourceClass: 'vcpu_1' },
-    sandbox: { name: 'known-verifier', projectId: 'project_test', teamId: 'team_test' } });
+    sandbox: { name: 'known-verifier', projectId: 'project_test', teamId: 'team_test' },
+    providerAccountIdentity: vercelTeamProjectIdentity('team_test', 'project_test') });
   const ordinal = await permit.beginProviderAttempt();
   await permit.finishProviderAttempt(ordinal, 'ambiguous'); await permit.complete('ambiguous', 'provider_attempt_ambiguous');
   const queue = new MemoryQueue();
@@ -324,12 +331,13 @@ test('expired unmatched provider start blocks stale verification restart without
   await context.database.insert(candidateVerificationAttempt).values({ id: randomUUID(), verificationId: verification.id, queueJobId: verification.id,
     attemptNumber: 1, expectedEvidenceId: randomUUID(), ownershipToken: randomUUID(), state: 'active', claimedAt: NOW, heartbeatAt: NOW,
     leaseExpiresAt: new Date(NOW.getTime() + 90_000) });
-  const permit = await new DurableExternalExecutionAuthorizer(context.database, { clock: () => NOW }).reserve({
+  const permit = await new DurableExternalExecutionAuthorizer(context.database, { clock: () => NOW, runtimeReleaseSha: 'd'.repeat(40) }).reserve({
     scope: { workspaceId: owner.workspace.id, repairRunId: seeded.runId, githubRepositoryId: REPOSITORY_ID, baseCommitSha: COMMIT,
       operationCategory: 'sandbox_verification', providerId: 'vercel' },
     amounts: { logicalRequests: 1, providerAttempts: 1, inputTokens: 0, outputTokens: 0, sandboxIdentities: 0, sandboxRuntimeMs: 0,
       verificationAttempts: 0, repairLoopIterations: 0, sandboxResourceClass: 'vcpu_1' },
-    sandbox: { name: 'unresolved-verifier', projectId: 'project_test', teamId: 'team_test' } });
+    sandbox: { name: 'unresolved-verifier', projectId: 'project_test', teamId: 'team_test' },
+    providerAccountIdentity: vercelTeamProjectIdentity('team_test', 'project_test') });
   await permit.beginProviderAttempt(); // Lost ownership before any trustworthy outcome was persisted.
   let executions = 0;
   const result = await processCandidateVerificationJob(job(verification.id), { configuration: CONFIGURATION, database: context.database, gateway: new Gateway(), logger,

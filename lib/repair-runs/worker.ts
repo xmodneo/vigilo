@@ -282,7 +282,8 @@ async function finalizeFromEvidence(
       cleanup,
     });
     if (!owned) return { id: attempt.queueJobId, status: 'failed', output: { code: 'attempt_ownership_lost' } };
-    await transitionRepairRun(dependencies.database, run.workspaceId, run.id, 'baseline_running', target, now, { baselineId: evidence.id, eventId: (dependencies.randomId ?? randomUUID)() });
+    await transitionRepairRun(dependencies.database, run.workspaceId, run.id, 'baseline_running', target, now,
+      { baselineId: evidence.id, eventId: (dependencies.randomId ?? randomUUID)(), finalizeSourceCheckpoint: true });
     dependencies.logger.write({ event: 'run_finalized', runId: run.id, attemptId: attempt.id, outcome: target });
     return { id: attempt.queueJobId, status: 'completed' };
   }
@@ -343,6 +344,7 @@ async function reconcileCompletedAttempt(dependencies: RepairWorkerDependencies,
   await transitionRepairRun(dependencies.database, claim.run.workspaceId, claim.run.id, 'baseline_running', target, (dependencies.clock ?? (() => new Date()))(), {
     baselineId: evidence.id,
     eventId: (dependencies.randomId ?? randomUUID)(),
+    finalizeSourceCheckpoint: true,
   });
   dependencies.logger.write({ event: 'run_finalized', runId: claim.run.id, attemptId: claim.attempt.id, outcome: target });
   return { id: claim.attempt.queueJobId, status: 'completed' };

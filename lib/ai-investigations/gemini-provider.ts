@@ -3,6 +3,7 @@ import { GoogleGenAI, type Interactions } from '@google/genai';
 import { ModelProviderError, type InvestigationModelProvider, type InvestigationModelSession, type ModelTurn } from './types.ts';
 import { FINALIZATION_INPUT } from './protocol.ts';
 import { ExternalExecutionAuthorityError, ZERO_EXTERNAL_EXECUTION_AUTHORITY, type ExternalExecutionAuthorizer } from '../external-execution/types.ts';
+import { googleProjectIdentity, type ProviderAccountIdentity } from '../external-execution/provider-account.ts';
 
 interface GeminiInteractionsClient {
   create(
@@ -82,6 +83,15 @@ export function readModelApiKey(environment: NodeJS.ProcessEnv = process.env): s
   return value;
 }
 
+/** Project identity is operator-attested configuration, not proof of API-key ownership. */
+export function readGeminiProviderConfiguration(environment: NodeJS.ProcessEnv = process.env): { apiKey: string; accountIdentity: ProviderAccountIdentity } {
+  const apiKey = readModelApiKey(environment);
+  const projectId = environment.GEMINI_PROJECT_ID;
+  if (!projectId) throw new ModelProviderError('provider_configuration_failed');
+  try { return { apiKey, accountIdentity: googleProjectIdentity(projectId) }; }
+  catch { throw new ModelProviderError('provider_configuration_failed'); }
+}
+
 function parseFunctionCalls(steps: Interactions.Step[]): Array<{ callId: string; name: string; arguments: unknown }> {
   const calls = [];
   for (const step of steps) {
@@ -108,6 +118,7 @@ export class GeminiInvestigationProvider implements InvestigationModelProvider {
     readonly modelId = 'gemini-3.1-flash-lite',
     private readonly client: GeminiInteractionsClient = new GoogleGenAI({ apiKey }).interactions,
     private readonly executionAuthority: ExternalExecutionAuthorizer = ZERO_EXTERNAL_EXECUTION_AUTHORITY,
+    private readonly accountIdentity?: ProviderAccountIdentity,
   ) {}
 
   createSession(configuration: Parameters<InvestigationModelProvider['createSession']>[0]): InvestigationModelSession {
@@ -150,6 +161,7 @@ export class GeminiInvestigationProvider implements InvestigationModelProvider {
         if (!configuration.externalExecutionScope) throw new ModelProviderError('provider_configuration_failed');
         const permit = await this.executionAuthority.reserve({
           scope: configuration.externalExecutionScope,
+          ...(this.accountIdentity ? { providerAccountIdentity: this.accountIdentity } : {}),
           amounts: {
             logicalRequests: 1,
             providerAttempts: 1,

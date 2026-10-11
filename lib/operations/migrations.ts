@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
-export const EXPECTED_SCHEMA_VERSION = '0023' as const;
+export const EXPECTED_SCHEMA_VERSION = '0024' as const;
 
 export const MIGRATION_MANIFEST = [
   { tag: '0000_auth-workspace', hash: 'd9d6792a7ecd363a0a372e8d1b2c6eb297f314d7c1d85a85753550b50018a3e3', createdAt: 1788660000589 },
@@ -29,6 +29,7 @@ export const MIGRATION_MANIFEST = [
   { tag: '0021_repair-publication', hash: 'db986bb804e3e20b8f9a90b06972c1a4373795855a1e14646d35f036c97a9343', createdAt: 1790589600000 },
   { tag: '0022_external-execution-authority', hash: 'f3d058dad152612831373e785ebd0be46d681d07f1e9c3c067cc3e8c665ca625', createdAt: 1790676000000 },
   { tag: '0023_operational-readiness', hash: '7cf93d6e3801886667cf7ecfe620f92985fa687c58b076b1fac522c25bc83bc7', createdAt: 1790762400000 },
+  { tag: '0024_execution-provenance', hash: '5cd5c384598cf9bed856d3fbb7c590819732a01d23ab81ac1395028838aaf16e', createdAt: 1790848800000 },
 ] as const;
 
 export interface MigrationLedgerEntry {

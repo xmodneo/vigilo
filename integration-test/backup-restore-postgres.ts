@@ -187,7 +187,7 @@ try {
   });
   assert.deepEqual(baselineRecovery, { id: baselineJobId, status: 'deadletter', output: { code: 'run_not_found' } });
   assert.equal(gatewayCalls, 0);
-  process.stdout.write(`${JSON.stringify({ migrations: '0000-0023', archive: 'validated', representativeJobs: 2, identities: 'preserved', effectiveExternalAuthority: 0, restoredRecoveryExternalCalls: 0, result: 'passed' })}\n`);
+  process.stdout.write(`${JSON.stringify({ migrations: '0000-0024', archive: 'validated', representativeJobs: 2, identities: 'preserved', effectiveExternalAuthority: 0, restoredRecoveryExternalCalls: 0, result: 'passed' })}\n`);
 } finally {
   try { await boss?.stop({ graceful: false }); } catch { /* best effort */ }
   try { await source?.end({ timeout: 1 }); } catch { /* best effort */ }

@@ -4,6 +4,7 @@ import { fileURLToPath } from 'node:url';
 import { drizzle } from 'drizzle-orm/postgres-js';
 import { migrate } from 'drizzle-orm/postgres-js/migrator';
 import postgres from 'postgres';
+import { MIGRATION_MANIFEST } from '../lib/operations/migrations.ts';
 
 const configuredUrl = process.env.DATABASE_URL;
 if (!configuredUrl) throw new Error('missing_required_environment:DATABASE_URL');
@@ -120,9 +121,18 @@ try {
       (select tgname from pg_trigger where tgname = 'operational_worker_heartbeat_guard' and not tgisinternal) as "heartbeatGuard",
       (select count(*)::int from drizzle.__drizzle_migrations) as "ledgerCount"
   `;
-  const operationalPassed = operationalFacts?.heartbeat === 'operational_worker_heartbeat' && operationalFacts.bucket === 'http_rate_limit_bucket' && operationalFacts.heartbeatGuard === 'operational_worker_heartbeat_guard' && operationalFacts.ledgerCount === 24;
-  if (!passed || !reviewPassed || !publicationPassed || !authorityPassed || !operationalPassed) throw new Error('clean_migration_probe_failed');
-  process.stdout.write(`${JSON.stringify({ migrations: '0000-0023', repairRunAttempt: 'present', investigation: 'present', repairCandidate: 'present', candidateVerification: 'present', aiInvestigation: 'present', aiCandidateGeneration: 'present', repairLoop: 'present', humanReview: 'present', repairPublication: 'present', externalExecutionAuthority: 'present', releaseAcceptance: 'present', operationalReadiness: 'present', constraints: 'current', result: 'passed' })}\n`);
+  const operationalPassed = operationalFacts?.heartbeat === 'operational_worker_heartbeat' && operationalFacts.bucket === 'http_rate_limit_bucket' && operationalFacts.heartbeatGuard === 'operational_worker_heartbeat_guard' && operationalFacts.ledgerCount === 25;
+  const [provenanceFacts] = await probe<{ checkpoint: string | null; grantRelease: string | null; reservationRelease: string | null; guardCount: number }[]>`
+    select to_regclass('public.repair_run_source_checkpoint')::text as checkpoint,
+      (select column_name from information_schema.columns where table_schema = 'public' and table_name = 'execution_budget_grant' and column_name = 'authorized_release_sha') as "grantRelease",
+      (select column_name from information_schema.columns where table_schema = 'public' and table_name = 'external_execution_reservation' and column_name = 'executing_release_sha') as "reservationRelease",
+      (select count(*)::int from pg_trigger where tgname in ('execution_budget_grant_insert_provenance_guard','repair_run_provenance_guard','repository_baseline_provenance_guard','repair_run_source_checkpoint_guard','external_execution_reservation_provenance_guard','external_execution_event_provenance_guard') and not tgisinternal) as "guardCount"
+  `;
+  const ledger = await probe<{ hash: string }[]>`select hash from drizzle.__drizzle_migrations order by id`;
+  const provenancePassed = provenanceFacts?.checkpoint === 'repair_run_source_checkpoint' && provenanceFacts.grantRelease === 'authorized_release_sha' && provenanceFacts.reservationRelease === 'executing_release_sha' && provenanceFacts.guardCount === 6 &&
+    JSON.stringify(ledger.map((row) => row.hash)) === JSON.stringify(MIGRATION_MANIFEST.map((entry) => entry.hash));
+  if (!passed || !reviewPassed || !publicationPassed || !authorityPassed || !operationalPassed || !provenancePassed) throw new Error('clean_migration_probe_failed');
+  process.stdout.write(`${JSON.stringify({ migrations: '0000-0024', repairRunAttempt: 'present', investigation: 'present', repairCandidate: 'present', candidateVerification: 'present', aiInvestigation: 'present', repairLoop: 'present', humanReview: 'present', repairPublication: 'present', externalExecutionAuthority: 'present', releaseAcceptance: 'present', operationalReadiness: 'present', executionProvenance: 'present', constraints: 'current', result: 'passed' })}\n`);
 } finally {
   if (probe) await probe.end();
   await admin`select pg_terminate_backend(pid) from pg_stat_activity where datname = ${databaseName} and pid <> pg_backend_pid()`;

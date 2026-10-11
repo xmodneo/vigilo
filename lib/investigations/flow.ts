@@ -7,6 +7,7 @@ import type { AuthenticatedWorkspace } from '../auth/protected-context.ts';
 import type { VigiloDatabase } from '../db/types.ts';
 import { RepositoryPolicyError, assertPublicRepositoryAuthority } from '../github-repositories/policy.ts';
 import { matchesRepairRunEvidence } from '../repair-runs/flow.ts';
+import { assertMatchedSourceCheckpoint } from '../external-execution/source-checkpoint.ts';
 import { INVESTIGATION_JOB_VERSION, type TransactionalInvestigationQueue } from '../repair-runs/queue.ts';
 import { CONTEXT_BUDGET } from './policy.ts';
 import type { InvestigationResult } from './types.ts';
@@ -94,6 +95,7 @@ export async function createInvestigation(
       ]);
       if (!intent) throw new InvestigationError('repair_intent_missing');
       if (!baseline || !matchesRepairRunEvidence(run, baseline) || !TRUSTWORTHY_OUTCOMES.has(baseline.overallOutcome)) throw new InvestigationError('baseline_evidence_mismatch');
+      await assertMatchedSourceCheckpoint(transaction, run.id);
 
       const [created] = await transaction.insert(investigation).values({
         id: randomId(), repairRunId: run.id, repairIntentId: intent.id, workspaceId: run.workspaceId,

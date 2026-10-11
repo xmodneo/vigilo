@@ -7,6 +7,7 @@ import type { VigiloDatabase } from '../lib/db/types.ts';
 import { resolveExecutionAvailability } from '../lib/external-execution/availability.ts';
 import { DurableExternalExecutionAuthorizer } from '../lib/external-execution/authority.ts';
 import { computeExecutionGrantIdentity } from '../lib/external-execution/identity.ts';
+import { googleProjectIdentity } from '../lib/external-execution/provider-account.ts';
 import type { ExternalExecutionAmounts, ExternalExecutionScope } from '../lib/external-execution/types.ts';
 import { createTestContext } from './support.ts';
 
@@ -41,6 +42,8 @@ const generous = {
   logicalRequests: 5, providerAttempts: 5, inputTokens: 10_000, outputTokens: 5_000,
   sandboxIdentities: 0, sandboxRuntimeMs: 0, verificationAttempts: 0, repairLoopIterations: 0,
 };
+const RELEASE_SHA = 'd'.repeat(40);
+const GOOGLE_ACCOUNT = googleProjectIdentity('test-project');
 
 async function seedAuthority(options: { expiresAt?: Date; operationLogicalRequests?: number; concurrency?: number; includeOperation?: boolean; invalidOperationIdentity?: boolean } = {}) {
   const context = await createTestContext();
@@ -59,13 +62,18 @@ async function seedAuthority(options: { expiresAt?: Date; operationLogicalReques
   });
   const operationId = randomUUID();
   const limits = { ...generous, logicalRequests: options.operationLogicalRequests ?? generous.logicalRequests, maxConcurrentExternalOperations: 0 };
-  const scope: ExternalExecutionScope = { workspaceId, operationCategory: 'gemini_investigation', providerId: 'google', modelId: 'gemini-3.1-flash-lite' };
+  const scope: ExternalExecutionScope = { workspaceId, repairRunId: randomUUID(), githubRepositoryId: 42,
+    baseCommitSha: 'a'.repeat(40), operationCategory: 'gemini_investigation', providerId: 'google', modelId: 'gemini-3.1-flash-lite' };
+  await context.database.insert(repairRun).values({ id: scope.repairRunId!, workspaceId, githubRepositoryId: 42, installationId: 77,
+    profileIdentity: 'b'.repeat(64), baseCommitSha: scope.baseCommitSha!, idempotencyKey: randomUUID(), state: 'created', stateChangedAt: now, updatedAt: now });
   if (options.includeOperation !== false) await context.database.insert(executionBudgetGrant).values({
-    id: operationId, version: 1, scope: 'operation', workspaceId, operationCategory: scope.operationCategory, providerId: scope.providerId, modelId: scope.modelId,
+    id: operationId, version: 2, scope: 'operation', workspaceId, repairRunId: scope.repairRunId, githubRepositoryId: scope.githubRepositoryId,
+    baseCommitSha: scope.baseCommitSha, operationCategory: scope.operationCategory, providerId: scope.providerId, modelId: scope.modelId,
+    authorizedReleaseSha: RELEASE_SHA, authorizedProviderAccountIdentity: GOOGLE_ACCOUNT,
     maxLogicalRequests: limits.logicalRequests, maxProviderAttempts: limits.providerAttempts, maxInputTokens: limits.inputTokens, maxOutputTokens: limits.outputTokens,
     maxSandboxIdentities: 0, maxSandboxRuntimeMs: 0, maxVerificationAttempts: 0, maxRepairLoopIterations: 0, maxConcurrentExternalOperations: 0,
     expiresAt, authorizedBy: 'test-operator', createdAt: now,
-    grantIdentity: options.invalidOperationIdentity ? 'f'.repeat(64) : computeExecutionGrantIdentity({ version: 1, scope: 'operation', workspaceId, repairRunId: null, githubRepositoryId: null, baseCommitSha: null, operationCategory: scope.operationCategory, providerId: scope.providerId, modelId: scope.modelId ?? null, acceptancePurpose: null, limits, expiresAt: expiresAt.toISOString(), authorizedBy: 'test-operator' }),
+    grantIdentity: options.invalidOperationIdentity ? 'f'.repeat(64) : computeExecutionGrantIdentity({ version: 2, scope: 'operation', workspaceId, repairRunId: scope.repairRunId!, githubRepositoryId: scope.githubRepositoryId!, baseCommitSha: scope.baseCommitSha!, operationCategory: scope.operationCategory, providerId: scope.providerId, modelId: scope.modelId ?? null, acceptancePurpose: null, limits, expiresAt: expiresAt.toISOString(), authorizedBy: 'test-operator', authorizedReleaseSha: RELEASE_SHA, authorizedProviderAccountIdentity: GOOGLE_ACCOUNT }),
   });
   return { context, now, workspaceId, scope, operationId, accountId };
 }
@@ -90,7 +98,7 @@ test('read-only execution availability distinguishes ready, readiness, expiry, e
   await t.test('capacity unavailable without resolver mutation', async () => {
     const seeded = await seedAuthority({ concurrency: 1 });
     const amounts: ExternalExecutionAmounts = { logicalRequests: 1, providerAttempts: 1, inputTokens: 100, outputTokens: 100, sandboxIdentities: 0, sandboxRuntimeMs: 0, verificationAttempts: 0, repairLoopIterations: 0 };
-    await new DurableExternalExecutionAuthorizer(seeded.context.database, { clock: () => seeded.now }).reserve({ scope: seeded.scope, amounts });
+    await new DurableExternalExecutionAuthorizer(seeded.context.database, { clock: () => seeded.now, runtimeReleaseSha: RELEASE_SHA }).reserve({ scope: seeded.scope, amounts, providerAccountIdentity: GOOGLE_ACCOUNT });
     const before = (await seeded.context.database.select().from(externalExecutionReservation)).length;
     assert.deepEqual(await resolveExecutionAvailability(seeded.context.database, seeded.workspaceId, { clock: () => seeded.now, operationalReady: true }), { status: 'capacity_unavailable' });
     assert.equal((await seeded.context.database.select().from(externalExecutionReservation)).length, before);
@@ -107,16 +115,16 @@ test('read-only execution availability distinguishes ready, readiness, expiry, e
   });
   await t.test('one-shot release authority never enables general provider actions', async () => {
     const seeded = await seedAuthority({ includeOperation: false });
-    const runId = randomUUID(); const repositoryId = 42; const baseCommitSha = 'a'.repeat(40); const purpose = 'task_4_3_live_acceptance';
-    await seeded.context.database.insert(repairRun).values({ id: runId, workspaceId: seeded.workspaceId, githubRepositoryId: repositoryId, installationId: 77, profileIdentity: 'b'.repeat(64), baseCommitSha, idempotencyKey: randomUUID(), state: 'created', stateChangedAt: seeded.now, updatedAt: seeded.now });
+    const runId = seeded.scope.repairRunId!; const repositoryId = 42; const baseCommitSha = 'a'.repeat(40); const purpose = 'task_4_3_live_acceptance';
     const limits = { ...generous, logicalRequests: 1, providerAttempts: 0, maxConcurrentExternalOperations: 0 };
     await seeded.context.database.insert(executionBudgetGrant).values({
-      id: randomUUID(), version: 1, scope: 'one_shot', workspaceId: seeded.workspaceId, repairRunId: runId, githubRepositoryId: repositoryId, baseCommitSha,
+      id: randomUUID(), version: 2, scope: 'one_shot', workspaceId: seeded.workspaceId, repairRunId: runId, githubRepositoryId: repositoryId, baseCommitSha,
       operationCategory: 'release_acceptance_one_shot', providerId: 'vigilo', acceptancePurpose: purpose,
+      authorizedReleaseSha: RELEASE_SHA,
       maxLogicalRequests: limits.logicalRequests, maxProviderAttempts: limits.providerAttempts, maxInputTokens: limits.inputTokens, maxOutputTokens: limits.outputTokens,
       maxSandboxIdentities: limits.sandboxIdentities, maxSandboxRuntimeMs: limits.sandboxRuntimeMs, maxVerificationAttempts: limits.verificationAttempts,
       maxRepairLoopIterations: limits.repairLoopIterations, maxConcurrentExternalOperations: 0, expiresAt: new Date('2026-09-30T10:00:00.000Z'), authorizedBy: 'release-operator', createdAt: seeded.now,
-      grantIdentity: computeExecutionGrantIdentity({ version: 1, scope: 'one_shot', workspaceId: seeded.workspaceId, repairRunId: runId, githubRepositoryId: repositoryId, baseCommitSha, operationCategory: 'release_acceptance_one_shot', providerId: 'vigilo', modelId: null, acceptancePurpose: purpose, limits, expiresAt: '2026-09-30T10:00:00.000Z', authorizedBy: 'release-operator' }),
+      grantIdentity: computeExecutionGrantIdentity({ version: 2, scope: 'one_shot', workspaceId: seeded.workspaceId, repairRunId: runId, githubRepositoryId: repositoryId, baseCommitSha, operationCategory: 'release_acceptance_one_shot', providerId: 'vigilo', modelId: null, acceptancePurpose: purpose, limits, expiresAt: '2026-09-30T10:00:00.000Z', authorizedBy: 'release-operator', authorizedReleaseSha: RELEASE_SHA, authorizedProviderAccountIdentity: null }),
     });
     assert.deepEqual(await resolveExecutionAvailability(seeded.context.database, seeded.workspaceId, { clock: () => seeded.now, operationalReady: true }), { status: 'no_authority' });
     await seeded.context.client.close();

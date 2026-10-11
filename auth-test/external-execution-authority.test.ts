@@ -16,12 +16,13 @@ import {
   user,
   workspace,
 } from '../db/schema.ts';
-import { DurableExternalExecutionAuthorizer } from '../lib/external-execution/authority.ts';
+import { DurableExternalExecutionAuthorizer as ProductionExternalExecutionAuthorizer } from '../lib/external-execution/authority.ts';
 import { GeminiInvestigationProvider } from '../lib/ai-investigations/gemini-provider.ts';
 import { MODEL_INSTRUCTIONS, MODEL_TOOLS, CONCLUSION_SCHEMA, buildInitialInput } from '../lib/ai-investigations/protocol.ts';
 import { AI_CANDIDATE_PROPOSAL_INSTRUCTIONS, AI_CANDIDATE_PROPOSAL_TOOLS, AI_CANDIDATE_PROPOSAL_PROVIDER_SCHEMA, buildAiCandidateProposalInput } from '../lib/ai-candidate-generations/protocol.ts';
 import { computeExecutionGrantIdentity, computeExecutionReservationIdentity } from '../lib/external-execution/identity.ts';
-import { ExternalExecutionAuthorityError, type ExternalExecutionAmounts, type ExternalExecutionScope } from '../lib/external-execution/types.ts';
+import { googleProjectIdentity, vercelTeamProjectIdentity } from '../lib/external-execution/provider-account.ts';
+import { ExternalExecutionAuthorityError, type ExternalExecutionAmounts, type ExternalExecutionReservationRequest, type ExternalExecutionScope } from '../lib/external-execution/types.ts';
 import { createTestContext } from './support.ts';
 
 const scopeLimits: ExternalExecutionAmounts & { maxConcurrentExternalOperations: number } = {
@@ -36,6 +37,24 @@ const scopeLimits: ExternalExecutionAmounts & { maxConcurrentExternalOperations:
   maxConcurrentExternalOperations: 0,
 };
 
+const TEST_RELEASE_SHA = 'd'.repeat(40);
+const testProviderAccount = (providerId: string) => providerId === 'google'
+  ? googleProjectIdentity('test-project')
+  : providerId === 'vigilo' ? null : vercelTeamProjectIdentity('team_test', 'project_test');
+
+// Existing transport-envelope tests use fully authorized v2 fixtures. Dedicated
+// provenance tests exercise missing/mismatched identity with the production class.
+class DurableExternalExecutionAuthorizer extends ProductionExternalExecutionAuthorizer {
+  constructor(database: ConstructorParameters<typeof ProductionExternalExecutionAuthorizer>[0], options: ConstructorParameters<typeof ProductionExternalExecutionAuthorizer>[1] = {}) {
+    super(database, { ...options, runtimeReleaseSha: options?.runtimeReleaseSha ?? TEST_RELEASE_SHA });
+  }
+
+  override reserve(request: ExternalExecutionReservationRequest) {
+    const identity = request.providerAccountIdentity ?? testProviderAccount(request.scope.providerId);
+    return super.reserve({ ...request, ...(identity === null ? {} : { providerAccountIdentity: identity }) });
+  }
+}
+
 const amount = (overrides: Partial<ExternalExecutionAmounts> = {}): ExternalExecutionAmounts => ({
   logicalRequests: 1, providerAttempts: 1, inputTokens: 100, outputTokens: 100,
   sandboxIdentities: 0, sandboxRuntimeMs: 0, verificationAttempts: 0, repairLoopIterations: 0,
@@ -45,19 +64,21 @@ const amount = (overrides: Partial<ExternalExecutionAmounts> = {}): ExternalExec
 async function addOperationGrant(value: Awaited<ReturnType<typeof seeded>>, scope: ExternalExecutionScope, overrides: Partial<typeof scopeLimits>) {
   const limits = { ...scopeLimits, ...overrides };
   await value.context.database.insert(executionBudgetGrant).values({
-    id: randomUUID(), version: 1, scope: 'operation', workspaceId: scope.workspaceId,
+    id: randomUUID(), version: 2, scope: 'operation', workspaceId: scope.workspaceId,
     repairRunId: scope.repairRunId, githubRepositoryId: scope.githubRepositoryId, baseCommitSha: scope.baseCommitSha,
     operationCategory: scope.operationCategory, providerId: scope.providerId, modelId: scope.modelId,
+    authorizedReleaseSha: TEST_RELEASE_SHA, authorizedProviderAccountIdentity: testProviderAccount(scope.providerId),
     maxLogicalRequests: limits.logicalRequests, maxProviderAttempts: limits.providerAttempts,
     maxInputTokens: limits.inputTokens, maxOutputTokens: limits.outputTokens, maxSandboxIdentities: limits.sandboxIdentities,
     maxSandboxRuntimeMs: limits.sandboxRuntimeMs, sandboxResourceClass: limits.sandboxResourceClass,
     maxVerificationAttempts: limits.verificationAttempts,
     maxRepairLoopIterations: limits.repairLoopIterations, maxConcurrentExternalOperations: 0,
     expiresAt: new Date('2026-09-24T10:00:00.000Z'), authorizedBy: 'test-operator', createdAt: value.now,
-    grantIdentity: computeExecutionGrantIdentity({ version: 1, scope: 'operation', workspaceId: scope.workspaceId,
+    grantIdentity: computeExecutionGrantIdentity({ version: 2, scope: 'operation', workspaceId: scope.workspaceId,
       repairRunId: scope.repairRunId ?? null, githubRepositoryId: scope.githubRepositoryId ?? null, baseCommitSha: scope.baseCommitSha ?? null,
       operationCategory: scope.operationCategory, providerId: scope.providerId, modelId: scope.modelId ?? null,
-      acceptancePurpose: null, limits, expiresAt: '2026-09-24T10:00:00.000Z', authorizedBy: 'test-operator' }),
+      acceptancePurpose: null, limits, expiresAt: '2026-09-24T10:00:00.000Z', authorizedBy: 'test-operator',
+      authorizedReleaseSha: TEST_RELEASE_SHA, authorizedProviderAccountIdentity: testProviderAccount(scope.providerId) }),
   });
 }
 
@@ -605,10 +626,11 @@ for (const failure of ['network', '429', '503'] as const) test(`installed Sandbo
     return new Response('{}', { status: Number(failure), headers: { 'Retry-After': '0' } });
   } });
   const permit = await authority.reserve({ scope: value.scope, amounts: amount({ providerAttempts: 3 }), sandbox: sandboxContext });
-  await assert.rejects(Sandbox.get({ token: 'fake-opaque-access-token', teamId: 'team_test', projectId: 'project_test', name: 'test', resume: false, fetch: permit.meteredFetch }), failure === 'network' ? TypeError : APIError);
-  assert.equal(rawCalls, 3); assert.equal(globalCalls, 0);
-  assert.equal((await value.context.database.select().from(externalExecutionEvent)).filter((event) => event.eventType === 'attempt_started').length, 3);
-  assert.equal((await value.context.database.select().from(externalExecutionEvent)).filter((event) => event.eventType === (failure === 'network' ? 'attempt_ambiguous' : 'attempt_failed')).length, 3);
+  await assert.rejects(Sandbox.get({ token: 'fake-opaque-access-token', teamId: 'team_test', projectId: 'project_test', name: 'test', resume: false, fetch: permit.meteredFetch }), failure === 'network' ? ExternalExecutionAuthorityError : APIError);
+  const expectedAttempts = failure === 'network' ? 1 : 3;
+  assert.equal(rawCalls, expectedAttempts); assert.equal(globalCalls, 0);
+  assert.equal((await value.context.database.select().from(externalExecutionEvent)).filter((event) => event.eventType === 'attempt_started').length, expectedAttempts);
+  assert.equal((await value.context.database.select().from(externalExecutionEvent)).filter((event) => event.eventType === (failure === 'network' ? 'attempt_ambiguous' : 'attempt_failed')).length, expectedAttempts);
 });
 
 test('cancelled transport cannot consume or dispatch the next attempt', async (t) => {
@@ -693,14 +715,12 @@ async function seeded(options: { scope?: Partial<ExternalExecutionScope>; runBou
   await context.database.insert(workspace).values({ id: workspaceId, ownerUserId: userId, createdAt: now, updatedAt: now });
   const scope: ExternalExecutionScope = { workspaceId, operationCategory: 'gemini_investigation', providerId: 'google', modelId: 'gemini-3.1-flash-lite', ...options.scope };
   if (scope.operationCategory.startsWith('sandbox_')) delete scope.modelId;
-  if (options.runBound) {
-    scope.repairRunId = randomUUID(); scope.githubRepositoryId = 42; scope.baseCommitSha = 'a'.repeat(40);
-    await context.database.insert(repairRun).values({
-      id: scope.repairRunId, workspaceId, githubRepositoryId: 42, installationId: 77,
-      profileIdentity: 'b'.repeat(64), baseCommitSha: scope.baseCommitSha, idempotencyKey: randomUUID(), state: 'created',
-      stateChangedAt: now, updatedAt: now,
-    });
-  }
+  scope.repairRunId = randomUUID(); scope.githubRepositoryId = 42; scope.baseCommitSha = 'a'.repeat(40);
+  await context.database.insert(repairRun).values({
+    id: scope.repairRunId, workspaceId, githubRepositoryId: 42, installationId: 77,
+    profileIdentity: 'b'.repeat(64), baseCommitSha: scope.baseCommitSha, idempotencyKey: randomUUID(), state: 'created',
+    stateChangedAt: now, updatedAt: now,
+  });
   const expiresAt = options.expiresAt ?? new Date('2026-09-24T10:00:00.000Z');
   const limits = { ...scopeLimits, ...options.limits };
   const accountId = randomUUID();
@@ -717,16 +737,17 @@ async function seeded(options: { scope?: Partial<ExternalExecutionScope>; runBou
   });
   const grantId = randomUUID();
   await context.database.insert(executionBudgetGrant).values({
-    id: grantId, version: 1, scope: 'operation', workspaceId, operationCategory: scope.operationCategory,
+    id: grantId, version: 2, scope: 'operation', workspaceId, operationCategory: scope.operationCategory,
     repairRunId: scope.repairRunId, githubRepositoryId: scope.githubRepositoryId, baseCommitSha: scope.baseCommitSha,
     providerId: scope.providerId, modelId: scope.modelId,
+    authorizedReleaseSha: TEST_RELEASE_SHA, authorizedProviderAccountIdentity: testProviderAccount(scope.providerId),
     maxLogicalRequests: limits.logicalRequests, maxProviderAttempts: limits.providerAttempts,
     maxInputTokens: limits.inputTokens, maxOutputTokens: limits.outputTokens,
     maxSandboxIdentities: limits.sandboxIdentities, maxSandboxRuntimeMs: limits.sandboxRuntimeMs,
     sandboxResourceClass: limits.sandboxResourceClass,
     maxVerificationAttempts: limits.verificationAttempts, maxRepairLoopIterations: limits.repairLoopIterations,
     maxConcurrentExternalOperations: 0, expiresAt, authorizedBy: 'test-operator',
-    grantIdentity: options.malformedOperationIdentity ? 'f'.repeat(64) : computeExecutionGrantIdentity({ version: 1, scope: 'operation', workspaceId, repairRunId: scope.repairRunId ?? null, githubRepositoryId: scope.githubRepositoryId ?? null, baseCommitSha: scope.baseCommitSha ?? null, operationCategory: scope.operationCategory, providerId: scope.providerId, modelId: scope.modelId ?? null, acceptancePurpose: null, limits, expiresAt: expiresAt.toISOString(), authorizedBy: 'test-operator' }),
+    grantIdentity: options.malformedOperationIdentity ? 'f'.repeat(64) : computeExecutionGrantIdentity({ version: 2, scope: 'operation', workspaceId, repairRunId: scope.repairRunId ?? null, githubRepositoryId: scope.githubRepositoryId ?? null, baseCommitSha: scope.baseCommitSha ?? null, operationCategory: scope.operationCategory, providerId: scope.providerId, modelId: scope.modelId ?? null, acceptancePurpose: null, limits, expiresAt: expiresAt.toISOString(), authorizedBy: 'test-operator', authorizedReleaseSha: TEST_RELEASE_SHA, authorizedProviderAccountIdentity: testProviderAccount(scope.providerId) }),
     createdAt: now,
   });
   return { context, now, scope, grantId, accountId };
@@ -762,16 +783,20 @@ test('event audit rows require an existing lease and event-type-compatible facts
   const operationKey = randomUUID();
   const fence = 999;
   const [reservation] = await seededValue.context.database.insert(externalExecutionReservation).values({
-    id: randomUUID(), version: 1, grantId: seededValue.grantId, accountGrantId: seededValue.accountId,
+    id: randomUUID(), version: 2, grantId: seededValue.grantId, accountGrantId: seededValue.accountId,
     workspaceId: seededValue.scope.workspaceId, operationCategory: seededValue.scope.operationCategory,
+    repairRunId: seededValue.scope.repairRunId, githubRepositoryId: seededValue.scope.githubRepositoryId,
+    baseCommitSha: seededValue.scope.baseCommitSha, executingReleaseSha: TEST_RELEASE_SHA,
+    executingProviderAccountIdentity: testProviderAccount(seededValue.scope.providerId),
     providerId: seededValue.scope.providerId, modelId: seededValue.scope.modelId, operationKey,
     reservedLogicalRequests: amounts.logicalRequests, reservedProviderAttempts: amounts.providerAttempts,
     reservedInputTokens: amounts.inputTokens, reservedOutputTokens: amounts.outputTokens,
     reservedSandboxIdentities: amounts.sandboxIdentities, reservedSandboxRuntimeMs: amounts.sandboxRuntimeMs,
     reservedVerificationAttempts: amounts.verificationAttempts, reservedRepairLoopIterations: amounts.repairLoopIterations,
     fence, reservationIdentity: computeExecutionReservationIdentity({
-      version: 1, grantId: seededValue.grantId, accountGrantId: seededValue.accountId,
-      scope: seededValue.scope, amounts, operationKey, fence,
+      version: 2, grantId: seededValue.grantId, accountGrantId: seededValue.accountId,
+      scope: seededValue.scope, amounts, operationKey, fence, executingReleaseSha: TEST_RELEASE_SHA,
+      executingProviderAccountIdentity: testProviderAccount(seededValue.scope.providerId),
     }), createdAt: seededValue.now,
   }).returning();
   assert.ok(reservation);
@@ -869,24 +894,19 @@ test('account-wide cumulative budgets bound reservations across operation grants
 
 test('one-shot live-acceptance authority binds one run, revision, purpose, and finite operation allowance', async () => {
   const seededValue = await seeded();
-  const runId = randomUUID(); const baseCommitSha = 'a'.repeat(40); const repositoryId = 42;
-  await seededValue.context.database.insert(repairRun).values({
-    id: runId, workspaceId: seededValue.scope.workspaceId, githubRepositoryId: repositoryId, installationId: 77,
-    profileIdentity: 'b'.repeat(64), baseCommitSha, idempotencyKey: randomUUID(), state: 'created',
-    stateChangedAt: seededValue.now, updatedAt: seededValue.now,
-  });
+  const runId = seededValue.scope.repairRunId!; const baseCommitSha = seededValue.scope.baseCommitSha!; const repositoryId = seededValue.scope.githubRepositoryId!;
   const limits = { ...scopeLimits, logicalRequests: 1, providerAttempts: 0 };
   const grantId = randomUUID(); const purpose = 'task_4_3_live_acceptance';
   await seededValue.context.database.insert(executionBudgetGrant).values({
-    id: grantId, version: 1, scope: 'one_shot', workspaceId: seededValue.scope.workspaceId, repairRunId: runId,
+    id: grantId, version: 2, scope: 'one_shot', workspaceId: seededValue.scope.workspaceId, repairRunId: runId,
     githubRepositoryId: repositoryId, baseCommitSha, operationCategory: 'release_acceptance_one_shot',
-    providerId: 'vigilo', acceptancePurpose: purpose,
+    providerId: 'vigilo', acceptancePurpose: purpose, authorizedReleaseSha: TEST_RELEASE_SHA,
     maxLogicalRequests: limits.logicalRequests, maxProviderAttempts: limits.providerAttempts,
     maxInputTokens: limits.inputTokens, maxOutputTokens: limits.outputTokens,
     maxSandboxIdentities: limits.sandboxIdentities, maxSandboxRuntimeMs: limits.sandboxRuntimeMs,
     maxVerificationAttempts: limits.verificationAttempts, maxRepairLoopIterations: limits.repairLoopIterations,
     maxConcurrentExternalOperations: 0, expiresAt: new Date('2026-09-24T10:00:00.000Z'), authorizedBy: 'release-operator',
-    grantIdentity: computeExecutionGrantIdentity({ version: 1, scope: 'one_shot', workspaceId: seededValue.scope.workspaceId, repairRunId: runId, githubRepositoryId: repositoryId, baseCommitSha, operationCategory: 'release_acceptance_one_shot', providerId: 'vigilo', modelId: null, acceptancePurpose: purpose, limits, expiresAt: '2026-09-24T10:00:00.000Z', authorizedBy: 'release-operator' }),
+    grantIdentity: computeExecutionGrantIdentity({ version: 2, scope: 'one_shot', workspaceId: seededValue.scope.workspaceId, repairRunId: runId, githubRepositoryId: repositoryId, baseCommitSha, operationCategory: 'release_acceptance_one_shot', providerId: 'vigilo', modelId: null, acceptancePurpose: purpose, limits, expiresAt: '2026-09-24T10:00:00.000Z', authorizedBy: 'release-operator', authorizedReleaseSha: TEST_RELEASE_SHA, authorizedProviderAccountIdentity: null }),
     createdAt: seededValue.now,
   });
   const authority = new DurableExternalExecutionAuthorizer(seededValue.context.database, { clock: () => seededValue.now });
@@ -949,7 +969,7 @@ test('ambiguous transport outcomes consume the reserved provider attempt', async
   const authority = new DurableExternalExecutionAuthorizer(seededValue.context.database, { clock: () => seededValue.now, fetch: async () => { throw new TypeError('simulated transport loss'); } });
   const permit = await authority.reserve({ scope: seededValue.scope, amounts: amount({ providerAttempts: 1 }) });
   await assert.rejects(permit.meteredFetch('https://provider.invalid'));
-  await assert.rejects(permit.beginProviderAttempt(), (error: unknown) => error instanceof ExternalExecutionAuthorityError && error.code === 'execution_budget_exhausted');
+  await assert.rejects(permit.beginProviderAttempt(), (error: unknown) => error instanceof ExternalExecutionAuthorityError && error.code === 'provider_attempt_ambiguous');
   const events = await seededValue.context.database.select({ type: externalExecutionEvent.eventType }).from(externalExecutionEvent).where(eq(externalExecutionEvent.reservationId, permit.reservationId));
   assert.deepEqual(events.map((row) => row.type), ['reserved', 'attempt_started', 'attempt_ambiguous']);
   await permit.complete('ambiguous', 'provider_attempt_ambiguous');

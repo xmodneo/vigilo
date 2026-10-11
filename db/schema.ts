@@ -360,6 +360,21 @@ export const repositoryBaseline = pgTable(
   ],
 );
 
+export const repairRunSourceCheckpoint = pgTable('repair_run_source_checkpoint', {
+  repairRunId: text('repair_run_id').primaryKey().references(() => repairRun.id, { onDelete: 'restrict' }),
+  expectedSourceIdentity: text('expected_source_identity').notNull(),
+  reviewedBy: text('reviewed_by').notNull(),
+  planIdentity: text('plan_identity').notNull(),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  baselineId: text('baseline_id').references(() => repositoryBaseline.id, { onDelete: 'restrict' }),
+  observedSourceIdentity: text('observed_source_identity'),
+  state: text('state').notNull().default('pending'),
+  checkedAt: timestamp('checked_at', { withTimezone: true }),
+}, (table) => [
+  check('repair_run_source_checkpoint_hash_check', sql`${table.expectedSourceIdentity} ~ '^[0-9a-f]{64}$' and ${table.planIdentity} ~ '^[0-9a-f]{64}$' and (${table.observedSourceIdentity} is null or ${table.observedSourceIdentity} ~ '^[0-9a-f]{64}$')`),
+  check('repair_run_source_checkpoint_state_check', sql`(${table.state} = 'pending' and ${table.baselineId} is null and ${table.observedSourceIdentity} is null and ${table.checkedAt} is null) or (${table.state} in ('matched','mismatched','unmeasured') and ${table.baselineId} is not null and ${table.checkedAt} is not null)`),
+]);
+
 export const repairRun = pgTable(
   'repair_run',
   {
@@ -1344,6 +1359,8 @@ export const executionBudgetGrant = pgTable(
     providerId: text('provider_id'),
     modelId: text('model_id'),
     acceptancePurpose: text('acceptance_purpose'),
+    authorizedReleaseSha: text('authorized_release_sha'),
+    authorizedProviderAccountIdentity: jsonb('authorized_provider_account_identity').$type<import('../lib/external-execution/provider-account.ts').ProviderAccountIdentity>(),
     maxLogicalRequests: integer('max_logical_requests').notNull(),
     maxProviderAttempts: integer('max_provider_attempts').notNull(),
     maxInputTokens: integer('max_input_tokens').notNull(),
@@ -1363,7 +1380,7 @@ export const executionBudgetGrant = pgTable(
     index('execution_budget_grant_scope_expiry_idx').on(table.scope, table.expiresAt),
     index('execution_budget_grant_workspace_run_idx').on(table.workspaceId, table.repairRunId),
     check('execution_budget_grant_uuid_check', sql`${table.id} ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'`),
-    check('execution_budget_grant_version_check', sql`${table.version} = 1`),
+    check('execution_budget_grant_version_check', sql`${table.version} in (1,2)`),
     check('execution_budget_grant_scope_check', sql`${table.scope} in ('account','operation','one_shot')`),
     check('execution_budget_grant_hash_check', sql`${table.grantIdentity} ~ '^[0-9a-f]{64}$' and (${table.baseCommitSha} is null or ${table.baseCommitSha} ~ '^[0-9a-f]{40}$')`),
     check('execution_budget_grant_category_check', sql`${table.operationCategory} is null or ${table.operationCategory} in ('gemini_investigation','gemini_candidate_generation','sandbox_baseline','sandbox_verification','repair_loop_iteration','release_acceptance_one_shot')`),
@@ -1410,6 +1427,8 @@ export const externalExecutionReservation = pgTable(
     providerId: text('provider_id').notNull(),
     modelId: text('model_id'),
     acceptancePurpose: text('acceptance_purpose'),
+    executingReleaseSha: text('executing_release_sha'),
+    executingProviderAccountIdentity: jsonb('executing_provider_account_identity').$type<import('../lib/external-execution/provider-account.ts').ProviderAccountIdentity>(),
     operationKey: text('operation_key').notNull().unique(),
     reservedLogicalRequests: integer('reserved_logical_requests').notNull(),
     reservedProviderAttempts: integer('reserved_provider_attempts').notNull(),
@@ -1429,7 +1448,7 @@ export const externalExecutionReservation = pgTable(
     index('external_execution_reservation_account_grant_created_idx').on(table.accountGrantId, table.createdAt),
     index('external_execution_reservation_workspace_created_idx').on(table.workspaceId, table.createdAt),
     check('external_execution_reservation_uuid_check', sql`${table.id} ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$' and ${table.operationKey} ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'`),
-    check('external_execution_reservation_version_check', sql`${table.version} = 1`),
+    check('external_execution_reservation_version_check', sql`${table.version} in (1,2)`),
     check('external_execution_reservation_hash_check', sql`${table.reservationIdentity} ~ '^[0-9a-f]{64}$' and (${table.baseCommitSha} is null or ${table.baseCommitSha} ~ '^[0-9a-f]{40}$')`),
     check('external_execution_reservation_category_check', sql`${table.operationCategory} in ('gemini_investigation','gemini_candidate_generation','sandbox_baseline','sandbox_verification','repair_loop_iteration','release_acceptance_one_shot')`),
     check('external_execution_reservation_limits_check', sql`${table.reservedLogicalRequests} between 0 and 10000 and ${table.reservedProviderAttempts} between 0 and 100000 and ${table.reservedInputTokens} between 0 and 100000000 and ${table.reservedOutputTokens} between 0 and 100000000 and ${table.reservedSandboxIdentities} between 0 and 1000 and ${table.reservedSandboxRuntimeMs} between 0 and 86400000 and ${table.reservedVerificationAttempts} between 0 and 1000 and ${table.reservedRepairLoopIterations} between 0 and 1000 and ${table.fence} > 0`),
@@ -1567,7 +1586,7 @@ export const operationalWorkerHeartbeat = pgTable(
     index('operational_worker_heartbeat_stopped_idx').on(table.stoppedAt).where(sql`${table.state} = 'stopped'`),
     check('operational_worker_heartbeat_uuid_check', sql`${table.id} ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'`),
     check('operational_worker_heartbeat_service_check', sql`${table.service} = 'vigilo-worker'`),
-    check('operational_worker_heartbeat_release_check', sql`${table.releaseSha} ~ '^[0-9a-f]{40}$' and ${table.expectedSchemaVersion} = '0023'`),
+    check('operational_worker_heartbeat_release_check', sql`${table.releaseSha} ~ '^[0-9a-f]{40}$' and ${table.expectedSchemaVersion} in ('0023','0024')`),
     check('operational_worker_heartbeat_queues_check', sql`jsonb_typeof(${table.registeredQueues}) = 'array' and jsonb_array_length(${table.registeredQueues}) = 7 and ${table.registeredQueues} = '["ai-candidate-generation-v1","ai-investigation-v1","candidate-verification-v1","investigation-context-v1","repair-baseline-v1","repair-loop-v1","repair-publication-v1"]'::jsonb`),
     check('operational_worker_heartbeat_state_check', sql`${table.state} in ('starting','ready','draining','stopped')`),
     check('operational_worker_heartbeat_failure_check', sql`${table.failureCode} is null or ${table.failureCode} ~ '^[a-z_]{1,64}$'`),

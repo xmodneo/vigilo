@@ -18,6 +18,7 @@ import type { AuthenticatedWorkspace } from '../auth/protected-context.ts';
 import type { VigiloDatabase } from '../db/types.ts';
 import { assertRunBusinessAllowed, lockExternalExecution } from '../external-execution/business-fence.ts';
 import { ExternalExecutionAuthorityError } from '../external-execution/types.ts';
+import { assertMatchedSourceCheckpoint } from '../external-execution/source-checkpoint.ts';
 import { RepositoryPolicyError, assertPublicRepositoryAuthority } from '../github-repositories/policy.ts';
 import { AI_MODEL_ID, AI_PROVIDER_ID } from '../ai-investigations/types.ts';
 import { REPAIR_LOOP_AI_CANDIDATE_GENERATION_PROTOCOL_VERSION } from '../ai-candidate-generations/types.ts';
@@ -89,6 +90,7 @@ export async function startRepairLoop(
       catch (error) { if (error instanceof RepositoryPolicyError) throw new RepairLoopFlowError(error.code); throw error; }
       const [existing] = await transaction.select().from(repairLoop).where(eq(repairLoop.repairRunId, run.id)).limit(1);
       if (existing) return existing;
+      await assertMatchedSourceCheckpoint(transaction, run.id);
       if (run.state !== 'ready_for_investigation' || !run.baselineId) throw new RepairLoopFlowError('repair_loop_not_eligible');
       const [[parent], [baseline], [profile], [source]] = await Promise.all([
         transaction.select().from(investigation).where(and(eq(investigation.repairRunId, run.id), eq(investigation.workspaceId, run.workspaceId))).limit(1),

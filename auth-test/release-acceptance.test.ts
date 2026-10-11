@@ -145,10 +145,10 @@ test('production release identity has no Git or test-only fallback', async () =>
 
 test('publication acceptance boundaries require the exact complete live set', () => {
   assert.deepEqual(PUBLICATION_ACCEPTANCE_BOUNDARIES, {
-    repair_loop_live: { boundaryVersion: 'repair-loop-live-v1', protocolVersion: 4, providerId: 'google', modelId: 'gemini-3.1-flash-lite' },
+    repair_loop_live: { boundaryVersion: 'repair-loop-live-v2', protocolVersion: 4, providerId: 'google', modelId: 'gemini-3.1-flash-lite' },
     human_review_live: { boundaryVersion: 'human-review-v1' },
     draft_publication_live: { boundaryVersion: 'draft-publication-v1' },
-    security_cost_control: { boundaryVersion: 'external-authority-v1' },
+    security_cost_control: { boundaryVersion: 'external-authority-v2' },
   });
 });
 

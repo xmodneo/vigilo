@@ -13,6 +13,7 @@ import {
   repairRunEvent,
   repository,
   repositoryBaseline,
+  repairRunSourceCheckpoint,
 } from '../db/schema.ts';
 import { AccessDeniedError, resolveAuthenticatedWorkspace, type AuthenticatedWorkspace } from '../lib/auth/protected-context.ts';
 import type { VigiloDatabase } from '../lib/db/types.ts';
@@ -512,6 +513,32 @@ test('matching evidence persisted before a crash is reconciled without rerunning
   const result = await processRepairJob(job(run.id), workerDependencies(context.database, executorFor('baseline_passed', {}, calls)));
   assert.equal(result.status, 'completed'); assert.equal(calls.count, 0);
   assert.equal((await getRepairRun(context.database, owner, run.id))?.state, 'ready_for_investigation');
+});
+
+test('completed failing baseline reconciliation finalizes a staged source checkpoint after restart', async (t) => {
+  const context = await createTestContext(); t.after(() => context.client.close());
+  const owner = await authenticated(context); await seed(context, owner);
+  const { run } = await queuedRun(context, owner);
+  await context.database.insert(repairRunSourceCheckpoint).values({ repairRunId: run.id,
+    expectedSourceIdentity: 'd'.repeat(64), reviewedBy: owner.user.id, planIdentity: 'f'.repeat(64) });
+  let entered!: () => void;
+  const started = new Promise<void>((resolve) => { entered = resolve; });
+  void processRepairJob(job(run.id), workerDependencies(context.database, async () => { entered(); return new Promise<never>(() => {}); }));
+  await started;
+  const [attempt] = await context.database.select().from(repairRunAttempt); assert.ok(attempt);
+  await persistEvidence(context.database, evidence({ workspaceId: owner.workspace.id,
+    profileIdentity: run.identity.profileIdentity, baselineId: attempt.expectedBaselineId, outcome: 'test_failed' }));
+  await context.database.update(repairRunAttempt).set({ state: 'customer_failed', baselineId: attempt.expectedBaselineId,
+    leaseExpiresAt: null, finishedAt: NOW, failureClassification: 'customer_baseline_failure', failureCode: 'test_failed' })
+    .where(eq(repairRunAttempt.id, attempt.id));
+  const calls = { count: 0 };
+  const result = await processRepairJob(job(run.id), workerDependencies(context.database, executorFor('test_failed', {}, calls)));
+  assert.equal(result.status, 'completed'); assert.equal(calls.count, 0);
+  assert.equal((await getRepairRun(context.database, owner, run.id))?.state, 'ready_for_investigation');
+  const [checkpoint] = await context.database.select().from(repairRunSourceCheckpoint)
+    .where(eq(repairRunSourceCheckpoint.repairRunId, run.id));
+  assert.equal(checkpoint?.state, 'matched');
+  assert.equal(checkpoint.baselineId, attempt.expectedBaselineId);
 });
 
 test('mismatched crash evidence is never reconciled as success', async (t) => {

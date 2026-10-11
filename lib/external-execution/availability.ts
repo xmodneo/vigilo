@@ -10,6 +10,7 @@ import {
 import type { VigiloDatabase } from '../db/types.ts';
 import type { ExecutionAvailabilityStatus } from '../presentation/policy.ts';
 import { executionGrantIdentityMatches } from './identity.ts';
+import { accountIdentityMatches } from './provider-account.ts';
 
 export interface ExecutionAvailabilityResult {
   status: ExecutionAvailabilityStatus;
@@ -111,7 +112,10 @@ export async function resolveExecutionAvailability(
     const accountCandidates = unrevoked.filter((grant) => grant.scope === 'account');
     // Release-acceptance one-shot authority is independently governed and must
     // never advertise general provider-backed workflow actions as available.
-    const operationCandidates = unrevoked.filter((grant) => grant.scope === 'operation' && grant.workspaceId === workspaceId);
+    const operationCandidates = unrevoked.filter((grant) => grant.scope === 'operation' && grant.workspaceId === workspaceId &&
+      grant.version === 2 && grant.repairRunId !== null && grant.githubRepositoryId !== null && grant.baseCommitSha !== null &&
+      /^[0-9a-f]{40}$/.test(grant.authorizedReleaseSha ?? '') &&
+      accountIdentityMatches(grant.providerId ?? '', grant.authorizedProviderAccountIdentity));
 
     if (accountCandidates.length === 0 || operationCandidates.length === 0) return { status: 'no_authority' };
     if (accountCandidates.some((grant) => grant.expiresAt <= now) || operationCandidates.every((grant) => grant.expiresAt <= now)) {

@@ -13,7 +13,22 @@ import postgres from 'postgres';
 import * as schema from '../db/schema.ts';
 import { DurableExternalExecutionAuthorizer } from '../lib/external-execution/authority.ts';
 import { computeExecutionGrantIdentity } from '../lib/external-execution/identity.ts';
-import type { ExternalExecutionAmounts, ExternalExecutionScope } from '../lib/external-execution/types.ts';
+import { googleProjectIdentity } from '../lib/external-execution/provider-account.ts';
+import type { ExternalExecutionAmounts, ExternalExecutionReservationRequest, ExternalExecutionScope } from '../lib/external-execution/types.ts';
+import type { VigiloDatabase } from '../lib/db/types.ts';
+
+const RELEASE_SHA = 'f'.repeat(40);
+const PROVIDER_ACCOUNT = googleProjectIdentity('disposable-envelope-test');
+
+class EnvelopeAuthorizer extends DurableExternalExecutionAuthorizer {
+  constructor(database: VigiloDatabase, options: ConstructorParameters<typeof DurableExternalExecutionAuthorizer>[1] = {}) {
+    super(database, { ...options, runtimeReleaseSha: RELEASE_SHA });
+  }
+
+  override reserve(request: ExternalExecutionReservationRequest) {
+    return super.reserve({ ...request, providerAccountIdentity: PROVIDER_ACCOUNT });
+  }
+}
 
 // Deliberately accepts no URL or environment configuration. The only database
 // target is constructed from this script's newly owned RAM-backed container.
@@ -89,7 +104,7 @@ try {
   await migrate(drizzle(a), { migrationsFolder });
   const history = await a`select hash from drizzle.__drizzle_migrations order by created_at, id`;
   assert.deepEqual(history.map((row) => row.hash), readMigrationFiles({ migrationsFolder }).map((migration) => migration.hash));
-  assert.equal(history.length, 24);
+  assert.equal(history.length, 25);
 
   const databaseA = drizzle(a, { schema }); const databaseB = drizzle(b, { schema });
   const now = new Date(); const expiresAt = new Date(now.getTime() + 3_600_000); const accountId = randomUUID();
@@ -114,14 +129,16 @@ try {
     const scope: ExternalExecutionScope = { workspaceId, repairRunId, githubRepositoryId: 42, baseCommitSha: 'a'.repeat(40),
       operationCategory: 'gemini_investigation', providerId: 'google', modelId: 'gemini-3.1-flash-lite' };
     const operationLimits = { ...limits, logicalRequests: 10, providerAttempts: 10, maxConcurrentExternalOperations: 0 };
-    await databaseA.insert(schema.executionBudgetGrant).values({ id: grantId, version: 1, scope: 'operation',
+    await databaseA.insert(schema.executionBudgetGrant).values({ id: grantId, version: 2, scope: 'operation',
       ...scope, maxLogicalRequests: 10, maxProviderAttempts: 10, maxInputTokens: limits.inputTokens, maxOutputTokens: limits.outputTokens,
       maxSandboxIdentities: 0, maxSandboxRuntimeMs: 0, maxVerificationAttempts: 0, maxRepairLoopIterations: 0,
+      authorizedReleaseSha: RELEASE_SHA, authorizedProviderAccountIdentity: PROVIDER_ACCOUNT,
       maxConcurrentExternalOperations: 0, expiresAt, authorizedBy: 'disposable-test', createdAt: now,
-      grantIdentity: computeExecutionGrantIdentity({ version: 1, scope: 'operation', workspaceId, repairRunId,
+      grantIdentity: computeExecutionGrantIdentity({ version: 2, scope: 'operation', workspaceId, repairRunId,
         githubRepositoryId: 42, baseCommitSha: scope.baseCommitSha!, operationCategory: scope.operationCategory,
         providerId: scope.providerId, modelId: scope.modelId!, acceptancePurpose: null, limits: operationLimits,
-        expiresAt: expiresAt.toISOString(), authorizedBy: 'disposable-test' }) });
+        expiresAt: expiresAt.toISOString(), authorizedBy: 'disposable-test',
+        authorizedReleaseSha: RELEASE_SHA, authorizedProviderAccountIdentity: PROVIDER_ACCOUNT }) });
     return { scope, grantId };
   };
   const blocked = async (connection: postgres.TransactionSql, applicationName: string) => {
@@ -138,8 +155,8 @@ try {
   const fakeFetch: typeof fetch = async () => { calls += 1; return Response.json({ ok: true }); };
 
   await check('ambiguity completion wins admission atomically across independent connections', async () => {
-    const { scope } = await seed(); const first = new DurableExternalExecutionAuthorizer(databaseA, { fetch: fakeFetch });
-    const second = new DurableExternalExecutionAuthorizer(databaseB, { fetch: fakeFetch });
+    const { scope } = await seed(); const first = new EnvelopeAuthorizer(databaseA, { fetch: fakeFetch });
+    const second = new EnvelopeAuthorizer(databaseB, { fetch: fakeFetch });
     const permit = await first.reserve({ scope, amounts }); const ordinal = await permit.beginProviderAttempt();
     let finish!: ReturnType<typeof pending<void>>; let admission!: ReturnType<typeof pending<Awaited<ReturnType<typeof second.reserve>>>>;
     await observer.begin(async (transaction) => {
@@ -154,8 +171,8 @@ try {
   });
 
   await check('admission before ambiguity cannot later begin provider transport', async () => {
-    const { scope } = await seed(); const first = new DurableExternalExecutionAuthorizer(databaseA, { fetch: fakeFetch });
-    const second = new DurableExternalExecutionAuthorizer(databaseB, { fetch: fakeFetch });
+    const { scope } = await seed(); const first = new EnvelopeAuthorizer(databaseA, { fetch: fakeFetch });
+    const second = new EnvelopeAuthorizer(databaseB, { fetch: fakeFetch });
     const permit = await first.reserve({ scope, amounts }); const ordinal = await permit.beginProviderAttempt();
     let admission!: ReturnType<typeof pending<Awaited<ReturnType<typeof second.reserve>>>>; let finish!: ReturnType<typeof pending<void>>;
     await observer.begin(async (transaction) => {
@@ -171,23 +188,23 @@ try {
 
   await check('expired unmatched start fences restart and changed operation identity', async () => {
     const { scope } = await seed(); let clock = new Date();
-    const first = new DurableExternalExecutionAuthorizer(databaseA, { clock: () => clock, leaseMs: 10, fetch: fakeFetch });
+    const first = new EnvelopeAuthorizer(databaseA, { clock: () => clock, leaseMs: 10, fetch: fakeFetch });
     const permit = await first.reserve({ scope, amounts }); await permit.beginProviderAttempt(); clock = new Date(clock.getTime() + 11);
-    const restarted = new DurableExternalExecutionAuthorizer(databaseB, { clock: () => clock, fetch: fakeFetch });
+    const restarted = new EnvelopeAuthorizer(databaseB, { clock: () => clock, fetch: fakeFetch });
     await assert.rejects(restarted.reserve({ scope, amounts, operationKey: randomUUID() }), /provider_attempt_ambiguous/);
     await permit.complete('failed'); assert.equal(calls, 0);
   });
 
   await check('lease expiry between reservation and transport denies dispatch', async () => {
     const { scope } = await seed(); let clock = new Date();
-    const first = new DurableExternalExecutionAuthorizer(databaseA, { clock: () => clock, leaseMs: 10, fetch: fakeFetch });
+    const first = new EnvelopeAuthorizer(databaseA, { clock: () => clock, leaseMs: 10, fetch: fakeFetch });
     const permit = await first.reserve({ scope, amounts }); clock = new Date(clock.getTime() + 11);
     await assert.rejects(permit.meteredFetch('https://provider.invalid'), /execution_authority_expired/);
     await permit.complete('failed'); assert.equal(calls, 0);
   });
 
   await check('grant revocation and attempt admission do not deadlock or dispatch stale authority', async () => {
-    const { scope, grantId } = await seed(); const first = new DurableExternalExecutionAuthorizer(databaseA, { fetch: fakeFetch });
+    const { scope, grantId } = await seed(); const first = new EnvelopeAuthorizer(databaseA, { fetch: fakeFetch });
     const permit = await first.reserve({ scope, amounts }); let admission!: ReturnType<typeof pending<number>>;
     await b.begin(async (transaction) => {
       await transaction`select id from execution_budget_grant where id = ${grantId} for update`;
@@ -199,8 +216,8 @@ try {
 
   await check('late success after sibling ambiguity cannot become durable success', async () => {
     const { scope } = await seed();
-    const first = new DurableExternalExecutionAuthorizer(databaseA, { fetch: fakeFetch });
-    const second = new DurableExternalExecutionAuthorizer(databaseB, { fetch: fakeFetch });
+    const first = new EnvelopeAuthorizer(databaseA, { fetch: fakeFetch });
+    const second = new EnvelopeAuthorizer(databaseB, { fetch: fakeFetch });
     const late = await first.reserve({ scope, amounts }); const sibling = await second.reserve({ scope, amounts });
     const lateOrdinal = await late.beginProviderAttempt(); const siblingOrdinal = await sibling.beginProviderAttempt();
     await sibling.finishProviderAttempt(siblingOrdinal, 'ambiguous');
@@ -215,8 +232,8 @@ try {
 
   await check('reservation completion rechecks a newly activated sibling fence', async () => {
     const { scope } = await seed();
-    const first = new DurableExternalExecutionAuthorizer(databaseA, { fetch: fakeFetch });
-    const second = new DurableExternalExecutionAuthorizer(databaseB, { fetch: fakeFetch });
+    const first = new EnvelopeAuthorizer(databaseA, { fetch: fakeFetch });
+    const second = new EnvelopeAuthorizer(databaseB, { fetch: fakeFetch });
     const late = await first.reserve({ scope, amounts }); const sibling = await second.reserve({ scope, amounts });
     const lateOrdinal = await late.beginProviderAttempt(); const siblingOrdinal = await sibling.beginProviderAttempt();
     await late.finishProviderAttempt(lateOrdinal, 'succeeded');
@@ -229,7 +246,7 @@ try {
 
   await check('late attempt success after ownership expiry is rejected', async () => {
     const { scope } = await seed(); let clock = new Date();
-    const first = new DurableExternalExecutionAuthorizer(databaseA, { clock: () => clock, leaseMs: 10, fetch: fakeFetch });
+    const first = new EnvelopeAuthorizer(databaseA, { clock: () => clock, leaseMs: 10, fetch: fakeFetch });
     const late = await first.reserve({ scope, amounts }); const ordinal = await late.beginProviderAttempt();
     clock = new Date(clock.getTime() + 11);
     await assert.rejects(late.finishProviderAttempt(ordinal, 'succeeded'), /execution_authority_expired/);
@@ -240,7 +257,7 @@ try {
 
   await check('late attempt success after durable grant revocation is rejected', async () => {
     const { scope, grantId } = await seed();
-    const first = new DurableExternalExecutionAuthorizer(databaseA, { fetch: fakeFetch });
+    const first = new EnvelopeAuthorizer(databaseA, { fetch: fakeFetch });
     const late = await first.reserve({ scope, amounts }); const ordinal = await late.beginProviderAttempt();
     await b`insert into execution_budget_grant_revocation (id, grant_id, revoked_by, reason_code) values (${randomUUID()}, ${grantId}, 'disposable-test', 'test_revoked')`;
     await assert.rejects(late.finishProviderAttempt(ordinal, 'succeeded'), /execution_authority_missing/);
@@ -251,7 +268,7 @@ try {
 
   await check('provider I/O holds no semaphore, grant, or lease locks', async () => {
     const { scope, grantId } = await seed(); let permitId = '';
-    const first = new DurableExternalExecutionAuthorizer(databaseA, { fetch: async () => {
+    const first = new EnvelopeAuthorizer(databaseA, { fetch: async () => {
       calls += 1;
       await observer.begin(async (transaction) => {
         await transaction`select id from external_execution_semaphore where id = 'global' for update nowait`;

@@ -7,9 +7,13 @@ import { fileURLToPath } from 'node:url';
 
 import { drizzle } from 'drizzle-orm/postgres-js';
 import { migrate } from 'drizzle-orm/postgres-js/migrator';
+import { eq } from 'drizzle-orm';
 import postgres, { type Sql } from 'postgres';
 
 import * as schema from '../db/schema.ts';
+import { computeExecutionGrantIdentity, computeExecutionReservationIdentity, computeReleaseAcceptanceIdentity,
+  executionGrantIdentityMatches, executionReservationIdentityMatches } from '../lib/external-execution/identity.ts';
+import { acceptanceIdentityPayload, verifyAcceptanceExecutionAudit } from '../lib/release-acceptance/resolver.ts';
 
 const configuredUrl = process.env.DATABASE_URL;
 if (!configuredUrl) throw new Error('missing_required_environment:DATABASE_URL');
@@ -29,8 +33,8 @@ const sha256 = (content: string) => createHash('sha256').update(content).digest(
 const adminUrl = new URL(databaseUrl); adminUrl.pathname = '/postgres';
 const admin = postgres(adminUrl.toString(), { max: 1, prepare: false, onnotice: () => {} });
 
-async function createHistoricalFolder() {
-  const folder = await mkdtemp(join(tmpdir(), 'vigilo-historical-migrations-'));
+async function createMigrationFolder(lastIndex: number) {
+  const folder = await mkdtemp(join(tmpdir(), `vigilo-migrations-through-${lastIndex}-`));
   const meta = join(folder, 'meta');
   await mkdir(meta);
   const journal = JSON.parse(await readFile(join(migrationsFolder, 'meta/_journal.json'), 'utf8')) as {
@@ -38,7 +42,7 @@ async function createHistoricalFolder() {
     dialect: string;
     entries: Array<{ idx: number; version: string; when: number; tag: string; breakpoints: boolean }>;
   };
-  const entries = journal.entries.filter((entry) => entry.idx <= 17);
+  const entries = journal.entries.filter((entry) => entry.idx <= lastIndex);
   for (const entry of entries) await copyFile(join(migrationsFolder, `${entry.tag}.sql`), join(folder, `${entry.tag}.sql`));
   await writeFile(join(meta, '_journal.json'), `${JSON.stringify({ ...journal, entries }, null, 2)}\n`);
   return folder;
@@ -74,7 +78,7 @@ async function migrationRows(sql: Sql) {
 async function assertHistoricalHashes(sql: Sql) {
   const journal = JSON.parse(await readFile(join(migrationsFolder, 'meta/_journal.json'), 'utf8')) as { entries: Array<{ idx: number; tag: string }> };
   const rows = await migrationRows(sql);
-  assert.equal(rows.length, 24);
+  assert.equal(rows.length, 25);
   for (const [tag, expected] of historicalHashes) {
     const entry = journal.entries.find((candidate) => candidate.tag === tag);
     assert.ok(entry, tag);
@@ -114,10 +118,76 @@ async function seedRepresentativeRows(sql: Sql) {
   return { userId, workspaceId, baselineId, runId, intentId, investigationId, aiId, candidateId, verificationId, generationId };
 }
 
+async function seedLegacyExecutionRows(sql: Sql, subject: { workspaceId: string; runId: string }) {
+  const database = drizzle(sql, { schema });
+  const accountId = randomUUID(); const grantId = randomUUID(); const reservationId = randomUUID();
+  const expiresAt = new Date(NOW.getTime() + 86_400_000);
+  const limits = { logicalRequests: 2, providerAttempts: 2, inputTokens: 200, outputTokens: 200,
+    sandboxIdentities: 0, sandboxRuntimeMs: 0, verificationAttempts: 0, repairLoopIterations: 0,
+    maxConcurrentExternalOperations: 1 };
+  const scope = { workspaceId: subject.workspaceId, repairRunId: subject.runId,
+    githubRepositoryId: REPOSITORY_ID, baseCommitSha: COMMIT,
+    operationCategory: 'gemini_investigation' as const, providerId: 'google', modelId: 'gemini-3.1-flash-lite' };
+  const accountIdentity = computeExecutionGrantIdentity({ version: 1, scope: 'account', workspaceId: null,
+    repairRunId: null, githubRepositoryId: null, baseCommitSha: null, operationCategory: null,
+    providerId: null, modelId: null, acceptancePurpose: null, limits,
+    expiresAt: expiresAt.toISOString(), authorizedBy: 'historical-operator' });
+  const grantIdentity = computeExecutionGrantIdentity({ version: 1, scope: 'operation', ...scope,
+    acceptancePurpose: null, limits: { ...limits, maxConcurrentExternalOperations: 0 },
+    expiresAt: expiresAt.toISOString(), authorizedBy: 'historical-operator' });
+  await sql`insert into execution_budget_grant
+    (id,version,scope,max_logical_requests,max_provider_attempts,max_input_tokens,max_output_tokens,max_sandbox_identities,
+     max_sandbox_runtime_ms,max_verification_attempts,max_repair_loop_iterations,max_concurrent_external_operations,
+     expires_at,authorized_by,grant_identity,created_at)
+    values (${accountId},1,'account',2,2,200,200,0,0,0,0,1,${expiresAt.toISOString()},'historical-operator',${accountIdentity},${NOW.toISOString()})`;
+  await sql`insert into execution_budget_grant
+    (id,version,scope,workspace_id,repair_run_id,github_repository_id,base_commit_sha,operation_category,provider_id,model_id,
+     max_logical_requests,max_provider_attempts,max_input_tokens,max_output_tokens,max_sandbox_identities,max_sandbox_runtime_ms,
+     max_verification_attempts,max_repair_loop_iterations,max_concurrent_external_operations,expires_at,authorized_by,grant_identity,created_at)
+    values (${grantId},1,'operation',${subject.workspaceId},${subject.runId},${REPOSITORY_ID},${COMMIT},
+      'gemini_investigation','google','gemini-3.1-flash-lite',2,2,200,200,0,0,0,0,0,${expiresAt.toISOString()},
+      'historical-operator',${grantIdentity},${NOW.toISOString()})`;
+  const amounts = { logicalRequests: 1, providerAttempts: 1, inputTokens: 10, outputTokens: 10,
+    sandboxIdentities: 0, sandboxRuntimeMs: 0, verificationAttempts: 0, repairLoopIterations: 0 };
+  const operationKey = randomUUID();
+  const reservationIdentity = computeExecutionReservationIdentity({ version: 1, grantId,
+    accountGrantId: accountId, scope, amounts, operationKey, fence: 1 });
+  await sql`insert into external_execution_reservation
+    (id,version,grant_id,account_grant_id,workspace_id,repair_run_id,github_repository_id,base_commit_sha,
+     operation_category,provider_id,model_id,operation_key,reserved_logical_requests,reserved_provider_attempts,
+     reserved_input_tokens,reserved_output_tokens,reserved_sandbox_identities,reserved_sandbox_runtime_ms,
+     reserved_verification_attempts,reserved_repair_loop_iterations,fence,reservation_identity,created_at)
+    values (${reservationId},1,${grantId},${accountId},${subject.workspaceId},${subject.runId},${REPOSITORY_ID},${COMMIT},
+      'gemini_investigation','google','gemini-3.1-flash-lite',${operationKey},1,1,10,10,0,0,0,0,1,${reservationIdentity},${NOW.toISOString()})`;
+  const completedAt = new Date(NOW.getTime() + 1000);
+  await database.insert(schema.externalExecutionLease).values({ reservationId, ownershipToken: randomUUID(), fence: 1,
+    state: 'active', heartbeatAt: NOW, leaseExpiresAt: expiresAt });
+  await database.insert(schema.externalExecutionEvent).values({ id: randomUUID(), reservationId, eventType: 'reserved', createdAt: NOW });
+  await database.insert(schema.externalExecutionEvent).values({ id: randomUUID(), reservationId, eventType: 'attempt_started', attemptOrdinal: 1, createdAt: NOW });
+  await database.insert(schema.externalExecutionEvent).values({ id: randomUUID(), reservationId, eventType: 'attempt_succeeded', attemptOrdinal: 1,
+    inputTokens: 5, outputTokens: 5, createdAt: completedAt });
+  await database.update(schema.externalExecutionLease).set({ state: 'succeeded', completedAt }).where(eq(schema.externalExecutionLease.reservationId, reservationId));
+  await database.insert(schema.externalExecutionEvent).values({ id: randomUUID(), reservationId, eventType: 'completed', createdAt: completedAt });
+  const acceptance = { id: randomUUID(), version: 1, kind: 'security_cost_control', state: 'pending',
+    boundaryVersion: 'external-authority-v1', releasedCommitSha: COMMIT, workspaceId: subject.workspaceId,
+    protocolVersion: null, repairRunId: null, repairLoopId: null, repairLoopIterationId: null,
+    aiCandidateGenerationId: null, repairCandidateId: null, candidateIdentity: null,
+    candidateVerificationId: null, verificationEvidenceId: null, verificationEvidenceIdentity: null,
+    objectiveContractHash: null, objectiveEvidenceHash: null, humanReviewDecisionId: null,
+    repairPublicationId: null, providerId: null, modelId: null, sandboxExecutionIdentity: null,
+    executionBudgetGrantId: accountId, executionReservationIds: [reservationId], reviewedBy: 'historical-operator',
+    acceptedAt: NOW, createdAt: NOW, acceptanceIdentity: '' } as typeof schema.releaseAcceptance.$inferInsert;
+  acceptance.acceptanceIdentity = computeReleaseAcceptanceIdentity(acceptanceIdentityPayload(acceptance as typeof schema.releaseAcceptance.$inferSelect));
+  await database.insert(schema.releaseAcceptance).values(acceptance);
+  return { accountId, grantId, reservationId, acceptanceId: acceptance.id };
+}
+
 const preservedTables = [
   ['user', 'id'], ['workspace', 'id'], ['repository_baseline', 'id'], ['repair_run', 'id'], ['repair_intent', 'id'],
   ['investigation', 'id'], ['ai_investigation', 'id'], ['repair_candidate', 'id'], ['repair_candidate_file', 'candidate_id'],
   ['repair_candidate_event', 'id'], ['candidate_verification', 'id'], ['ai_candidate_generation', 'id'],
+  ['execution_budget_grant', 'id'], ['external_execution_reservation', 'id'], ['external_execution_lease', 'reservation_id'],
+  ['external_execution_event', 'id'], ['release_acceptance', 'id'],
 ] as const;
 
 async function dataFingerprint(sql: Sql) {
@@ -142,6 +212,11 @@ async function applyDocumentedManualCorrections(sql: Sql) {
 }
 
 async function assertFinalCatalog(sql: Sql) {
+  const [provenance] = await sql<{ checkpoint: string | null; guardCount: number }[]>`
+    select to_regclass('public.repair_run_source_checkpoint')::text as checkpoint,
+      (select count(*)::int from pg_trigger where tgname in ('execution_budget_grant_insert_provenance_guard','repair_run_provenance_guard','repository_baseline_provenance_guard','repair_run_source_checkpoint_guard','external_execution_reservation_provenance_guard','external_execution_event_provenance_guard') and not tgisinternal) as "guardCount"
+  `;
+  assert.deepEqual(provenance, { checkpoint: 'repair_run_source_checkpoint', guardCount: 6 });
   const foreignKeys = await sql<{ name: string; action: string }[]>`
     select conname::text as name, confdeltype::text as action
     from pg_constraint
@@ -240,16 +315,29 @@ async function schemaSnapshot(sql: Sql) {
   return snapshot?.value;
 }
 
-async function runUpgradePath(sql: Sql, historicalFolder: string, manuallyReconciled: boolean) {
+async function runUpgradePath(sql: Sql, historicalFolder: string, preProvenanceFolder: string, manuallyReconciled: boolean) {
   await migrateFolder(sql, historicalFolder);
   assert.equal((await migrationRows(sql)).length, 18);
   const identifiers = await seedRepresentativeRows(sql);
   if (manuallyReconciled) await applyDocumentedManualCorrections(sql);
+  await migrateFolder(sql, preProvenanceFolder);
+  assert.equal((await migrationRows(sql)).length, 24);
+  const legacy = await seedLegacyExecutionRows(sql, identifiers);
   const before = await dataFingerprint(sql);
   await migrateFolder(sql, migrationsFolder);
   await assertHistoricalHashes(sql);
   await assertFinalCatalog(sql);
   assert.deepEqual(await dataFingerprint(sql), before);
+  const database = drizzle(sql, { schema });
+  const [grant] = await database.select().from(schema.executionBudgetGrant).where(eq(schema.executionBudgetGrant.id, legacy.grantId));
+  const [reservation] = await database.select().from(schema.externalExecutionReservation).where(eq(schema.externalExecutionReservation.id, legacy.reservationId));
+  const [acceptance] = await database.select().from(schema.releaseAcceptance).where(eq(schema.releaseAcceptance.id, legacy.acceptanceId));
+  assert.ok(grant); assert.ok(reservation); assert.ok(acceptance);
+  assert.equal(grant.version, 1); assert.equal(grant.authorizedReleaseSha, null); assert.equal(grant.authorizedProviderAccountIdentity, null);
+  assert.equal(reservation.version, 1); assert.equal(reservation.executingReleaseSha, null); assert.equal(reservation.executingProviderAccountIdentity, null);
+  assert.equal(executionGrantIdentityMatches(grant), true); assert.equal(executionReservationIdentityMatches(reservation), true);
+  assert.equal(await verifyAcceptanceExecutionAudit(database as never, [legacy.reservationId]), true);
+  assert.equal(await verifyAcceptanceExecutionAudit(database as never, [legacy.reservationId], COMMIT), false);
   return { identifiers, schema: await schemaSnapshot(sql), data: before };
 }
 
@@ -273,10 +361,11 @@ function errorChain(error: unknown) {
   return messages.join(' | ');
 }
 
-const historicalFolder = await createHistoricalFolder();
+const historicalFolder = await createMigrationFolder(17);
+const preProvenanceFolder = await createMigrationFolder(23);
 try {
-  const clean = await withDisposableDatabase('clean', (sql) => runUpgradePath(sql, historicalFolder, false));
-  const historical = await withDisposableDatabase('historical', (sql) => runUpgradePath(sql, historicalFolder, true));
+  const clean = await withDisposableDatabase('clean', (sql) => runUpgradePath(sql, historicalFolder, preProvenanceFolder, false));
+  const historical = await withDisposableDatabase('historical', (sql) => runUpgradePath(sql, historicalFolder, preProvenanceFolder, true));
   assert.deepEqual(historical.schema, clean.schema);
   assert.deepEqual(Object.keys(historical.data), Object.keys(clean.data));
 
@@ -299,5 +388,6 @@ try {
   process.stdout.write(`${JSON.stringify({ cleanInstall: 'passed', historicalUpgrade: 'passed', finalSchemaComparison: 'equal', representativeRows: 'preserved', failClosedCases: failures, persistentDatabase: 'untouched' })}\n`);
 } finally {
   await rm(historicalFolder, { recursive: true, force: true });
+  await rm(preProvenanceFolder, { recursive: true, force: true });
   await admin.end();
 }

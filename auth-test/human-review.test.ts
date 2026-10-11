@@ -10,8 +10,8 @@ import {
   candidateVerification, candidateVerificationAttempt, candidateVerificationEvidence,
   executionBudgetGrant, executionBudgetGrantRevocation, executionProfile, externalExecutionEvent, externalExecutionLease, externalExecutionReservation,
   githubInstallation, humanReviewDecision, investigation, repairCandidate,
-  repairCandidateFile, repairIntent, repairLoop, repairLoopIteration, repairRun,
-  releaseAcceptance, releaseAcceptanceRevocation, repairPublication, repairPublicationAttempt, repairPublicationEvent, repository, repositoryBaseline, user, workspace,
+  repairCandidateFile, repairIntent, repairLoop, repairLoopIteration, repairRun, repairRunAttempt,
+  releaseAcceptance, releaseAcceptanceRevocation, repairPublication, repairPublicationAttempt, repairPublicationEvent, repository, repositoryBaseline, repairRunSourceCheckpoint, user, workspace,
 } from '../db/schema.ts';
 import type { AuthenticatedWorkspace } from '../lib/auth/protected-context.ts';
 import { AccessDeniedError } from '../lib/auth/protected-context.ts';
@@ -38,6 +38,7 @@ import type { PublicationPullRequest, RepairPublicationGateway } from '../lib/re
 import { createRepairPublicationHandlers } from '../lib/repair-publications/handlers.ts';
 import { DurableExternalExecutionAuthorizer } from '../lib/external-execution/authority.ts';
 import { computeExecutionGrantIdentity, computeReleaseAcceptanceIdentity } from '../lib/external-execution/identity.ts';
+import { googleProjectIdentity, vercelTeamProjectIdentity } from '../lib/external-execution/provider-account.ts';
 import { acceptanceIdentityPayload, ReleaseAcceptanceError, resolveReleaseAcceptance } from '../lib/release-acceptance/resolver.ts';
 import { computePublicationBootstrapPurpose, resolvePublicationReleaseAuthority } from '../lib/release-acceptance/publication-gate.ts';
 
@@ -70,9 +71,24 @@ async function seedVerifiedReview(
   const profileIdentity = computeExecutionProfileIdentity({ baseCommitSha: COMMIT, build: { script: 'build', tool: 'npm' }, githubRepositoryId: REPOSITORY_ID, install: { operation: 'ci', tool: 'npm' }, installationId: INSTALLATION_ID, lockfileType: 'package-lock', nodeMajor: 24, packageJsonBlobSha: 'd'.repeat(40), packageJsonContentSha256: 'e'.repeat(64), packageLockBlobSha: 'f'.repeat(40), packageLockContentSha256: '1'.repeat(64), packageManager: 'npm', profileVersion: 2, runtimeFamily: 'node', test: { script: 'test', tool: 'npm' }, testRunner: 'vitest', typecheck: { script: 'typecheck', tool: 'npm' }, workspaceId });
   const profile = { githubRepositoryId: REPOSITORY_ID, workspaceId, installationId: INSTALLATION_ID, profileVersion: 2, profileIdentity, baseCommitSha: COMMIT, runtimeFamily: 'node', nodeMajor: 24, packageManager: 'npm', lockfileType: 'package-lock', installOperation: 'ci', typecheckScript: 'typecheck', buildScript: 'build', testScript: 'test', testRunner: 'vitest', packageJsonBlobSha: 'd'.repeat(40), packageJsonContentSha256: 'e'.repeat(64), packageLockBlobSha: 'f'.repeat(40), packageLockContentSha256: '1'.repeat(64), status: 'ready' } as const;
   await context.database.insert(executionProfile).values(profile);
+  await context.database.insert(repairRun).values({ id: runId, workspaceId, githubRepositoryId: REPOSITORY_ID, installationId: INSTALLATION_ID,
+    profileIdentity, baseCommitSha: COMMIT, idempotencyKey: randomUUID(), state: 'created', stateChangedAt: NOW, updatedAt: NOW });
+  await context.database.insert(repairRunSourceCheckpoint).values({ repairRunId: runId, expectedSourceIdentity: SOURCE,
+    reviewedBy: userId, planIdentity: '8'.repeat(64) });
+  await context.database.update(repairRun).set({ state: 'baseline_running', baselineStartedAt: NOW,
+    stateChangedAt: NOW, updatedAt: NOW }).where(eq(repairRun.id, runId));
+  const baselineAttemptId = randomUUID();
+  await context.database.insert(repairRunAttempt).values({ id: baselineAttemptId, repairRunId: runId,
+    queueJobId: randomUUID(), attemptNumber: 1, expectedBaselineId: baselineId,
+    ownershipToken: randomUUID(), state: 'active', claimedAt: NOW, heartbeatAt: NOW,
+    leaseExpiresAt: new Date(NOW.getTime() + 60_000) });
   const baseline = { id: baselineId, workspaceId, githubRepositoryId: REPOSITORY_ID, installationId: INSTALLATION_ID, evidenceVersion: 1, profileIdentity, baseCommitSha: COMMIT, archiveSha256: '2'.repeat(64), sandboxName: 'baseline-review', sourceIdentityBefore: SOURCE, sourceIdentityAfter: SOURCE, sourceUnchanged: true, credentialsExposure: 'absent', networkPolicy: 'deny-all', installStatus: 'completed', installExitCode: 0, installTimedOut: false, typecheckStatus: 'completed', typecheckExitCode: 0, typecheckTimedOut: false, buildStatus: 'completed', buildExitCode: 0, buildTimedOut: false, testStatus: 'failed', testExitCode: 1, testTimedOut: false, executionOutcome: 'test_failed', overallOutcome: 'test_failed', cleanupStop: 'confirmed', cleanupDelete: 'confirmed', cleanupLookup: 'absent', errorPhase: 'test', errorCode: 'npm_command_failed', startedAt: NOW, completedAt: NOW, durationMs: 1 } as const;
   await context.database.insert(repositoryBaseline).values(baseline);
-  await context.database.insert(repairRun).values({ id: runId, workspaceId, githubRepositoryId: REPOSITORY_ID, installationId: INSTALLATION_ID, profileIdentity, baseCommitSha: COMMIT, idempotencyKey: randomUUID(), state: 'ready_for_investigation', baselineId, baselineOutcome: 'test_failed', failureClassification: 'customer_baseline_failure', failureCode: 'test_failed', baselineStartedAt: NOW, completedAt: NOW, stateChangedAt: NOW, updatedAt: NOW });
+  await context.database.update(repairRunAttempt).set({ state: 'customer_failed', baselineId,
+    leaseExpiresAt: null, finishedAt: NOW, failureClassification: 'customer_baseline_failure', failureCode: 'test_failed' })
+    .where(eq(repairRunAttempt.id, baselineAttemptId));
+  await context.database.update(repairRun).set({ state: 'ready_for_investigation', baselineId, baselineOutcome: 'test_failed', failureClassification: 'customer_baseline_failure', failureCode: 'test_failed', baselineStartedAt: NOW, completedAt: NOW, stateChangedAt: NOW, updatedAt: NOW }).where(eq(repairRun.id, runId));
+  await context.database.update(repairRunSourceCheckpoint).set({ baselineId }).where(eq(repairRunSourceCheckpoint.repairRunId, runId));
   const repairIntentId = randomUUID(); const objectiveText = 'Repair the measured test failure.';
   await context.database.insert(repairIntent).values({ id: repairIntentId, repairRunId: runId, workspaceId, objective: objectiveText, objectiveHash: sha256(objectiveText) });
   await context.database.insert(investigation).values({ id: investigationId, repairRunId: runId, repairIntentId, workspaceId, githubRepositoryId: REPOSITORY_ID, installationId: INSTALLATION_ID, baseCommitSha: COMMIT, profileIdentity, baselineId, idempotencyKey: randomUUID(), state: 'ready', contextBudgetVersion: 1, maxTreeEntries: 2000, maxFileBytes: 65536, maxCumulativeBytes: 1048576, maxOperations: 50, treeSha: '3'.repeat(40), indexedPathCount: 1, attemptNumber: 1, completedAt: NOW, updatedAt: NOW });
@@ -207,9 +223,9 @@ async function insertAcceptance(
     repairPublicationId: null, providerId: null, modelId: null, sandboxExecutionIdentity: null,
     executionBudgetGrantId: null, executionReservationIds: [] as string[], reviewedBy: 'release-reviewer',
     acceptedAt: NOW, createdAt: NOW, acceptanceIdentity: '',
-    boundaryVersion: values.kind === 'repair_loop_live' ? 'repair-loop-live-v1'
+    boundaryVersion: values.kind === 'repair_loop_live' ? 'repair-loop-live-v2'
       : values.kind === 'human_review_live' ? 'human-review-v1'
-        : values.kind === 'draft_publication_live' ? 'draft-publication-v1' : 'external-authority-v1',
+        : values.kind === 'draft_publication_live' ? 'draft-publication-v1' : 'external-authority-v2',
     ...values,
   } satisfies typeof releaseAcceptance.$inferInsert;
   row.acceptanceIdentity = computeReleaseAcceptanceIdentity(acceptanceIdentityPayload(row as typeof releaseAcceptance.$inferSelect));
@@ -236,21 +252,22 @@ async function seedPublicationAcceptances(context: Awaited<ReturnType<typeof cre
   });
   const operationLimits = { ...grantLimits, logicalRequests: 1, repairLoopIterations: 1, maxConcurrentExternalOperations: 0 };
   await context.database.insert(executionBudgetGrant).values({
-    id: operationGrantId, version: 1, scope: 'operation', workspaceId: seeded.authority.workspaceId,
+    id: operationGrantId, version: 2, scope: 'operation', workspaceId: seeded.authority.workspaceId,
     repairRunId: seeded.authority.repairRunId, githubRepositoryId: REPOSITORY_ID, baseCommitSha: COMMIT,
-    operationCategory: 'repair_loop_iteration', providerId: 'vigilo', maxLogicalRequests: 1,
+    operationCategory: 'repair_loop_iteration', providerId: 'vigilo', authorizedReleaseSha: RELEASE_SHA, maxLogicalRequests: 1,
     maxProviderAttempts: operationLimits.providerAttempts, maxInputTokens: operationLimits.inputTokens,
     maxOutputTokens: operationLimits.outputTokens, maxSandboxIdentities: operationLimits.sandboxIdentities,
     maxSandboxRuntimeMs: operationLimits.sandboxRuntimeMs, maxVerificationAttempts: operationLimits.verificationAttempts,
     maxRepairLoopIterations: 1, maxConcurrentExternalOperations: 0, expiresAt, authorizedBy: operatorId, createdAt: NOW,
-    grantIdentity: computeExecutionGrantIdentity({ version: 1, scope: 'operation', workspaceId: seeded.authority.workspaceId,
+    grantIdentity: computeExecutionGrantIdentity({ version: 2, scope: 'operation', workspaceId: seeded.authority.workspaceId,
       repairRunId: seeded.authority.repairRunId, githubRepositoryId: REPOSITORY_ID, baseCommitSha: COMMIT,
       operationCategory: 'repair_loop_iteration', providerId: 'vigilo', modelId: null, acceptancePurpose: null,
-      limits: operationLimits, expiresAt: expiresAt.toISOString(), authorizedBy: operatorId }),
+      limits: operationLimits, expiresAt: expiresAt.toISOString(), authorizedBy: operatorId,
+      authorizedReleaseSha: RELEASE_SHA, authorizedProviderAccountIdentity: null }),
   });
   const sandboxBinding = { name: 'verification-review', teamId: 'team_test', projectId: 'project_test' };
   let sandboxCreateDispatches = 0;
-  const authorizer = new DurableExternalExecutionAuthorizer(context.database, { clock: () => NOW, fetch: async (input, init) => {
+  const authorizer = new DurableExternalExecutionAuthorizer(context.database, { clock: () => NOW, runtimeReleaseSha: RELEASE_SHA, fetch: async (input, init) => {
     const url = new URL(String(input));
     assert.equal(url.origin, 'https://vercel.com'); assert.equal(url.pathname, '/api/v3/sandboxes');
     assert.equal(init?.method, 'POST'); assert.equal(JSON.parse(String(init.body)).name, sandboxBinding.name);
@@ -279,15 +296,18 @@ async function seedPublicationAcceptances(context: Awaited<ReturnType<typeof cre
       sandboxIdentities: model ? 0 : 1, sandboxRuntimeMs: model ? 0 : 1000,
       ...(!model ? { sandboxResourceClass: 'vcpu_1' as const } : {}), verificationAttempts: model ? 0 : 1, repairLoopIterations: 0 };
     await context.database.insert(executionBudgetGrant).values({
-      id: grantId, version: 1, scope: 'operation', ...scope, maxLogicalRequests: 1, maxProviderAttempts: 1,
+      id: grantId, version: 2, scope: 'operation', ...scope, maxLogicalRequests: 1, maxProviderAttempts: 1,
+      authorizedReleaseSha: RELEASE_SHA, authorizedProviderAccountIdentity: model ? googleProjectIdentity('test-project') : vercelTeamProjectIdentity('team_test', 'project_test'),
       maxInputTokens: amounts.inputTokens, maxOutputTokens: amounts.outputTokens,
       maxSandboxIdentities: amounts.sandboxIdentities, maxSandboxRuntimeMs: amounts.sandboxRuntimeMs,
       sandboxResourceClass: model ? null : 'vcpu_1', maxVerificationAttempts: amounts.verificationAttempts,
       maxRepairLoopIterations: 0, maxConcurrentExternalOperations: 0, expiresAt, authorizedBy: operatorId, createdAt: NOW,
-      grantIdentity: computeExecutionGrantIdentity({ version: 1, scope: 'operation', ...scope, modelId: model ? 'gemini-3.1-flash-lite' : null,
-        acceptancePurpose: null, limits: { ...amounts, maxConcurrentExternalOperations: 0 }, expiresAt: expiresAt.toISOString(), authorizedBy: operatorId }),
+      grantIdentity: computeExecutionGrantIdentity({ version: 2, scope: 'operation', ...scope, modelId: model ? 'gemini-3.1-flash-lite' : null,
+        acceptancePurpose: null, limits: { ...amounts, maxConcurrentExternalOperations: 0 }, expiresAt: expiresAt.toISOString(), authorizedBy: operatorId,
+        authorizedReleaseSha: RELEASE_SHA, authorizedProviderAccountIdentity: model ? googleProjectIdentity('test-project') : vercelTeamProjectIdentity('team_test', 'project_test') }),
     });
-    const permit = await authorizer.reserve({ grantId, accountGrantId, scope, amounts, ...(!model ? { sandbox: sandboxBinding } : {}) });
+    const permit = await authorizer.reserve({ grantId, accountGrantId, scope, amounts, ...(!model ? { sandbox: sandboxBinding } : {}),
+      providerAccountIdentity: model ? googleProjectIdentity('test-project') : vercelTeamProjectIdentity('team_test', 'project_test') });
     if (model) {
       const ordinal = await permit.beginProviderAttempt();
       await permit.finishProviderAttempt(ordinal, 'succeeded');
@@ -339,7 +359,7 @@ for (const defect of ['ambiguous_outcome', 'ambiguous_lease', 'unresolved_outcom
     const context = await createTestContext(); t.after(() => context.client.close());
     const seeded = await seedPublicationAcceptances(context);
     const boundary = { kind: 'repair_loop_live' as const, workspaceId: seeded.authority.workspaceId,
-      releasedCommitSha: RELEASE_SHA, boundaryVersion: 'repair-loop-live-v1', protocolVersion: 4,
+      releasedCommitSha: RELEASE_SHA, boundaryVersion: 'repair-loop-live-v2', protocolVersion: 4,
       providerId: 'google', modelId: 'gemini-3.1-flash-lite' };
     assert.equal((await resolveReleaseAcceptance(context.database, boundary)).id, seeded.repair.id);
     const [reservation] = await context.database.select().from(externalExecutionReservation).where(and(
@@ -382,16 +402,16 @@ async function insertBootstrapGrant(
     sandboxIdentities: 0, sandboxRuntimeMs: 0, verificationAttempts: 0, repairLoopIterations: 0,
     maxConcurrentExternalOperations: 0 };
   await context.database.insert(executionBudgetGrant).values({
-    id, version: 1, scope: 'one_shot', workspaceId: seeded.authority.workspaceId,
+    id, version: 2, scope: 'one_shot', workspaceId: seeded.authority.workspaceId,
     repairRunId: seeded.authority.repairRunId, githubRepositoryId: REPOSITORY_ID, baseCommitSha: COMMIT,
-    operationCategory: 'release_acceptance_one_shot', providerId: 'vigilo', acceptancePurpose: purpose,
+    operationCategory: 'release_acceptance_one_shot', providerId: 'vigilo', acceptancePurpose: purpose, authorizedReleaseSha: RELEASE_SHA,
     maxLogicalRequests: 1, maxProviderAttempts: 0, maxInputTokens: 0, maxOutputTokens: 0,
     maxSandboxIdentities: 0, maxSandboxRuntimeMs: 0, maxVerificationAttempts: 0, maxRepairLoopIterations: 0,
     maxConcurrentExternalOperations: 0, expiresAt, authorizedBy, createdAt: NOW,
-    grantIdentity: computeExecutionGrantIdentity({ version: 1, scope: 'one_shot', workspaceId: seeded.authority.workspaceId,
+    grantIdentity: computeExecutionGrantIdentity({ version: 2, scope: 'one_shot', workspaceId: seeded.authority.workspaceId,
       repairRunId: seeded.authority.repairRunId, githubRepositoryId: REPOSITORY_ID, baseCommitSha: COMMIT,
       operationCategory: 'release_acceptance_one_shot', providerId: 'vigilo', modelId: null, acceptancePurpose: purpose,
-      limits, expiresAt: expiresAt.toISOString(), authorizedBy }),
+      limits, expiresAt: expiresAt.toISOString(), authorizedBy, authorizedReleaseSha: RELEASE_SHA, authorizedProviderAccountIdentity: null }),
   });
   return { id, purpose };
 }
@@ -419,6 +439,38 @@ test('partial acceptance sets and wrong release or subject identities remain una
     { ...seeded.authority, verificationEvidenceIdentity: '9'.repeat(64) },
     { ...seeded.authority, humanReviewDecisionId: randomUUID() },
   ]) await assert.rejects(resolvePublicationReleaseAuthority(context.database, changed, RELEASE_SHA, { clock: () => NOW }));
+});
+
+test('publication bootstrap rejects legacy or wrong-release one-shot authority before work is queued', async (t) => {
+  for (const kind of ['legacy', 'wrong_release'] as const) {
+    await t.test(kind, async (subtest) => {
+      const context = await createTestContext(); subtest.after(() => context.client.close());
+      const seeded = await seedPublicationAcceptances(context);
+      const bootstrap = await insertBootstrapGrant(context, seeded);
+      const [grant] = await context.database.select().from(executionBudgetGrant).where(eq(executionBudgetGrant.id, bootstrap.id));
+      assert.ok(grant);
+      const version = kind === 'legacy' ? 1 : 2;
+      const authorizedReleaseSha = kind === 'legacy' ? null : '8'.repeat(40);
+      const grantIdentity = computeExecutionGrantIdentity({ version, scope: 'one_shot',
+        workspaceId: grant.workspaceId, repairRunId: grant.repairRunId,
+        githubRepositoryId: grant.githubRepositoryId, baseCommitSha: grant.baseCommitSha,
+        operationCategory: 'release_acceptance_one_shot', providerId: grant.providerId, modelId: grant.modelId,
+        acceptancePurpose: grant.acceptancePurpose,
+        limits: { logicalRequests: grant.maxLogicalRequests, providerAttempts: grant.maxProviderAttempts,
+          inputTokens: grant.maxInputTokens, outputTokens: grant.maxOutputTokens,
+          sandboxIdentities: grant.maxSandboxIdentities, sandboxRuntimeMs: grant.maxSandboxRuntimeMs,
+          verificationAttempts: grant.maxVerificationAttempts, repairLoopIterations: grant.maxRepairLoopIterations,
+          maxConcurrentExternalOperations: grant.maxConcurrentExternalOperations },
+        expiresAt: grant.expiresAt.toISOString(), authorizedBy: grant.authorizedBy,
+        authorizedReleaseSha, authorizedProviderAccountIdentity: null });
+      // Confine historical/catalog corruption to this disposable database; the resolver must reject independently.
+      await context.database.execute(sql`drop trigger execution_budget_grant_mutation_guard on execution_budget_grant`);
+      await context.database.update(executionBudgetGrant).set({ version, authorizedReleaseSha, grantIdentity })
+        .where(eq(executionBudgetGrant.id, bootstrap.id));
+      await assert.rejects(resolvePublicationReleaseAuthority(context.database, seeded.authority, RELEASE_SHA, { clock: () => NOW }),
+        (error: unknown) => error instanceof ReleaseAcceptanceError && error.code === 'acceptance_missing');
+    });
+  }
 });
 
 test('acceptance-publication bootstrap is exact, expiring, revocable, and one-shot under concurrency', async (t) => {

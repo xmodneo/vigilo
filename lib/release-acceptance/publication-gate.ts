@@ -21,14 +21,14 @@ import { ReleaseAcceptanceError, resolveReleaseAcceptance, verifyAcceptanceExecu
 
 export const PUBLICATION_ACCEPTANCE_BOUNDARIES = Object.freeze({
   repair_loop_live: Object.freeze({
-    boundaryVersion: 'repair-loop-live-v1',
+    boundaryVersion: 'repair-loop-live-v2',
     protocolVersion: REPAIR_LOOP_AI_CANDIDATE_GENERATION_PROTOCOL_VERSION,
     providerId: AI_PROVIDER_ID,
     modelId: AI_MODEL_ID,
   }),
   human_review_live: Object.freeze({ boundaryVersion: 'human-review-v1' }),
   draft_publication_live: Object.freeze({ boundaryVersion: 'draft-publication-v1' }),
-  security_cost_control: Object.freeze({ boundaryVersion: 'external-authority-v1' }),
+  security_cost_control: Object.freeze({ boundaryVersion: 'external-authority-v2' }),
 });
 
 const BOOTSTRAP_PROVIDER_ID = 'vigilo';
@@ -177,8 +177,9 @@ function boundary(kind: keyof typeof PUBLICATION_ACCEPTANCE_BOUNDARIES, workspac
   return { kind, workspaceId, releasedCommitSha, ...PUBLICATION_ACCEPTANCE_BOUNDARIES[kind] };
 }
 
-function bootstrapGrantShape(grant: typeof executionBudgetGrant.$inferSelect, authority: ApprovedHumanReviewAuthority, purpose: string): boolean {
-  return grant.scope === 'one_shot' && grant.workspaceId === authority.workspaceId && grant.repairRunId === authority.repairRunId &&
+function bootstrapGrantShape(grant: typeof executionBudgetGrant.$inferSelect, authority: ApprovedHumanReviewAuthority, purpose: string, releasedCommitSha: string): boolean {
+  return grant.version === 2 && grant.authorizedReleaseSha === releasedCommitSha && grant.authorizedProviderAccountIdentity === null &&
+    grant.scope === 'one_shot' && grant.workspaceId === authority.workspaceId && grant.repairRunId === authority.repairRunId &&
     grant.githubRepositoryId === authority.githubRepositoryId && grant.baseCommitSha === authority.baseCommitSha &&
     grant.operationCategory === 'release_acceptance_one_shot' && grant.providerId === BOOTSTRAP_PROVIDER_ID &&
     grant.modelId === null && grant.acceptancePurpose === purpose && grant.sandboxResourceClass === null &&
@@ -199,7 +200,7 @@ async function exactBootstrapAuthority(
   const purpose = computePublicationBootstrapPurpose(authority, releasedCommitSha);
   const grants = await database.select().from(executionBudgetGrant);
   const account = grants.find((grant) => grant.id === security.executionBudgetGrantId);
-  const candidates = grants.filter((grant) => bootstrapGrantShape(grant, authority, purpose));
+  const candidates = grants.filter((grant) => bootstrapGrantShape(grant, authority, purpose, releasedCommitSha));
   if (!account || account.scope !== 'account' || account.authorizedBy !== authority.reviewerUserId ||
       account.expiresAt <= now || !executionGrantIdentityMatches(account) || candidates.length !== 1) {
     throw new ReleaseAcceptanceError('acceptance_missing');
@@ -215,7 +216,9 @@ async function exactBootstrapAuthority(
   if (!options.operationKey || reservations.length !== 1) throw new ReleaseAcceptanceError('acceptance_boundary_mismatch');
   const reservation = reservations[0]!;
   const [lease] = await database.select().from(externalExecutionLease).where(eq(externalExecutionLease.reservationId, reservation.id)).limit(1);
-  if (reservation.operationKey !== options.operationKey || reservation.accountGrantId !== account.id ||
+  if (reservation.version !== 2 || reservation.executingReleaseSha !== releasedCommitSha ||
+      reservation.executingProviderAccountIdentity !== null ||
+      reservation.operationKey !== options.operationKey || reservation.accountGrantId !== account.id ||
       reservation.workspaceId !== authority.workspaceId || reservation.repairRunId !== authority.repairRunId ||
       reservation.githubRepositoryId !== authority.githubRepositoryId || reservation.baseCommitSha !== authority.baseCommitSha ||
       reservation.operationCategory !== 'release_acceptance_one_shot' || reservation.providerId !== BOOTSTRAP_PROVIDER_ID ||
@@ -262,7 +265,9 @@ async function verifyPublishedBootstrap(
     objectiveEvidenceHash: decision.objectiveEvidenceHash,
   };
   const purpose = computePublicationBootstrapPurpose(acceptedAuthority, releasedCommitSha);
-  return Boolean(grant && bootstrapGrantShape(grant, acceptedAuthority, purpose) && reservation && lease && lease.state === 'succeeded' &&
+  return Boolean(grant && bootstrapGrantShape(grant, acceptedAuthority, purpose, releasedCommitSha) && reservation &&
+    reservation.version === 2 && reservation.executingReleaseSha === releasedCommitSha &&
+    reservation.executingProviderAccountIdentity === null && lease && lease.state === 'succeeded' &&
     reservation.grantId === grant.id && reservation.accountGrantId === security.executionBudgetGrantId &&
     reservation.operationKey === draft.repairPublicationId && reservation.acceptancePurpose === purpose &&
     executionReservationIdentityMatches(reservation));
