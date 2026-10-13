@@ -129,6 +129,50 @@ async function seedVerifiedReview(
   return { owner, userId, workspaceId, runId, baselineId, investigationId, aiInvestigationId, profileIdentity, loopId, iterationId, generationId, candidateId, candidateIdentity: storedCandidateIdentity, verificationId, evidenceId, file };
 }
 
+test('deselected repository retains exact human-review evidence but cannot admit a decision or publication authority', async (t) => {
+  const context = await createTestContext();
+  t.after(() => context.client.close());
+  const seeded = await seedVerifiedReview(context);
+  const before = await getHumanReview(context.database, seeded.owner, seeded.runId);
+  assert.equal(before.status, 'awaiting_decision');
+  const decision = await createHumanReviewDecision(context.database, seeded.owner, seeded.runId, {
+    decision: 'approved', reviewSubjectIdentity: before.reviewSubjectIdentity!, idempotencyKey: randomUUID(),
+  });
+
+  await context.database.update(repository).set({ isSelected: false }).where(eq(repository.githubRepositoryId, REPOSITORY_ID));
+  await context.database.insert(repository).values({ githubRepositoryId: REPOSITORY_ID + 1,
+    workspaceId: seeded.workspaceId, installationId: INSTALLATION_ID, ownerId: 1001,
+    ownerLogin: 'reviewer', name: 'next', fullName: 'reviewer/next', defaultBranch: 'main',
+    isPrivate: false, isSelected: true });
+
+  const historical = await getHumanReview(context.database, seeded.owner, seeded.runId);
+  assert.equal(historical.status, 'ineligible');
+  assert.equal(historical.reviewSubjectIdentity, before.reviewSubjectIdentity);
+  assert.equal(historical.subject?.candidate.id, seeded.candidateId);
+  assert.equal(historical.subject?.verification.id, seeded.verificationId);
+  assert.equal(historical.decision?.id, decision.id);
+  await assert.rejects(resolveApprovedHumanReviewAuthority(context.database, seeded.workspaceId, decision.id),
+    (error: unknown) => error instanceof HumanReviewError);
+});
+
+test('deselection before review prevents a new human decision while preserving evidence visibility', async (t) => {
+  const context = await createTestContext();
+  t.after(() => context.client.close());
+  const seeded = await seedVerifiedReview(context);
+  const before = await getHumanReview(context.database, seeded.owner, seeded.runId);
+  assert.equal(before.status, 'awaiting_decision');
+  await context.database.update(repository).set({ isSelected: false }).where(eq(repository.githubRepositoryId, REPOSITORY_ID));
+  const historical = await getHumanReview(context.database, seeded.owner, seeded.runId);
+  assert.equal(historical.status, 'ineligible');
+  assert.equal(historical.reviewSubjectIdentity, before.reviewSubjectIdentity);
+  assert.equal(historical.subject?.candidate.id, seeded.candidateId);
+  assert.equal(historical.decision, null);
+  await assert.rejects(createHumanReviewDecision(context.database, seeded.owner, seeded.runId, {
+    decision: 'approved', reviewSubjectIdentity: before.reviewSubjectIdentity!, idempotencyKey: randomUUID(),
+  }), (error: unknown) => error instanceof HumanReviewError);
+  assert.equal((await context.database.select().from(humanReviewDecision)).length, 0);
+});
+
 const EMPTY_TREE = '4b825dc642cb6eb9a060e54bf8d69288fbee4904';
 type PublicationRow = typeof repairPublication.$inferSelect;
 

@@ -158,12 +158,22 @@ endpoint contacts an external provider.
 
 ## Current release and acceptance state
 
-- The checked source migration ledger is `0000` through `0024`. Migration
-  `0024_execution-provenance.sql` is not applied to the persistent local
-  development database by this implementation task.
-- Migration `0023_operational-readiness.sql` has been applied to the positively
-  identified local development database. This local fact says nothing about
-  production, staging, shared databases, or arbitrary deployments.
+- The checked source migration ledger is `0000` through `0025`.
+  `0025_repository-selection-history.sql` has been applied to the positively
+  identified persistent local Vigilo development database, whose ledger has 26
+  consistent entries. This local fact says nothing about production, staging,
+  shared databases, or arbitrary deployments.
+- The local selected repository remains `xmodneo/vigilo`. The authenticated
+  switch to `xmodneo/vigilo-acceptance-fixture` has not occurred, and M7.7 live
+  acceptance has not started.
+- With 0025 applied locally, changing the selected repository retains old
+  repository, profile, run, and baseline rows as history. A switch or loss-of-access
+  deselection is blocked by active run/investigation/AI-generation/verification/
+  repair-loop/publication states, active attempts, unexpired operation or one-shot
+  grants, active or ambiguous external leases, and unfinished provider attempts.
+  Parked `ready_for_investigation` runs do not block selection, but cannot start
+  new work while their repository is deselected. Profile detection for a newly
+  selected repository remains a separate explicit action.
 - `0020_human-review.sql`, `0021_repair-publication.sql`, and
   `0022_external-execution-authority.sql` were likewise applied only to the
   positively identified local development database during their reviewed

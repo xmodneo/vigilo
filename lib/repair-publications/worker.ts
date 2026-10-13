@@ -168,7 +168,7 @@ function branchMayAlreadyExist(publication: PublicationRow): boolean {
 }
 
 async function prepare(dependencies: RepairPublicationWorkerDependencies, publication: PublicationRow, accessToken: string, owner: string, name: string, now: Date): Promise<PreparedGitPublication> {
-  const [selected] = await dependencies.database.select().from(repository).where(and(eq(repository.githubRepositoryId, publication.githubRepositoryId), eq(repository.workspaceId, publication.workspaceId), eq(repository.installationId, publication.installationId))).limit(1);
+  const [selected] = await dependencies.database.select().from(repository).where(and(eq(repository.githubRepositoryId, publication.githubRepositoryId), eq(repository.workspaceId, publication.workspaceId), eq(repository.installationId, publication.installationId), eq(repository.isSelected, true))).limit(1);
   if (!selected || !selected.defaultBranch || selected.ownerLogin !== owner || selected.name !== name || selected.fullName !== `${owner}/${name}`) throw new PublicationWorkerError('repository_state_changed', 'failed');
   const metadata = await dependencies.gateway.getRepositoryMetadata(accessToken, owner, name);
   if (metadata.id !== selected.githubRepositoryId || metadata.fullName !== selected.fullName || metadata.defaultBranch !== selected.defaultBranch || metadata.isPrivate !== selected.isPrivate) throw new PublicationWorkerError('repository_state_changed', 'failed');

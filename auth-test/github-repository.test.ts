@@ -1,13 +1,21 @@
 import assert from 'node:assert/strict';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
+import { eq } from 'drizzle-orm';
+
 import {
   executionProfile,
+  executionBudgetGrant,
+  executionBudgetGrantRevocation,
+  externalExecutionReservation,
   githubInstallation,
   githubRepositoryAccessAttempt,
+  repairRun,
+  repairRunSourceCheckpoint,
   repository,
+  repositoryBaseline,
 } from '../db/schema.ts';
 import {
   AccessDeniedError,
@@ -22,6 +30,12 @@ import {
   RepositoryAccessError,
 } from '../lib/github-repositories/flow.ts';
 import { createGitHubRepositoryHandlers } from '../lib/github-repositories/handlers.ts';
+import { getCurrentExecutionProfile } from '../lib/execution-profiles/flow.ts';
+import { assertPublicRepositoryAuthority } from '../lib/github-repositories/policy.ts';
+import { resolveBaselineAuthority } from '../lib/repository-baselines/authority.ts';
+import { getRepairRun, startRepairRun } from '../lib/repair-runs/flow.ts';
+import { computeExecutionGrantIdentity } from '../lib/external-execution/identity.ts';
+import { googleProjectIdentity } from '../lib/external-execution/provider-account.ts';
 import type {
   GitHubRepository,
   GitHubRepositoryAccessGateway,
@@ -336,7 +350,7 @@ test('write access lost after listing is rejected by fresh selection authorizati
   assert.equal((await testContext.database.select().from(repository)).length, 0);
 });
 
-test('selecting a different stable repository invalidates the previous execution profile', async (t) => {
+test('selecting a different stable repository retains the historical repository and execution profile', async (t) => {
   const testContext = await createTestContext();
   t.after(() => testContext.client.close());
   const authenticated = await authenticatedWorkspace(testContext);
@@ -374,6 +388,12 @@ test('selecting a different stable repository invalidates the previous execution
     workspaceId: authenticated.context.workspace.id,
   });
 
+  const sameState = 'same-selection-state-0123456789ab';
+  await authorize(testContext.database, authenticated.context, { operation: 'select', repositoryId: FIRST_REPOSITORY.id }, sameState);
+  await complete(testContext.database, authenticated.context, gateway, sameState);
+  assert.equal((await testContext.database.select().from(repository)).length, 1);
+  assert.equal((await testContext.database.select().from(executionProfile)).length, 1);
+
   const secondState = 'second-selection-state-0123456789';
   await authorize(
     testContext.database,
@@ -388,8 +408,158 @@ test('selecting a different stable repository invalidates the previous execution
     secondState,
   );
 
-  assert.equal((await testContext.database.select().from(repository))[0]?.githubRepositoryId, SECOND_REPOSITORY.id);
-  assert.equal((await testContext.database.select().from(executionProfile)).length, 0);
+  const repositories = await testContext.database.select().from(repository);
+  assert.equal(repositories.length, 2);
+  assert.equal(repositories.find((value) => value.githubRepositoryId === FIRST_REPOSITORY.id)?.isSelected, false);
+  assert.equal(repositories.find((value) => value.githubRepositoryId === SECOND_REPOSITORY.id)?.isSelected, true);
+  assert.equal((await testContext.database.select().from(executionProfile)).length, 1);
+  assert.equal(await getCurrentExecutionProfile(testContext.database, authenticated.context), null);
+  assert.equal((await getRepositoryOverview(testContext.database, authenticated.context, NOW)).selected?.githubRepositoryId, SECOND_REPOSITORY.id);
+  await assert.rejects(assertPublicRepositoryAuthority(testContext.database, authenticated.context.workspace.id, FIRST_REPOSITORY.id));
+  await assert.rejects(resolveBaselineAuthority(testContext.database, authenticated.context));
+  let queued = false;
+  await assert.rejects(startRepairRun(testContext.database, authenticated.context, randomUUID(),
+    'Repair the required test.', { enqueue: async () => { queued = true; return 'unexpected'; } }));
+  assert.equal(queued, false);
+  assert.equal((await testContext.database.select().from(repairRun)).length, 0);
+  assert.equal((await testContext.database.select().from(repositoryBaseline)).length, 0);
+  assert.equal((await testContext.database.select().from(repairRunSourceCheckpoint)).length, 0);
+  assert.equal((await testContext.database.select().from(executionBudgetGrant)).length, 0);
+  assert.equal((await testContext.database.select().from(externalExecutionReservation)).length, 0);
+
+  const returnState = 'return-selection-state-0123456789';
+  await authorize(testContext.database, authenticated.context, { operation: 'select', repositoryId: FIRST_REPOSITORY.id }, returnState);
+  await complete(testContext.database, authenticated.context, gateway, returnState);
+  assert.ok(await getCurrentExecutionProfile(testContext.database, authenticated.context));
+  const other = await authenticatedWorkspace(testContext, '2002');
+  await testContext.database.update(repository).set({ installationId: other.installationId })
+    .where(eq(repository.githubRepositoryId, FIRST_REPOSITORY.id));
+  assert.equal(await getCurrentExecutionProfile(testContext.database, authenticated.context), null,
+    'a profile from another installation is historical, not current authority');
+});
+
+test('parked ready-for-investigation run and baseline remain readable but cannot authorize new work after switch', async (t) => {
+  const testContext = await createTestContext();
+  t.after(() => testContext.client.close());
+  const authenticated = await authenticatedWorkspace(testContext);
+  const gateway = new FakeRepositoryGateway();
+  gateway.repositories = [FIRST_REPOSITORY, SECOND_REPOSITORY].map((value) => providerRepository(value, { push: true }));
+  await authorize(testContext.database, authenticated.context, { operation: 'select', repositoryId: FIRST_REPOSITORY.id });
+  await complete(testContext.database, authenticated.context, gateway);
+  const baselineId = randomUUID();
+  const runId = randomUUID();
+  const profileIdentity = 'a'.repeat(64);
+  const baseCommitSha = 'b'.repeat(40);
+  await testContext.database.insert(repositoryBaseline).values({ id: baselineId,
+    workspaceId: authenticated.context.workspace.id, githubRepositoryId: FIRST_REPOSITORY.id,
+    installationId: authenticated.installationId, evidenceVersion: 1, profileIdentity, baseCommitSha,
+    archiveSha256: 'c'.repeat(64), sandboxName: 'historical-evidence', sourceIdentityBefore: 'd'.repeat(64),
+    sourceIdentityAfter: 'd'.repeat(64), sourceUnchanged: true, credentialsExposure: 'absent', networkPolicy: 'deny-all',
+    installStatus: 'completed', installExitCode: 0, installTimedOut: false,
+    typecheckStatus: 'completed', typecheckExitCode: 0, typecheckTimedOut: false,
+    buildStatus: 'completed', buildExitCode: 0, buildTimedOut: false,
+    testStatus: 'failed', testExitCode: 1, testTimedOut: false,
+    executionOutcome: 'test_failed', overallOutcome: 'test_failed',
+    cleanupStop: 'confirmed', cleanupDelete: 'confirmed', cleanupLookup: 'absent',
+    errorPhase: 'test', errorCode: 'npm_command_failed', startedAt: NOW, completedAt: NOW, durationMs: 1 });
+  await testContext.database.insert(repairRun).values({ id: runId,
+    workspaceId: authenticated.context.workspace.id, githubRepositoryId: FIRST_REPOSITORY.id,
+    installationId: authenticated.installationId, profileIdentity, baseCommitSha,
+    idempotencyKey: randomUUID(), state: 'ready_for_investigation', baselineId,
+    baselineOutcome: 'test_failed', failureClassification: 'customer_baseline_failure', failureCode: 'test_failed',
+    baselineStartedAt: NOW, completedAt: NOW, stateChangedAt: NOW, updatedAt: NOW });
+  const nextState = 'parked-switch-0123456789abcdef';
+  await authorize(testContext.database, authenticated.context, { operation: 'select', repositoryId: SECOND_REPOSITORY.id }, nextState);
+  await complete(testContext.database, authenticated.context, gateway, nextState);
+  assert.equal((await getRepairRun(testContext.database, authenticated.context, runId))?.identity.githubRepositoryId, FIRST_REPOSITORY.id);
+  assert.equal((await testContext.database.select().from(repositoryBaseline))[0]?.id, baselineId);
+  await assert.rejects(assertPublicRepositoryAuthority(testContext.database, authenticated.context.workspace.id, FIRST_REPOSITORY.id));
+});
+
+test('an active repair job blocks switching, while terminal history does not', async (t) => {
+  const testContext = await createTestContext();
+  t.after(() => testContext.client.close());
+  const authenticated = await authenticatedWorkspace(testContext);
+  const gateway = new FakeRepositoryGateway();
+  gateway.repositories = [
+    providerRepository(FIRST_REPOSITORY, { push: true }),
+    providerRepository(SECOND_REPOSITORY, { push: true }),
+  ];
+  await authorize(testContext.database, authenticated.context, { operation: 'select', repositoryId: FIRST_REPOSITORY.id });
+  await complete(testContext.database, authenticated.context, gateway);
+  const runId = randomUUID();
+  await testContext.database.insert(repairRun).values({
+    id: runId, workspaceId: authenticated.context.workspace.id,
+    githubRepositoryId: FIRST_REPOSITORY.id, installationId: authenticated.installationId,
+    profileIdentity: 'a'.repeat(64), baseCommitSha: 'b'.repeat(40), idempotencyKey: randomUUID(), state: 'created',
+  });
+  const blockedState = 'blocked-switch-0123456789abcdef';
+  await authorize(testContext.database, authenticated.context, { operation: 'select', repositoryId: SECOND_REPOSITORY.id }, blockedState);
+  await assert.rejects(complete(testContext.database, authenticated.context, gateway, blockedState),
+    (error: unknown) => error instanceof RepositoryAccessError && error.code === 'repository_conflict');
+  assert.equal((await getRepositoryOverview(testContext.database, authenticated.context, NOW)).selected?.githubRepositoryId, FIRST_REPOSITORY.id);
+  assert.equal((await testContext.database.select().from(repository)).length, 1);
+
+  await testContext.database.update(repairRun).set({ state: 'cancelled', completedAt: NOW,
+    failureClassification: 'cancelled', failureCode: 'cancelled_before_execution' }).where(eq(repairRun.id, runId));
+  const allowedState = 'allowed-switch-0123456789abcdef';
+  await authorize(testContext.database, authenticated.context, { operation: 'select', repositoryId: SECOND_REPOSITORY.id }, allowedState);
+  await complete(testContext.database, authenticated.context, gateway, allowedState);
+  assert.equal((await getRepositoryOverview(testContext.database, authenticated.context, NOW)).selected?.githubRepositoryId, SECOND_REPOSITORY.id);
+  assert.equal((await testContext.database.select().from(repairRun))[0]?.id, runId);
+});
+
+test('an unexpired operation grant blocks switching until explicitly revoked', async (t) => {
+  const testContext = await createTestContext();
+  t.after(() => testContext.client.close());
+  const authenticated = await authenticatedWorkspace(testContext);
+  const gateway = new FakeRepositoryGateway();
+  gateway.repositories = [
+    providerRepository(FIRST_REPOSITORY, { push: true }),
+    providerRepository(SECOND_REPOSITORY, { push: true }),
+  ];
+  await authorize(testContext.database, authenticated.context, { operation: 'select', repositoryId: FIRST_REPOSITORY.id });
+  await complete(testContext.database, authenticated.context, gateway);
+  const grantId = randomUUID();
+  const runId = randomUUID();
+  await testContext.database.insert(repairRun).values({ id: runId, workspaceId: authenticated.context.workspace.id,
+    githubRepositoryId: FIRST_REPOSITORY.id, installationId: authenticated.installationId,
+    profileIdentity: 'a'.repeat(64), baseCommitSha: 'b'.repeat(40), idempotencyKey: randomUUID(),
+    state: 'cancelled', completedAt: NOW, failureClassification: 'cancelled', failureCode: 'cancelled_before_execution' });
+  const expiresAt = new Date(NOW.getTime() + 60_000);
+  const providerAccount = googleProjectIdentity('fixture-project');
+  const limits = { logicalRequests: 1, providerAttempts: 1, inputTokens: 1000, outputTokens: 1000,
+    sandboxIdentities: 0, sandboxRuntimeMs: 0, verificationAttempts: 0, repairLoopIterations: 0,
+    maxConcurrentExternalOperations: 0 };
+  await testContext.database.insert(executionBudgetGrant).values({
+    id: grantId, version: 2, scope: 'operation', workspaceId: authenticated.context.workspace.id,
+    repairRunId: runId, githubRepositoryId: FIRST_REPOSITORY.id, baseCommitSha: 'b'.repeat(40),
+    operationCategory: 'gemini_investigation',
+    providerId: 'google', modelId: 'gemini-3.1-flash-lite',
+    authorizedReleaseSha: 'c'.repeat(40), authorizedProviderAccountIdentity: providerAccount,
+    maxLogicalRequests: limits.logicalRequests, maxProviderAttempts: limits.providerAttempts,
+    maxInputTokens: limits.inputTokens, maxOutputTokens: limits.outputTokens,
+    maxSandboxIdentities: 0, maxSandboxRuntimeMs: 0, maxVerificationAttempts: 0,
+    maxRepairLoopIterations: 0, maxConcurrentExternalOperations: 0,
+    expiresAt, authorizedBy: 'test-operator',
+    grantIdentity: computeExecutionGrantIdentity({ version: 2, scope: 'operation',
+      workspaceId: authenticated.context.workspace.id, repairRunId: runId,
+      githubRepositoryId: FIRST_REPOSITORY.id, baseCommitSha: 'b'.repeat(40),
+      operationCategory: 'gemini_investigation', providerId: 'google', modelId: 'gemini-3.1-flash-lite',
+      acceptancePurpose: null, limits, expiresAt: expiresAt.toISOString(), authorizedBy: 'test-operator',
+      authorizedReleaseSha: 'c'.repeat(40), authorizedProviderAccountIdentity: providerAccount }),
+  });
+  const blockedState = 'grant-blocked-0123456789abcdef';
+  await authorize(testContext.database, authenticated.context, { operation: 'select', repositoryId: SECOND_REPOSITORY.id }, blockedState);
+  await assert.rejects(complete(testContext.database, authenticated.context, gateway, blockedState),
+    (error: unknown) => error instanceof RepositoryAccessError && error.code === 'repository_conflict');
+  assert.equal((await getRepositoryOverview(testContext.database, authenticated.context, NOW)).selected?.githubRepositoryId, FIRST_REPOSITORY.id);
+  await testContext.database.insert(executionBudgetGrantRevocation).values({ id: randomUUID(), grantId,
+    reasonCode: 'operator_revoked', revokedBy: 'test-operator' });
+  const allowedState = 'grant-cleared-0123456789abcdef';
+  await authorize(testContext.database, authenticated.context, { operation: 'select', repositoryId: SECOND_REPOSITORY.id }, allowedState);
+  await complete(testContext.database, authenticated.context, gateway, allowedState);
+  assert.equal((await getRepositoryOverview(testContext.database, authenticated.context, NOW)).selected?.githubRepositoryId, SECOND_REPOSITORY.id);
 });
 
 test('wrong user, inaccessible installation, replay, and cross-session state fail closed', async (t) => {
@@ -471,19 +641,58 @@ test('fresh listing reconciles renamed and removed selected repositories by stab
     fullName: 'octo-org/renamed-app',
     name: 'renamed-app',
   }, { push: true })];
-  await authorize(testContext.database, authenticated.context, { operation: 'list' }, renamedState);
-  await complete(testContext.database, authenticated.context, gateway, renamedState);
+  const renamedAt = new Date(NOW.getTime() + 1_000);
+  await beginRepositoryAuthorization(testContext.database, authenticated.context, CONFIGURATION,
+    { operation: 'list' }, { now: renamedAt, randomToken: tokenSequence(renamedState, VERIFIER) });
+  await completeRepositoryAuthorization(testContext.database, authenticated.context, gateway, CONFIGURATION,
+    { code: 'one-time-code', state: renamedState }, { now: renamedAt });
   assert.equal((await testContext.database.select().from(repository))[0]?.fullName, 'octo-org/renamed-app');
 
   const removedState = 'removed-state-0123456789abcdef';
   gateway.repositories = [];
-  await authorize(testContext.database, authenticated.context, { operation: 'list' }, removedState);
-  await complete(testContext.database, authenticated.context, gateway, removedState);
-  assert.equal((await testContext.database.select().from(repository)).length, 0);
+  const removedAt = new Date(renamedAt.getTime() + 1_000);
+  await beginRepositoryAuthorization(testContext.database, authenticated.context, CONFIGURATION,
+    { operation: 'list' }, { now: removedAt, randomToken: tokenSequence(removedState, VERIFIER) });
+  await completeRepositoryAuthorization(testContext.database, authenticated.context, gateway, CONFIGURATION,
+    { code: 'one-time-code', state: removedState }, { now: removedAt });
+  const [historical] = await testContext.database.select().from(repository);
+  assert.equal(historical?.githubRepositoryId, FIRST_REPOSITORY.id);
+  assert.equal(historical?.isSelected, false);
+  assert.equal((await getRepositoryOverview(testContext.database, authenticated.context, NOW)).selected, null);
   assert.deepEqual(
     (await getRepositoryOverview(testContext.database, authenticated.context, NOW)).repositories,
     [],
   );
+});
+
+test('a stale listing callback cannot clear a repository selected after that listing began', async (t) => {
+  const testContext = await createTestContext();
+  t.after(() => testContext.client.close());
+  const authenticated = await authenticatedWorkspace(testContext);
+  const firstGateway = new FakeRepositoryGateway();
+  await authorize(testContext.database, authenticated.context, { operation: 'select', repositoryId: FIRST_REPOSITORY.id });
+  await complete(testContext.database, authenticated.context, firstGateway);
+
+  const staleState = 'stale-listing-0123456789abcdef';
+  const initiatedAt = new Date(NOW.getTime() + 1_000);
+  await beginRepositoryAuthorization(testContext.database, authenticated.context, CONFIGURATION,
+    { operation: 'list' }, { now: initiatedAt, randomToken: tokenSequence(staleState, VERIFIER) });
+  const switchState = 'new-selection-0123456789abcdef';
+  const selectedAt = new Date(initiatedAt.getTime() + 1_000);
+  const switchGateway = new FakeRepositoryGateway();
+  switchGateway.repositories = [FIRST_REPOSITORY, SECOND_REPOSITORY].map((value) => providerRepository(value, { push: true }));
+  await beginRepositoryAuthorization(testContext.database, authenticated.context, CONFIGURATION,
+    { operation: 'select', repositoryId: SECOND_REPOSITORY.id },
+    { now: selectedAt, randomToken: tokenSequence(switchState, VERIFIER) });
+  await completeRepositoryAuthorization(testContext.database, authenticated.context, switchGateway, CONFIGURATION,
+    { code: 'one-time-code', state: switchState }, { now: selectedAt });
+
+  const staleGateway = new FakeRepositoryGateway();
+  staleGateway.repositories = [providerRepository(FIRST_REPOSITORY, { push: true })];
+  await completeRepositoryAuthorization(testContext.database, authenticated.context, staleGateway, CONFIGURATION,
+    { code: 'one-time-code', state: staleState }, { now: new Date(selectedAt.getTime() + 1_000) });
+  assert.equal((await getRepositoryOverview(testContext.database, authenticated.context,
+    new Date(selectedAt.getTime() + 1_000))).selected?.githubRepositoryId, SECOND_REPOSITORY.id);
 });
 
 test('database uniqueness prevents one repository from being selected by two workspaces', async (t) => {
@@ -503,6 +712,57 @@ test('database uniqueness prevents one repository from being selected by two wor
     complete(testContext.database, second.context, secondGateway, secondState),
     (error: unknown) => error instanceof RepositoryAccessError && error.code === 'repository_conflict',
   );
+});
+
+test('cross-workspace target conflict rolls back and retains the previous selection', async (t) => {
+  const testContext = await createTestContext();
+  t.after(() => testContext.client.close());
+  const first = await authenticatedWorkspace(testContext, '2001', 'first-conflict@example.test');
+  const second = await authenticatedWorkspace(testContext, '2002', 'second-conflict@example.test');
+  const firstGateway = new FakeRepositoryGateway();
+  firstGateway.repositories = [providerRepository(SECOND_REPOSITORY, { push: true })];
+  await authorize(testContext.database, first.context, { operation: 'select', repositoryId: SECOND_REPOSITORY.id });
+  await complete(testContext.database, first.context, firstGateway);
+
+  const secondGateway = new FakeRepositoryGateway();
+  secondGateway.userId = '2002';
+  secondGateway.installationIds = [9002];
+  secondGateway.repositories = [
+    providerRepository(FIRST_REPOSITORY, { push: true }),
+    providerRepository(SECOND_REPOSITORY, { push: true }),
+  ];
+  const initial = 'rollback-initial-0123456789abcd';
+  await authorize(testContext.database, second.context, { operation: 'select', repositoryId: FIRST_REPOSITORY.id }, initial);
+  await complete(testContext.database, second.context, secondGateway, initial);
+  const conflict = 'rollback-conflict-0123456789abcd';
+  await authorize(testContext.database, second.context, { operation: 'select', repositoryId: SECOND_REPOSITORY.id }, conflict);
+  await assert.rejects(complete(testContext.database, second.context, secondGateway, conflict),
+    (error: unknown) => error instanceof RepositoryAccessError && error.code === 'repository_conflict');
+  assert.equal((await getRepositoryOverview(testContext.database, second.context, NOW)).selected?.githubRepositoryId, FIRST_REPOSITORY.id);
+  assert.equal((await testContext.database.select().from(repository)).length, 2);
+});
+
+test('competing switches leave exactly one selected row and retain historical repositories', async (t) => {
+  const testContext = await createTestContext();
+  t.after(() => testContext.client.close());
+  const authenticated = await authenticatedWorkspace(testContext);
+  const third = { ...SECOND_REPOSITORY, id: 8103, name: 'third', fullName: 'octo-org/third' };
+  const gateway = new FakeRepositoryGateway();
+  gateway.repositories = [FIRST_REPOSITORY, SECOND_REPOSITORY, third].map((value) => providerRepository(value, { push: true }));
+  await authorize(testContext.database, authenticated.context, { operation: 'select', repositoryId: FIRST_REPOSITORY.id });
+  await complete(testContext.database, authenticated.context, gateway);
+  const secondState = 'competing-second-0123456789abcd';
+  const thirdState = 'competing-third-0123456789abcde';
+  await authorize(testContext.database, authenticated.context, { operation: 'select', repositoryId: SECOND_REPOSITORY.id }, secondState);
+  await authorize(testContext.database, authenticated.context, { operation: 'select', repositoryId: third.id }, thirdState);
+  await Promise.allSettled([
+    complete(testContext.database, authenticated.context, gateway, secondState),
+    complete(testContext.database, authenticated.context, gateway, thirdState),
+  ]);
+  const rows = await testContext.database.select().from(repository);
+  assert.equal(rows.filter((row) => row.isSelected).length, 1);
+  assert.ok(rows.some((row) => row.githubRepositoryId === FIRST_REPOSITORY.id && !row.isSelected));
+  assert.ok([SECOND_REPOSITORY.id, third.id].includes(rows.find((row) => row.isSelected)!.githubRepositoryId));
 });
 
 test('selected public repository metadata remains scoped to its owning workspace', async (t) => {

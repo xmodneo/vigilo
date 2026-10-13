@@ -101,7 +101,8 @@ test('README presents the truthful controlled-beta contract', async () => {
   const readme = await readFile('README.md', 'utf8');
   assert.match(readme, /eligible public, single-package Node\.js 24\/npm repositories/i);
   assert.match(readme, /does not automatically merge or deploy/i);
-  assert.match(readme, /0023_operational-readiness\.sql` has been applied to the positively\s+identified local development database/i);
+  assert.match(readme, /0025_repository-selection-history\.sql` has been applied to the positively\s+identified persistent local Vigilo development database, whose ledger has 26\s+consistent entries/i);
+  assert.match(readme, /The local selected repository remains `xmodneo\/vigilo`\. The authenticated\s+switch to `xmodneo\/vigilo-acceptance-fixture` has not occurred, and M7\.7 live\s+acceptance has not started/i);
   assert.match(readme, /Task 4\.3 live acceptance remains pending/i);
   assert.match(readme, /publication remains hard-closed with `live_acceptance_pending`/i);
   assert.match(readme, /Application budgets[\s\S]*do not guarantee a provider bill or dollar amount/i);

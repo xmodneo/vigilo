@@ -29,7 +29,7 @@ test('disposable 0023→0024 upgrade preserves provenance-free historical rows a
   t.after(async () => { await client.close(); await rm(directory, { recursive: true, force: true }); });
   await mkdir(join(directory, 'meta'));
   const journal = JSON.parse(await readFile(join(root, 'meta', '_journal.json'), 'utf8')) as { entries: Array<{ idx: number; tag: string }> };
-  assert.equal(journal.entries.length, 25);
+  assert.equal(journal.entries.length, 26);
   await writeFile(join(directory, 'meta', '_journal.json'), JSON.stringify({ ...journal, entries: journal.entries.slice(0, 24) }));
   for (const entry of journal.entries.slice(0, 24)) await copyFile(join(root, `${entry.tag}.sql`), join(directory, `${entry.tag}.sql`));
   const database = drizzle(client);
@@ -43,8 +43,9 @@ test('disposable 0023→0024 upgrade preserves provenance-free historical rows a
     profileIdentity: 'c'.repeat(64), baseCommitSha: 'd'.repeat(40), idempotencyKey: randomUUID(), state: 'created' });
   await database.insert(githubInstallation).values({ installationId: 73, workspaceId, githubAccountId: 23,
     accountLogin: 'operator', accountType: 'User', status: 'active' });
-  await database.insert(repository).values({ githubRepositoryId: 42, workspaceId, installationId: 73, ownerId: 23,
-    ownerLogin: 'operator', name: 'repo', fullName: 'operator/repo', defaultBranch: 'main', isPrivate: false });
+  await database.execute(sql`insert into repository
+    (github_repository_id,workspace_id,installation_id,owner_id,owner_login,name,full_name,default_branch,is_private)
+    values (42,${workspaceId},73,23,'operator','repo','operator/repo','main',false)`);
   await database.insert(executionProfile).values({ githubRepositoryId: 42, workspaceId, installationId: 73, profileVersion: 2,
     profileIdentity: 'c'.repeat(64), baseCommitSha: 'd'.repeat(40), runtimeFamily: 'node', nodeMajor: 24,
     packageManager: 'npm', lockfileType: 'package-lock', installOperation: 'ci', typecheckScript: 'typecheck', buildScript: 'build',
@@ -128,7 +129,7 @@ test('disposable 0023→0024 upgrade preserves provenance-free historical rows a
   await migrate(database, { migrationsFolder: root });
   await validateMigrationFiles(process.cwd());
   const ledger = (await client.query<{ hash: string; created_at: string }>('select hash, created_at from drizzle.__drizzle_migrations order by id')).rows;
-  assert.equal(ledger.length, 25);
+  assert.equal(ledger.length, 26);
   assert.deepEqual(ledger.slice(0, 24), originalLedger);
   assert.deepEqual(ledger.map((row) => row.hash), MIGRATION_MANIFEST.map((entry) => entry.hash));
   assert.equal(ledger[24]?.hash, sha256(await readFile(join(root, '0024_execution-provenance.sql'), 'utf8')));

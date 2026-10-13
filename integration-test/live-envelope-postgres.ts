@@ -104,7 +104,7 @@ try {
   await migrate(drizzle(a), { migrationsFolder });
   const history = await a`select hash from drizzle.__drizzle_migrations order by created_at, id`;
   assert.deepEqual(history.map((row) => row.hash), readMigrationFiles({ migrationsFolder }).map((migration) => migration.hash));
-  assert.equal(history.length, 25);
+  assert.equal(history.length, 26);
 
   const databaseA = drizzle(a, { schema }); const databaseB = drizzle(b, { schema });
   const now = new Date(); const expiresAt = new Date(now.getTime() + 3_600_000); const accountId = randomUUID();

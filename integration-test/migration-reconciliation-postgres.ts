@@ -11,8 +11,13 @@ import { eq } from 'drizzle-orm';
 import postgres, { type Sql } from 'postgres';
 
 import * as schema from '../db/schema.ts';
+import type { AuthenticatedWorkspace } from '../lib/auth/protected-context.ts';
+import { lockExternalExecution } from '../lib/external-execution/business-fence.ts';
 import { computeExecutionGrantIdentity, computeExecutionReservationIdentity, computeReleaseAcceptanceIdentity,
   executionGrantIdentityMatches, executionReservationIdentityMatches } from '../lib/external-execution/identity.ts';
+import { beginRepositoryAuthorization, completeRepositoryAuthorization, RepositoryAccessError } from '../lib/github-repositories/flow.ts';
+import { assertPublicRepositoryAuthority } from '../lib/github-repositories/policy.ts';
+import type { GitHubRepository, GitHubRepositoryAccessGateway } from '../lib/github-repositories/types.ts';
 import { acceptanceIdentityPayload, verifyAcceptanceExecutionAudit } from '../lib/release-acceptance/resolver.ts';
 
 const configuredUrl = process.env.DATABASE_URL;
@@ -48,14 +53,14 @@ async function createMigrationFolder(lastIndex: number) {
   return folder;
 }
 
-async function withDisposableDatabase<T>(label: string, operation: (sql: Sql) => Promise<T>) {
+async function withDisposableDatabase<T>(label: string, operation: (sql: Sql, url: string) => Promise<T>) {
   const databaseName = `vigilo_reconcile_${label}_${randomUUID().replaceAll('-', '')}`;
   const url = new URL(databaseUrl); url.pathname = `/${databaseName}`;
   let sql: Sql | undefined;
   await admin.unsafe(`create database "${databaseName}"`);
   try {
     sql = postgres(url.toString(), { max: 1, prepare: false, onnotice: () => {} });
-    return await operation(sql);
+    return await operation(sql, url.toString());
   } finally {
     if (sql) await sql.end();
     await admin`select pg_terminate_backend(pid) from pg_stat_activity where datname = ${databaseName} and pid <> pg_backend_pid()`;
@@ -78,7 +83,7 @@ async function migrationRows(sql: Sql) {
 async function assertHistoricalHashes(sql: Sql) {
   const journal = JSON.parse(await readFile(join(migrationsFolder, 'meta/_journal.json'), 'utf8')) as { entries: Array<{ idx: number; tag: string }> };
   const rows = await migrationRows(sql);
-  assert.equal(rows.length, 25);
+  assert.equal(rows.length, 26);
   for (const [tag, expected] of historicalHashes) {
     const entry = journal.entries.find((candidate) => candidate.tag === tag);
     assert.ok(entry, tag);
@@ -102,7 +107,9 @@ async function seedRepresentativeRows(sql: Sql) {
   await database.insert(schema.user).values({ id: userId, name: 'Migration owner', email: `${userId}@test.invalid`, emailVerified: true });
   await database.insert(schema.workspace).values({ id: workspaceId, ownerUserId: userId });
   await database.insert(schema.githubInstallation).values({ installationId: INSTALLATION_ID, workspaceId, githubAccountId: 93001, accountLogin: 'migration-owner', accountType: 'User', status: 'active' });
-  await database.insert(schema.repository).values({ githubRepositoryId: REPOSITORY_ID, workspaceId, installationId: INSTALLATION_ID, ownerId: 93001, ownerLogin: 'migration-owner', name: 'migration-repo', fullName: 'migration-owner/migration-repo', defaultBranch: 'main', isPrivate: true });
+  await sql`insert into repository
+    (github_repository_id,workspace_id,installation_id,owner_id,owner_login,name,full_name,default_branch,is_private)
+    values (${REPOSITORY_ID},${workspaceId},${INSTALLATION_ID},93001,'migration-owner','migration-repo','migration-owner/migration-repo','main',true)`;
   await database.insert(schema.executionProfile).values({ githubRepositoryId: REPOSITORY_ID, workspaceId, installationId: INSTALLATION_ID, profileVersion: 2, profileIdentity: PROFILE, baseCommitSha: COMMIT, runtimeFamily: 'node', nodeMajor: 24, packageManager: 'npm', lockfileType: 'package-lock', installOperation: 'ci', typecheckScript: 'typecheck', buildScript: 'build', testScript: 'test', testRunner: 'vitest', packageJsonBlobSha: 'e'.repeat(40), packageJsonContentSha256: 'f'.repeat(64), packageLockBlobSha: '1'.repeat(40), packageLockContentSha256: '2'.repeat(64), status: 'ready' });
   await database.insert(schema.repositoryBaseline).values({ id: baselineId, workspaceId, githubRepositoryId: REPOSITORY_ID, installationId: INSTALLATION_ID, evidenceVersion: 1, profileIdentity: PROFILE, baseCommitSha: COMMIT, archiveSha256: '3'.repeat(64), sandboxName: 'migration-baseline', sourceIdentityBefore: SOURCE, sourceIdentityAfter: SOURCE, sourceUnchanged: true, credentialsExposure: 'absent', networkPolicy: 'deny-all', installStatus: 'completed', installExitCode: 0, installTimedOut: false, typecheckStatus: 'completed', typecheckExitCode: 0, typecheckTimedOut: false, buildStatus: 'completed', buildExitCode: 0, buildTimedOut: false, testStatus: 'completed', testExitCode: 0, testTimedOut: false, executionOutcome: 'baseline_passed', overallOutcome: 'baseline_passed', cleanupStop: 'confirmed', cleanupDelete: 'confirmed', cleanupLookup: 'absent', startedAt: NOW, completedAt: NOW, durationMs: 1 });
   await database.insert(schema.repairRun).values({ id: runId, workspaceId, githubRepositoryId: REPOSITORY_ID, installationId: INSTALLATION_ID, profileIdentity: PROFILE, baseCommitSha: COMMIT, idempotencyKey: randomUUID(), state: 'ready_for_investigation', baselineId, baselineOutcome: 'baseline_passed', baselineStartedAt: NOW, completedAt: NOW, stateChangedAt: NOW, updatedAt: NOW });
@@ -212,6 +219,15 @@ async function applyDocumentedManualCorrections(sql: Sql) {
 }
 
 async function assertFinalCatalog(sql: Sql) {
+  const [selection] = await sql<{ column: string | null; indexdef: string | null; oldUnique: number }[]>`
+    select
+      (select column_name from information_schema.columns where table_schema = 'public' and table_name = 'repository' and column_name = 'is_selected') as column,
+      (select indexdef from pg_indexes where schemaname = 'public' and indexname = 'repository_one_selected_per_workspace_unique') as indexdef,
+      (select count(*)::int from pg_constraint where conrelid = 'repository'::regclass and conname = 'repository_workspace_id_unique') as "oldUnique"
+  `;
+  assert.equal(selection?.column, 'is_selected');
+  assert.match(selection?.indexdef ?? '', /UNIQUE INDEX.*workspace_id.*WHERE.*is_selected/i);
+  assert.equal(selection?.oldUnique, 0);
   const [provenance] = await sql<{ checkpoint: string | null; guardCount: number }[]>`
     select to_regclass('public.repair_run_source_checkpoint')::text as checkpoint,
       (select count(*)::int from pg_trigger where tgname in ('execution_budget_grant_insert_provenance_guard','repair_run_provenance_guard','repository_baseline_provenance_guard','repair_run_source_checkpoint_guard','external_execution_reservation_provenance_guard','external_execution_event_provenance_guard') and not tgisinternal) as "guardCount"
@@ -315,7 +331,7 @@ async function schemaSnapshot(sql: Sql) {
   return snapshot?.value;
 }
 
-async function runUpgradePath(sql: Sql, historicalFolder: string, preProvenanceFolder: string, manuallyReconciled: boolean) {
+async function runUpgradePath(sql: Sql, historicalFolder: string, preProvenanceFolder: string, preSelectionFolder: string, manuallyReconciled: boolean) {
   await migrateFolder(sql, historicalFolder);
   assert.equal((await migrationRows(sql)).length, 18);
   const identifiers = await seedRepresentativeRows(sql);
@@ -323,8 +339,12 @@ async function runUpgradePath(sql: Sql, historicalFolder: string, preProvenanceF
   await migrateFolder(sql, preProvenanceFolder);
   assert.equal((await migrationRows(sql)).length, 24);
   const legacy = await seedLegacyExecutionRows(sql, identifiers);
+  await migrateFolder(sql, preSelectionFolder);
+  const beforeLedger = await migrationRows(sql);
+  assert.equal(beforeLedger.length, 25);
   const before = await dataFingerprint(sql);
   await migrateFolder(sql, migrationsFolder);
+  assert.deepEqual(Array.from((await migrationRows(sql)).slice(0, 25)), Array.from(beforeLedger));
   await assertHistoricalHashes(sql);
   await assertFinalCatalog(sql);
   assert.deepEqual(await dataFingerprint(sql), before);
@@ -339,6 +359,112 @@ async function runUpgradePath(sql: Sql, historicalFolder: string, preProvenanceF
   assert.equal(await verifyAcceptanceExecutionAudit(database as never, [legacy.reservationId]), true);
   assert.equal(await verifyAcceptanceExecutionAudit(database as never, [legacy.reservationId], COMMIT), false);
   return { identifiers, schema: await schemaSnapshot(sql), data: before };
+}
+
+async function nativeSelectionConcurrency(sql: Sql, url: string) {
+  await migrateFolder(sql, migrationsFolder);
+  const userId = randomUUID(); const workspaceId = randomUUID(); const sessionId = randomUUID();
+  const installationId = 99201; const accountId = '42';
+  const owner = 'fixture-owner';
+  const repositoryFor = (id: number, name: string): GitHubRepository => ({ id, name, ownerLogin: owner,
+    ownerId: 99301, fullName: `${owner}/${name}`, defaultBranch: 'main', isPrivate: false });
+  const [repoA, repoB, repoC, repoD, repoE] = [
+    repositoryFor(99101, 'a'), repositoryFor(99102, 'b'), repositoryFor(99103, 'c'),
+    repositoryFor(99104, 'd'), repositoryFor(99105, 'e'),
+  ];
+  const database = drizzle(sql, { schema });
+  await database.insert(schema.user).values({ id: userId, name: 'Disposable owner', email: `${userId}@test.invalid` });
+  await database.insert(schema.session).values({ id: sessionId, userId, token: randomUUID(), expiresAt: new Date(Date.now() + 60_000) });
+  await database.insert(schema.workspace).values({ id: workspaceId, ownerUserId: userId });
+  await database.insert(schema.githubInstallation).values({ installationId, workspaceId, githubAccountId: 99301,
+    accountLogin: owner, accountType: 'Organization', status: 'active' });
+  const context: AuthenticatedWorkspace = { sessionId, githubUserId: accountId,
+    user: { id: userId, name: 'Disposable owner', email: `${userId}@test.invalid` },
+    workspace: { id: workspaceId, ownerUserId: userId } };
+  const configuration = { appId: 1, appSlug: 'disposable', baseUrl: 'http://localhost:3000', clientId: 'disposable-client' };
+  const gateway = (target: GitHubRepository): GitHubRepositoryAccessGateway => ({
+    exchangeAuthorizationCode: async () => 'disposable-token',
+    getAuthenticatedUserId: async () => accountId,
+    listAccessibleInstallationIds: async () => [installationId],
+    listUserInstallationRepositories: async () => [{ ...target, permissions: { admin: false, push: true } }],
+    revokeUserAccessToken: async () => {},
+  });
+  const begin = async (target: GitHubRepository) => {
+    const state = randomUUID().replaceAll('-', '');
+    await beginRepositoryAuthorization(database, context, configuration, { operation: 'select', repositoryId: target.id },
+      { randomToken: (() => { const values = [state, randomUUID().replaceAll('-', '')]; return () => values.shift()!; })() });
+    return state;
+  };
+  const complete = (connection: Sql, target: GitHubRepository, state: string) => completeRepositoryAuthorization(
+    drizzle(connection, { schema }), context, gateway(target), configuration, { code: 'disposable-code', state });
+  const selected = async () => sql<{ id: number }[]>`select github_repository_id::int as id from repository where workspace_id = ${workspaceId} and is_selected = true`;
+  await complete(sql, repoA, await begin(repoA));
+
+  const first = postgres(url, { max: 1, prepare: false, onnotice: () => {} });
+  const second = postgres(url, { max: 1, prepare: false, onnotice: () => {} });
+  try {
+    // Independent PostgreSQL sessions must serialize A→B and A→C, and a
+    // repeated A→B must remain idempotent even when both callbacks race.
+    const [toB, toC] = await Promise.all([begin(repoB), begin(repoC)]);
+    const competing = await Promise.allSettled([complete(first, repoB, toB), complete(second, repoC, toC)]);
+    assert.ok(competing.every((result) => result.status === 'fulfilled'));
+    assert.equal((await selected()).length, 1);
+    assert.ok([repoB.id, repoC.id].includes((await selected())[0]!.id));
+    const [againB1, againB2] = await Promise.all([begin(repoB), begin(repoB)]);
+    const repeated = await Promise.allSettled([complete(first, repoB, againB1), complete(second, repoB, againB2)]);
+    assert.ok(repeated.every((result) => result.status === 'fulfilled'));
+    assert.deepEqual((await selected()).map((row) => row.id), [repoB.id]);
+
+    // A failure after D's historical-row insert, but before D selection,
+    // must roll back both the insert and the prior B deselection.
+    await sql.unsafe(`create function disposable_reject_d_selection() returns trigger language plpgsql as $$ begin
+      if new.github_repository_id = ${repoD.id} and new.is_selected then raise exception 'disposable_selection_failure'; end if;
+      return new; end $$`);
+    await sql.unsafe('create trigger disposable_reject_d_selection before update on repository for each row execute function disposable_reject_d_selection()');
+    await assert.rejects(complete(first, repoD, await begin(repoD)),
+      (error: unknown) => error instanceof RepositoryAccessError && error.code === 'repository_conflict');
+    assert.deepEqual((await selected()).map((row) => row.id), [repoB.id]);
+    assert.equal((await sql`select 1 from repository where github_repository_id = ${repoD.id}`).length, 0);
+    await sql.unsafe('drop trigger disposable_reject_d_selection on repository');
+    await sql.unsafe('drop function disposable_reject_d_selection()');
+
+    // A competing admission holds the same global lock. Once it inserts an
+    // active A/B run, the waiting switch must observe it and fail closed.
+    let signalAdmission!: () => void;
+    let releaseAdmission!: () => void;
+    const admitted = new Promise<void>((resolve) => { signalAdmission = resolve; });
+    const release = new Promise<void>((resolve) => { releaseAdmission = resolve; });
+    const admission = drizzle(first, { schema }).transaction(async (transaction) => {
+      await lockExternalExecution(transaction);
+      signalAdmission();
+      await release;
+      await transaction.insert(schema.repairRun).values({ id: randomUUID(), workspaceId,
+        githubRepositoryId: repoB.id, installationId, profileIdentity: 'a'.repeat(64),
+        baseCommitSha: 'b'.repeat(40), idempotencyKey: randomUUID(), state: 'created' });
+    });
+    await admitted;
+    const blockedSwitch = complete(second, repoD, await begin(repoD));
+    releaseAdmission();
+    await admission;
+    await assert.rejects(blockedSwitch,
+      (error: unknown) => error instanceof RepositoryAccessError && error.code === 'repository_conflict');
+    assert.deepEqual((await selected()).map((row) => row.id), [repoB.id]);
+
+    // The partial unique index rejects a second selected row, including a
+    // direct write that bypasses the application flow entirely.
+    await database.insert(schema.repository).values({ githubRepositoryId: repoE.id, workspaceId, installationId,
+      ownerId: repoE.ownerId, ownerLogin: owner, name: repoE.name, fullName: repoE.fullName,
+      defaultBranch: 'main', isPrivate: false, isSelected: false });
+    await assert.rejects(database.update(schema.repository).set({ isSelected: true })
+      .where(eq(schema.repository.githubRepositoryId, repoE.id)));
+    assert.deepEqual((await selected()).map((row) => row.id), [repoB.id]);
+    await database.update(schema.repository).set({ isSelected: false }).where(eq(schema.repository.githubRepositoryId, repoB.id));
+    await assert.rejects(assertPublicRepositoryAuthority(database, workspaceId, repoB.id));
+    assert.equal((await selected()).length, 0);
+  } finally {
+    await first.end();
+    await second.end();
+  }
 }
 
 type FailureCase = { name: string; expected: string; corrupt: (sql: Sql) => Promise<unknown> };
@@ -363,11 +489,13 @@ function errorChain(error: unknown) {
 
 const historicalFolder = await createMigrationFolder(17);
 const preProvenanceFolder = await createMigrationFolder(23);
+const preSelectionFolder = await createMigrationFolder(24);
 try {
-  const clean = await withDisposableDatabase('clean', (sql) => runUpgradePath(sql, historicalFolder, preProvenanceFolder, false));
-  const historical = await withDisposableDatabase('historical', (sql) => runUpgradePath(sql, historicalFolder, preProvenanceFolder, true));
+  const clean = await withDisposableDatabase('clean', (sql) => runUpgradePath(sql, historicalFolder, preProvenanceFolder, preSelectionFolder, false));
+  const historical = await withDisposableDatabase('historical', (sql) => runUpgradePath(sql, historicalFolder, preProvenanceFolder, preSelectionFolder, true));
   assert.deepEqual(historical.schema, clean.schema);
   assert.deepEqual(Object.keys(historical.data), Object.keys(clean.data));
+  await withDisposableDatabase('native_selection', nativeSelectionConcurrency);
 
   const failures: string[] = [];
   for (const failureCase of failureCases) {
@@ -385,9 +513,10 @@ try {
     });
   }
 
-  process.stdout.write(`${JSON.stringify({ cleanInstall: 'passed', historicalUpgrade: 'passed', finalSchemaComparison: 'equal', representativeRows: 'preserved', failClosedCases: failures, persistentDatabase: 'untouched' })}\n`);
+  process.stdout.write(`${JSON.stringify({ cleanInstall: 'passed', historicalUpgrade: 'passed', finalSchemaComparison: 'equal', representativeRows: 'preserved', nativeSelectionConcurrency: 'passed', failClosedCases: failures, persistentDatabase: 'untouched' })}\n`);
 } finally {
   await rm(historicalFolder, { recursive: true, force: true });
   await rm(preProvenanceFolder, { recursive: true, force: true });
+  await rm(preSelectionFolder, { recursive: true, force: true });
   await admin.end();
 }

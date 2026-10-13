@@ -24,6 +24,7 @@ import { computeExecutionGrantIdentity, computeExecutionReservationIdentity } fr
 import { googleProjectIdentity, vercelTeamProjectIdentity } from '../lib/external-execution/provider-account.ts';
 import { ExternalExecutionAuthorityError, type ExternalExecutionAmounts, type ExternalExecutionReservationRequest, type ExternalExecutionScope } from '../lib/external-execution/types.ts';
 import { createTestContext } from './support.ts';
+import { hasRepositorySwitchConflict } from '../lib/github-repositories/switch-guard.ts';
 
 const scopeLimits: ExternalExecutionAmounts & { maxConcurrentExternalOperations: number } = {
   logicalRequests: 4,
@@ -752,6 +753,38 @@ async function seeded(options: { scope?: Partial<ExternalExecutionScope>; runBou
   });
   return { context, now, scope, grantId, accountId };
 }
+
+test('repository switch guard retains active lease and unfinished provider-attempt authority after grant revocation', async (t) => {
+  const value = await seeded();
+  t.after(() => value.context.client.close());
+  const authority = new DurableExternalExecutionAuthorizer(value.context.database, { clock: () => value.now });
+  const permit = await authority.reserve({ scope: value.scope, amounts: amount() });
+  await permit.beginProviderAttempt(); // Durable event only; no provider transport.
+  await value.context.database.insert(executionBudgetGrantRevocation).values({ id: randomUUID(), grantId: value.grantId,
+    reasonCode: 'operator_revoked', revokedBy: 'test-operator' });
+  await value.context.database.update(repairRun).set({ state: 'cancelled', completedAt: value.now,
+    failureClassification: 'cancelled', failureCode: 'cancelled_before_execution' }).where(eq(repairRun.id, value.scope.repairRunId!));
+  assert.equal(await hasRepositorySwitchConflict(value.context.database, value.scope.workspaceId, value.now), true);
+  await value.context.database.update(externalExecutionLease).set({ state: 'failed', completedAt: value.now,
+    failureCode: 'provider_attempt_ambiguous' }).where(eq(externalExecutionLease.reservationId, permit.reservationId));
+  // Neither a terminal run nor a revoked grant hides the unmatched attempt.
+  assert.equal(await hasRepositorySwitchConflict(value.context.database, value.scope.workspaceId, value.now), true);
+});
+
+test('repository switch guard independently blocks an active lease without a provider attempt', async (t) => {
+  const value = await seeded();
+  t.after(() => value.context.client.close());
+  const authority = new DurableExternalExecutionAuthorizer(value.context.database, { clock: () => value.now });
+  const permit = await authority.reserve({ scope: value.scope, amounts: amount() });
+  await value.context.database.insert(executionBudgetGrantRevocation).values({ id: randomUUID(), grantId: value.grantId,
+    reasonCode: 'operator_revoked', revokedBy: 'test-operator' });
+  await value.context.database.update(repairRun).set({ state: 'cancelled', completedAt: value.now,
+    failureClassification: 'cancelled', failureCode: 'cancelled_before_execution' }).where(eq(repairRun.id, value.scope.repairRunId!));
+  assert.equal(await hasRepositorySwitchConflict(value.context.database, value.scope.workspaceId, value.now), true);
+  await value.context.database.update(externalExecutionLease).set({ state: 'failed', completedAt: value.now,
+    failureCode: 'operator_stopped' }).where(eq(externalExecutionLease.reservationId, permit.reservationId));
+  assert.equal(await hasRepositorySwitchConflict(value.context.database, value.scope.workspaceId, value.now), false);
+});
 
 test('external execution authority is zero by default', async () => {
   const context = await createTestContext();

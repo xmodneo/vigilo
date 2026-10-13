@@ -19,8 +19,9 @@ import {
 } from '../../db/schema.ts';
 import type { AuthenticatedWorkspace } from '../auth/protected-context.ts';
 import type { VigiloDatabase } from '../db/types.ts';
-import { assertPublicRepositoryAuthority, RepositoryPolicyError } from '../github-repositories/policy.ts';
+import { assertHistoricalPublicRepository, assertPublicRepositoryAuthority, RepositoryPolicyError } from '../github-repositories/policy.ts';
 import { selfCheckRepairCandidateForWorkspace } from '../repair-candidates/flow.ts';
+import { lockExternalExecution } from '../external-execution/business-fence.ts';
 import { frozenBaselineProfile } from '../repository-baselines/authority.ts';
 import { canonicalRecord } from '../repair-loops/canonical.ts';
 import { readRuntimeRelease } from '../operations/release.ts';
@@ -107,10 +108,10 @@ function ineligible(reason: HumanReviewIneligibleReason): SubjectLoad {
   return { value: null, reason };
 }
 
-async function loadEligibleSubject(database: ReviewDatabase, workspaceId: string, repairRunId: string): Promise<SubjectLoad> {
+async function loadEligibleSubject(database: ReviewDatabase, workspaceId: string, repairRunId: string, historicalRead = false): Promise<SubjectLoad> {
   const [run] = await database.select().from(repairRun).where(and(eq(repairRun.id, repairRunId), eq(repairRun.workspaceId, workspaceId))).limit(1);
   if (!run) return ineligible('authority_mismatch');
-  try { await assertPublicRepositoryAuthority(database, run.workspaceId, run.githubRepositoryId); }
+  try { await (historicalRead ? assertHistoricalPublicRepository : assertPublicRepositoryAuthority)(database, run.workspaceId, run.githubRepositoryId); }
   catch (error) { if (error instanceof RepositoryPolicyError) return ineligible(error.code); throw error; }
   if (!run.baselineId) return ineligible('authority_mismatch');
   const [loop] = await database.select().from(repairLoop).where(and(eq(repairLoop.repairRunId, run.id), eq(repairLoop.workspaceId, workspaceId))).limit(1);
@@ -323,9 +324,16 @@ export async function getHumanReview(database: VigiloDatabase, context: Authenti
   const [loop] = await database.select().from(repairLoop).where(and(eq(repairLoop.repairRunId, repairRunId), eq(repairLoop.workspaceId, context.workspace.id))).limit(1);
   if (!loop) return { repairRunId, status: 'ineligible', ineligibleReason: 'repair_loop_not_verified', reviewSubjectIdentity: null, liveAcceptanceStatus: TASK_4_3_LIVE_ACCEPTANCE_STATUS, subject: null, decision: null, history: { items: [], truncated: false } };
   const [decision] = await database.select().from(humanReviewDecision).where(and(eq(humanReviewDecision.repairLoopId, loop.id), eq(humanReviewDecision.workspaceId, context.workspace.id))).limit(1);
-  const loaded = await loadEligibleSubject(database, context.workspace.id, repairRunId);
+  const loaded = await loadEligibleSubject(database, context.workspace.id, repairRunId, true);
   const history = await safeHistory(database, loop.id);
   if (!loaded.value) return { repairRunId, status: 'ineligible', ineligibleReason: loaded.reason, reviewSubjectIdentity: null, liveAcceptanceStatus: TASK_4_3_LIVE_ACCEPTANCE_STATUS, subject: null, decision: decision ? publicDecision(decision) : null, history };
+  // Keep immutable evidence visible, but never offer a decision for a
+  // deselected repository. Decision creation rechecks under the global lock.
+  try { await assertPublicRepositoryAuthority(database, context.workspace.id, loaded.value.subject.authority.githubRepositoryId); }
+  catch (error) {
+    if (!(error instanceof RepositoryPolicyError)) throw error;
+    return { repairRunId, status: 'ineligible', ineligibleReason: 'authority_mismatch', reviewSubjectIdentity: loaded.value.subjectIdentity, liveAcceptanceStatus: TASK_4_3_LIVE_ACCEPTANCE_STATUS, subject: loaded.value.subject, decision: decision ? publicDecision(decision) : null, history };
+  }
   let liveAcceptanceStatus: HumanReviewResult['liveAcceptanceStatus'] = TASK_4_3_LIVE_ACCEPTANCE_STATUS;
   if (decision?.decision === 'approved') {
     try {
@@ -365,6 +373,7 @@ export async function createHumanReviewDecision(
   const now = (options.clock ?? (() => new Date()))();
   try {
     const created = await database.transaction(async (transaction) => {
+      await lockExternalExecution(transaction);
       const [run] = await transaction.select({ id: repairRun.id }).from(repairRun).where(and(eq(repairRun.id, repairRunId), eq(repairRun.workspaceId, context.workspace.id))).for('update').limit(1);
       if (!run) throw new HumanReviewError('human_review_not_found');
       const [byKey] = await transaction.select().from(humanReviewDecision).where(and(eq(humanReviewDecision.workspaceId, context.workspace.id), eq(humanReviewDecision.idempotencyKey, input.idempotencyKey))).limit(1);

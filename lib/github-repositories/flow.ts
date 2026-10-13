@@ -6,6 +6,7 @@ import {
   githubInstallation,
   githubRepositoryAccessAttempt,
   repository,
+  workspace,
 } from '../../db/schema.ts';
 import type { AuthenticatedWorkspace } from '../auth/protected-context.ts';
 import type { VigiloDatabase } from '../db/types.ts';
@@ -16,6 +17,8 @@ import type {
   GitHubUserInstallationRepository,
 } from './types.ts';
 import { assertPublicRepository } from './policy.ts';
+import { lockExternalExecution } from '../external-execution/business-fence.ts';
+import { hasRepositorySwitchConflict } from './switch-guard.ts';
 
 const ATTEMPT_LIFETIME_MS = 10 * 60_000;
 const MAX_SNAPSHOT_BYTES = 1_000_000;
@@ -201,6 +204,7 @@ export async function beginRepositoryAuthorization(
 
   await database.insert(githubRepositoryAccessAttempt).values({
     codeVerifier,
+    createdAt: now,
     expiresAt: new Date(now.getTime() + ATTEMPT_LIFETIME_MS),
     id: randomUUID(),
     installationId,
@@ -247,25 +251,43 @@ async function reconcileSelectedRepository(
   installationId: number,
   repositories: GitHubRepository[],
   now: Date,
+  listingStartedAt: Date,
 ): Promise<typeof repository.$inferSelect | null> {
-  const [stored] = await database
-    .select()
-    .from(repository)
-    .where(eq(repository.workspaceId, context.workspace.id))
-    .limit(1);
-  if (!stored) return null;
-  const current = repositories.find((value) => value.id === stored.githubRepositoryId);
-  if (!current) {
-    await database.delete(repository).where(eq(repository.workspaceId, context.workspace.id));
-    return null;
-  }
-  const [updated] = await database
-    .update(repository)
-    .set(mutableRepositoryValues(current, installationId, context.workspace.id, now))
-    .where(eq(repository.workspaceId, context.workspace.id))
-    .returning();
-  if (!updated) throw new RepositoryAccessError('provider_failure');
-  return updated;
+  return database.transaction(async (transaction) => {
+    await lockRepositorySelection(transaction, context.workspace.id);
+    const [stored] = await transaction.select().from(repository).where(and(
+      eq(repository.workspaceId, context.workspace.id), eq(repository.isSelected, true),
+    )).limit(1);
+    if (!stored) return null;
+    // A listing initiated before the latest selection/metadata update cannot
+    // revoke or overwrite that newer authority. Equal timestamps also defer
+    // reconciliation because application clocks have millisecond precision.
+    if (stored.updatedAt >= listingStartedAt) return stored;
+    const current = repositories.find((value) => value.id === stored.githubRepositoryId && !value.isPrivate);
+    if (!current) {
+      if (await hasRepositorySwitchConflict(transaction, context.workspace.id, now)) {
+        throw new RepositoryAccessError('repository_conflict');
+      }
+      await transaction.update(repository).set({ isSelected: false, updatedAt: now }).where(and(
+        eq(repository.githubRepositoryId, stored.githubRepositoryId), eq(repository.workspaceId, context.workspace.id),
+      ));
+      return null;
+    }
+    const [updated] = await transaction.update(repository)
+      .set(mutableRepositoryValues(current, installationId, context.workspace.id, now))
+      .where(and(eq(repository.githubRepositoryId, stored.githubRepositoryId), eq(repository.workspaceId, context.workspace.id)))
+      .returning();
+    if (!updated) throw new RepositoryAccessError('provider_failure');
+    return updated;
+  });
+}
+
+async function lockRepositorySelection(database: VigiloDatabase, workspaceId: string): Promise<void> {
+  // Match the lock order used by external-execution admission: global first.
+  await lockExternalExecution(database);
+  const [locked] = await database.select({ id: workspace.id }).from(workspace)
+    .where(eq(workspace.id, workspaceId)).for('update').limit(1);
+  if (!locked) throw new RepositoryAccessError('repository_conflict');
 }
 
 async function persistSelectedRepository(
@@ -279,27 +301,38 @@ async function persistSelectedRepository(
   catch { throw new RepositoryAccessError('private_repository_not_supported'); }
   const values = mutableRepositoryValues(selected, installationId, context.workspace.id, now);
   try {
-    const [existing] = await database
-      .select({ githubRepositoryId: repository.githubRepositoryId })
-      .from(repository)
-      .where(eq(repository.workspaceId, context.workspace.id))
-      .limit(1);
-    if (existing) {
-      if (existing.githubRepositoryId === selected.id) {
-        await database
-          .update(repository)
-          .set(values)
-          .where(eq(repository.workspaceId, context.workspace.id));
-      } else {
-        await database
-          .delete(repository)
-          .where(eq(repository.workspaceId, context.workspace.id));
-        await database.insert(repository).values(values);
+    await database.transaction(async (transaction) => {
+      await lockRepositorySelection(transaction, context.workspace.id);
+      const [current] = await transaction.select().from(repository).where(and(
+        eq(repository.workspaceId, context.workspace.id), eq(repository.isSelected, true),
+      )).limit(1);
+      if (current?.githubRepositoryId === selected.id) {
+        await transaction.update(repository).set(values).where(and(
+          eq(repository.githubRepositoryId, selected.id), eq(repository.workspaceId, context.workspace.id),
+        ));
+        return;
       }
-    } else {
-      await database.insert(repository).values(values);
-    }
-  } catch {
+      if (await hasRepositorySwitchConflict(transaction, context.workspace.id, now)) {
+        throw new RepositoryAccessError('repository_conflict');
+      }
+      const [historical] = await transaction.select({ workspaceId: repository.workspaceId })
+        .from(repository).where(eq(repository.githubRepositoryId, selected.id)).limit(1);
+      if (historical && historical.workspaceId !== context.workspace.id) {
+        throw new RepositoryAccessError('repository_conflict');
+      }
+      if (!historical) {
+        await transaction.insert(repository).values({ ...values, isSelected: false });
+      }
+      if (current) await transaction.update(repository).set({ isSelected: false, updatedAt: now }).where(and(
+        eq(repository.githubRepositoryId, current.githubRepositoryId), eq(repository.workspaceId, context.workspace.id),
+      ));
+      const [updated] = await transaction.update(repository).set({ ...values, isSelected: true }).where(and(
+        eq(repository.githubRepositoryId, selected.id), eq(repository.workspaceId, context.workspace.id),
+      )).returning({ id: repository.githubRepositoryId });
+      if (!updated) throw new RepositoryAccessError('repository_conflict');
+    });
+  } catch (error) {
+    if (error instanceof RepositoryAccessError) throw error;
     throw new RepositoryAccessError('repository_conflict');
   }
 }
@@ -390,6 +423,7 @@ export async function completeRepositoryAuthorization(
       attempt.installationId,
       repositories,
       now,
+      attempt.createdAt,
     );
     await database
       .update(githubRepositoryAccessAttempt)
@@ -431,7 +465,7 @@ export async function getRepositoryOverview(
   const [stored] = await database
     .select()
     .from(repository)
-    .where(eq(repository.workspaceId, context.workspace.id))
+    .where(and(eq(repository.workspaceId, context.workspace.id), eq(repository.isSelected, true)))
     .limit(1);
   const [snapshot] = await database
     .select({ repositoriesJson: githubRepositoryAccessAttempt.repositoriesJson })

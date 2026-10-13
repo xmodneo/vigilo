@@ -146,6 +146,8 @@ export async function startCandidateVerification(
   try {
     return await database.transaction(async (transaction) => {
       await lockExternalExecution(transaction);
+      try { await assertPublicRepositoryAuthority(transaction, candidate.workspaceId, candidate.githubRepositoryId); }
+      catch (error) { if (error instanceof RepositoryPolicyError) throw new CandidateVerificationError(error.code); throw error; }
       const [lockedRun] = await transaction.select({ id: repairRun.id }).from(repairRun).where(and(eq(repairRun.id, candidate.repairRunId), eq(repairRun.workspaceId, context.workspace.id))).for('update').limit(1);
       if (!lockedRun) throw new CandidateVerificationError('verification_authority_mismatch');
       await assertMatchedSourceCheckpoint(transaction, lockedRun.id);

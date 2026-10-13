@@ -124,10 +124,10 @@ test('provider account identities are typed, canonical, and contain no credentia
   assert.throws(() => googleProjectIdentity(''), /provider_account_identity_invalid/);
 });
 
-test('disposable clean migration reaches 0024 with immutable provenance guards', async (t) => {
+test('disposable clean migration through 0025 retains immutable provenance guards', async (t) => {
   const context = await createTestContext(); t.after(() => context.client.close());
   const ledger = await context.client.query<{ count: number }>('select count(*)::int as count from drizzle.__drizzle_migrations');
-  assert.equal(ledger.rows[0]?.count, 25);
+  assert.equal(ledger.rows[0]?.count, 26);
   const triggers = await context.client.query<{ tgname: string }>(`select tgname from pg_trigger where not tgisinternal and tgname in
     ('execution_budget_grant_insert_provenance_guard','external_execution_reservation_provenance_guard',
      'external_execution_event_provenance_guard','repair_run_provenance_guard','repository_baseline_provenance_guard',

@@ -32,7 +32,7 @@ import type { ExecutionAvailabilityStatus } from '../../../lib/presentation/poli
 import { getReadinessResult } from '../../../lib/operations/readiness';
 import { GitHubConnectionView } from './github-connection-view';
 
-export default async function GitHubConnectionPage({ searchParams }: { searchParams?: Promise<{ error?: string | string[] }> }) {
+export default async function GitHubConnectionPage({ searchParams }: { searchParams?: Promise<{ error?: string | string[]; repositories?: string | string[] }> }) {
   try {
     const requestHeaders = await headers();
     const context = await resolveRequestWorkspace(requestHeaders);
@@ -133,6 +133,7 @@ export default async function GitHubConnectionPage({ searchParams }: { searchPar
 
     const parameters = await searchParams;
     const notice = Array.isArray(parameters?.error) ? parameters.error[0] : parameters?.error;
+    const showRepositoryPicker = parameters?.repositories === 'loaded';
     return (
       <GitHubConnectionView
         installation={installation}
@@ -160,6 +161,7 @@ export default async function GitHubConnectionPage({ searchParams }: { searchPar
         {...(workflowError ? { workflowError } : {})}
         {...(notice ? { noticeCode: notice } : {})}
         {...(selectedRepository !== undefined ? { selectedRepository } : {})}
+        showRepositoryPicker={showRepositoryPicker}
         workspaceId={context.workspace.id}
       />
     );

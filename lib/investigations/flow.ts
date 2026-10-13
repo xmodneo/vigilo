@@ -8,6 +8,7 @@ import type { VigiloDatabase } from '../db/types.ts';
 import { RepositoryPolicyError, assertPublicRepositoryAuthority } from '../github-repositories/policy.ts';
 import { matchesRepairRunEvidence } from '../repair-runs/flow.ts';
 import { assertMatchedSourceCheckpoint } from '../external-execution/source-checkpoint.ts';
+import { lockExternalExecution } from '../external-execution/business-fence.ts';
 import { INVESTIGATION_JOB_VERSION, type TransactionalInvestigationQueue } from '../repair-runs/queue.ts';
 import { CONTEXT_BUDGET } from './policy.ts';
 import type { InvestigationResult } from './types.ts';
@@ -84,6 +85,7 @@ export async function createInvestigation(
   const randomId = options.randomId ?? randomUUID;
   try {
     return await database.transaction(async (transaction) => {
+      await lockExternalExecution(transaction);
       const [run] = await transaction.select().from(repairRun).where(and(eq(repairRun.id, repairRunId), eq(repairRun.workspaceId, context.workspace.id))).limit(1);
       if (!run) throw new InvestigationError('repair_run_not_found');
       try { await assertPublicRepositoryAuthority(transaction, run.workspaceId, run.githubRepositoryId); }

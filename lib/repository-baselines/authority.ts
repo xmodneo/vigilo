@@ -85,6 +85,7 @@ export async function resolveBaselineAuthority(
     .innerJoin(githubInstallation, eq(githubInstallation.installationId, repository.installationId))
     .where(and(
       eq(repository.workspaceId, context.workspace.id),
+      eq(repository.isSelected, true),
       eq(executionProfile.workspaceId, context.workspace.id),
       eq(githubInstallation.workspaceId, context.workspace.id),
       eq(githubInstallation.status, 'active'),

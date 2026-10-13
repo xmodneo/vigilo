@@ -113,6 +113,26 @@ test('connected installation requires temporary GitHub App authorization before 
   assert.doesNotMatch(html, /name="repositoryId"/);
 });
 
+test('selected repository offers authenticated change flow without direct repository metadata input', () => {
+  const common = {
+    installation: { accountLogin: 'octo-org', accountType: 'Organization', installationId: 7001, status: 'active' },
+    selectedRepository: { defaultBranch: 'main', fullName: 'octo-org/first', id: 8101, isPrivate: false },
+    repairRequestId: '11111111-1111-4111-8111-111111111111', workspaceId: 'workspace-1',
+  };
+  const current = renderToStaticMarkup(<GitHubConnectionView {...common} />);
+  assert.match(current, /Change repository/);
+  assert.match(current, /href="\/app\/github\?repositories=loaded"/);
+  assert.doesNotMatch(current, /name="repositoryId"/);
+
+  const picker = renderToStaticMarkup(<GitHubConnectionView {...common} showRepositoryPicker repositories={[
+    { defaultBranch: 'main', fullName: 'octo-org/second', id: 8102, isPrivate: false },
+  ]} />);
+  assert.match(picker, /Currently selected: octo-org\/first/);
+  assert.match(picker, /action="\/api\/github\/repositories"/);
+  assert.match(picker, /name="repositoryId" value="8102"/);
+  assert.doesNotMatch(picker, /name="(?:owner|name|fullName|defaultBranch)"/);
+});
+
 test('GitHub connection page shows selected repository and unconfigured execution profile', () => {
   const html = renderToStaticMarkup(
     <GitHubConnectionView

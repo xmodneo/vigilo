@@ -113,6 +113,7 @@ export interface GitHubConnectionViewProps {
   workflowError?: 'unavailable';
   noticeCode?: string;
   selectedRepository?: RepositorySummary | null;
+  showRepositoryPicker?: boolean;
   workspaceId: string;
 }
 
@@ -142,6 +143,7 @@ export function GitHubConnectionView({
   workflowError,
   noticeCode,
   selectedRepository = null,
+  showRepositoryPicker = false,
   workspaceId,
 }: GitHubConnectionViewProps) {
   const repairLoopActive = repairLoop?.state === 'queued' || repairLoop?.state === 'running';
@@ -190,7 +192,7 @@ export function GitHubConnectionView({
                 <p>Repository access could not be verified. No execution action is available.</p>
                 <a className="secondary-action button-link" href="/app/github">Try again</a>
               </div>
-            ) : selectedRepository ? (
+            ) : selectedRepository && !showRepositoryPicker ? (
               <section className="repository-panel" aria-labelledby="selected-repository-title">
                 <p className="eyebrow">Connected repository</p>
                 <h2 id="selected-repository-title">{selectedRepository.fullName}</h2>
@@ -314,11 +316,13 @@ export function GitHubConnectionView({
                 <form action="/api/github/repositories/authorize" method="post">
                   <PendingSubmitButton className="secondary-action" pendingLabel="Refreshing access…">Refresh access</PendingSubmitButton>
                 </form>
+                <a className="secondary-action button-link" href="/app/github?repositories=loaded">Change repository</a>
               </section>
             ) : repositories === undefined ? (
               <section className="repository-panel" aria-labelledby="repository-access-title">
                 <p className="eyebrow">Repository access</p>
                 <h2 id="repository-access-title">Choose a repository</h2>
+                {selectedRepository && <p className="workspace-next">Currently selected: {selectedRepository.fullName}. No change occurs until you explicitly select another eligible public repository.</p>}
                 <p className="workspace-next">
                   Authorize the GitHub App briefly to load repositories where you have write access.
                 </p>
@@ -331,6 +335,7 @@ export function GitHubConnectionView({
               <section className="repository-panel" aria-labelledby="repository-list-title">
                 <p className="eyebrow">Repository access</p>
                 <h2 id="repository-list-title">Select a repository</h2>
+                {selectedRepository && <p className="workspace-next">Currently selected: {selectedRepository.fullName}. No change occurs until you explicitly select another eligible public repository.</p>}
                 <p className="data-use-disclosure">Vigilo currently supports public repositories only. Selecting a repository lets Vigilo inspect its metadata and, when explicitly authorized, read source from an exact revision.</p>
                 {repositories.length === 0 ? (
                   <p className="workspace-next">

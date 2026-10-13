@@ -121,7 +121,14 @@ try {
       (select tgname from pg_trigger where tgname = 'operational_worker_heartbeat_guard' and not tgisinternal) as "heartbeatGuard",
       (select count(*)::int from drizzle.__drizzle_migrations) as "ledgerCount"
   `;
-  const operationalPassed = operationalFacts?.heartbeat === 'operational_worker_heartbeat' && operationalFacts.bucket === 'http_rate_limit_bucket' && operationalFacts.heartbeatGuard === 'operational_worker_heartbeat_guard' && operationalFacts.ledgerCount === 25;
+  const operationalPassed = operationalFacts?.heartbeat === 'operational_worker_heartbeat' && operationalFacts.bucket === 'http_rate_limit_bucket' && operationalFacts.heartbeatGuard === 'operational_worker_heartbeat_guard' && operationalFacts.ledgerCount === 26;
+  const [selectionFacts] = await probe<{ selectedColumn: string | null; selectedIndex: string | null; oldWorkspaceUnique: number }[]>`
+    select
+      (select column_name from information_schema.columns where table_schema = 'public' and table_name = 'repository' and column_name = 'is_selected') as "selectedColumn",
+      (select indexdef from pg_indexes where schemaname = 'public' and indexname = 'repository_one_selected_per_workspace_unique') as "selectedIndex",
+      (select count(*)::int from pg_constraint where conrelid = 'repository'::regclass and conname = 'repository_workspace_id_unique') as "oldWorkspaceUnique"
+  `;
+  const selectionPassed = selectionFacts?.selectedColumn === 'is_selected' && selectionFacts.selectedIndex?.includes('UNIQUE INDEX') === true && selectionFacts.selectedIndex.includes('WHERE (is_selected = true)') && selectionFacts.oldWorkspaceUnique === 0;
   const [provenanceFacts] = await probe<{ checkpoint: string | null; grantRelease: string | null; reservationRelease: string | null; guardCount: number }[]>`
     select to_regclass('public.repair_run_source_checkpoint')::text as checkpoint,
       (select column_name from information_schema.columns where table_schema = 'public' and table_name = 'execution_budget_grant' and column_name = 'authorized_release_sha') as "grantRelease",
@@ -131,8 +138,8 @@ try {
   const ledger = await probe<{ hash: string }[]>`select hash from drizzle.__drizzle_migrations order by id`;
   const provenancePassed = provenanceFacts?.checkpoint === 'repair_run_source_checkpoint' && provenanceFacts.grantRelease === 'authorized_release_sha' && provenanceFacts.reservationRelease === 'executing_release_sha' && provenanceFacts.guardCount === 6 &&
     JSON.stringify(ledger.map((row) => row.hash)) === JSON.stringify(MIGRATION_MANIFEST.map((entry) => entry.hash));
-  if (!passed || !reviewPassed || !publicationPassed || !authorityPassed || !operationalPassed || !provenancePassed) throw new Error('clean_migration_probe_failed');
-  process.stdout.write(`${JSON.stringify({ migrations: '0000-0024', repairRunAttempt: 'present', investigation: 'present', repairCandidate: 'present', candidateVerification: 'present', aiInvestigation: 'present', repairLoop: 'present', humanReview: 'present', repairPublication: 'present', externalExecutionAuthority: 'present', releaseAcceptance: 'present', operationalReadiness: 'present', executionProvenance: 'present', constraints: 'current', result: 'passed' })}\n`);
+  if (!passed || !reviewPassed || !publicationPassed || !authorityPassed || !operationalPassed || !provenancePassed || !selectionPassed) throw new Error('clean_migration_probe_failed');
+  process.stdout.write(`${JSON.stringify({ migrations: '0000-0025', repairRunAttempt: 'present', investigation: 'present', repairCandidate: 'present', candidateVerification: 'present', aiInvestigation: 'present', repairLoop: 'present', humanReview: 'present', repairPublication: 'present', externalExecutionAuthority: 'present', releaseAcceptance: 'present', operationalReadiness: 'present', executionProvenance: 'present', repositorySelectionHistory: 'present', constraints: 'current', result: 'passed' })}\n`);
 } finally {
   if (probe) await probe.end();
   await admin`select pg_terminate_backend(pid) from pg_stat_activity where datname = ${databaseName} and pid <> pg_backend_pid()`;

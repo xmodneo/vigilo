@@ -19,10 +19,10 @@ import { readGitHubWorkerEnvironment } from '../lib/github-app/environment.js';
 import { validateOperationalSnapshot } from '../lib/operations/snapshot.js';
 
 test('checked migration manifest is complete, ordered, and matches repository bytes', async () => {
-  assert.equal(EXPECTED_SCHEMA_VERSION, '0024');
-  assert.equal(MIGRATION_MANIFEST.length, 25);
+  assert.equal(EXPECTED_SCHEMA_VERSION, '0025');
+  assert.equal(MIGRATION_MANIFEST.length, 26);
   assert.deepEqual(MIGRATION_MANIFEST.map((entry) => entry.tag.slice(0, 4)),
-    Array.from({ length: 25 }, (_, index) => String(index).padStart(4, '0')));
+    Array.from({ length: 26 }, (_, index) => String(index).padStart(4, '0')));
   await validateMigrationFiles(process.cwd());
 });
 

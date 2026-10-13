@@ -6,6 +6,7 @@ import { repairIntent, repairRun, repairRunEvent, repositoryBaseline } from '../
 import type { AuthenticatedWorkspace } from '../auth/protected-context.ts';
 import type { VigiloDatabase } from '../db/types.ts';
 import { finalizeSourceCheckpointIfStaged } from '../external-execution/source-checkpoint.ts';
+import { lockExternalExecution } from '../external-execution/business-fence.ts';
 import { resolveBaselineAuthority } from '../repository-baselines/authority.ts';
 import { normalizeRepairObjective, RepairIntentValidationError } from './intent.ts';
 import { REPAIR_JOB_VERSION, type TransactionalRepairQueue } from './queue.ts';
@@ -137,6 +138,7 @@ export async function transitionRepairRun(
 
 async function createRepairRun(
   database: VigiloDatabase,
+  context: AuthenticatedWorkspace,
   identity: RepairRunIdentity,
   idempotencyKey: string,
   objectiveInput: unknown,
@@ -148,6 +150,14 @@ async function createRepairRun(
   const intent = normalizeRepairObjective(objectiveInput);
   for (let attempt = 0; attempt < 2; attempt += 1) {
     const claimed = await database.transaction(async (transaction) => {
+      await lockExternalExecution(transaction);
+      const current = await resolveBaselineAuthority(transaction, context);
+      if (current.profile.githubRepositoryId !== identity.githubRepositoryId ||
+          current.profile.installationId !== identity.installationId ||
+          current.profile.profileIdentity !== identity.profileIdentity ||
+          current.profile.baseCommitSha !== identity.baseCommitSha) {
+        throw new RepairRunError('handoff_failed');
+      }
       const [inserted] = await transaction.insert(repairRun).values({
         id: randomId(),
         ...identity,
@@ -213,7 +223,7 @@ export async function startRepairRun(
   const clock = options.clock ?? (() => new Date());
   const randomId = options.randomId ?? randomUUID;
   try {
-    return (await createRepairRun(database, identity, idempotencyKey, objective, clock(), randomId, queue)).run;
+    return (await createRepairRun(database, context, identity, idempotencyKey, objective, clock(), randomId, queue)).run;
   } catch (error) {
     if (error instanceof RepairRunError || error instanceof RepairIntentValidationError) throw error;
     throw new RepairRunError('handoff_failed');

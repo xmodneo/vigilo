@@ -10,6 +10,7 @@ import { resolveApprovedPublicationAuthority } from '../human-reviews/flow.ts';
 import type { ApprovedHumanReviewAuthority } from '../human-reviews/types.ts';
 import { normalizeRepairObjective } from '../repair-runs/intent.ts';
 import { selfCheckRepairCandidateForWorkspace } from '../repair-candidates/flow.ts';
+import { lockExternalExecution } from '../external-execution/business-fence.ts';
 import { REPAIR_PUBLICATION_JOB_VERSION, type TransactionalRepairPublicationQueue } from '../repair-runs/queue.ts';
 import { buildPullRequestMetadata, computePublicationIntentIdentity, publicationBranch } from './identity.ts';
 import { PUBLICATION_VERSION, type RepairPublicationResult } from './types.ts';
@@ -89,6 +90,9 @@ export async function reserveRepairPublicationWithAuthority(
   const publicationIntentIdentity = computePublicationIntentIdentity({ publicationId: id, authority, repairIntentId: intent.id, repairObjectiveHash: intent.objectiveHash, requestedByUserId: context.user.id, targetBranch, pullRequestTitle: metadata.title, pullRequestBodyHash: metadata.bodyHash });
   try {
     return await database.transaction(async (transaction) => {
+      await lockExternalExecution(transaction);
+      try { await assertPublicRepositoryAuthority(transaction, authority.workspaceId, authority.githubRepositoryId); }
+      catch (error) { if (error instanceof RepositoryPolicyError) throw new RepairPublicationError(error.code); throw error; }
       const [run] = await transaction.select({ id: repairRun.id }).from(repairRun).where(and(eq(repairRun.id, authority.repairRunId), eq(repairRun.workspaceId, context.workspace.id))).for('update').limit(1);
       if (!run) throw new RepairPublicationError('publication_authority_mismatch');
       const [byDecision] = await transaction.select().from(repairPublication).where(eq(repairPublication.humanReviewDecisionId, authority.humanReviewDecisionId)).limit(1);

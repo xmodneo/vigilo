@@ -81,7 +81,7 @@ async function selectedRepository(
         eq(githubInstallation.status, 'active'),
       ),
     )
-    .where(eq(repository.workspaceId, context.workspace.id))
+    .where(and(eq(repository.workspaceId, context.workspace.id), eq(repository.isSelected, true)))
     .limit(1);
   if (!selected) throw new ExecutionProfileError('repository_not_selected');
   return selected;
@@ -163,6 +163,7 @@ async function persistProfile(
         eq(repository.githubRepositoryId, draft.githubRepositoryId),
         eq(repository.workspaceId, context.workspace.id),
         eq(repository.installationId, draft.installationId),
+        eq(repository.isSelected, true),
       ),
     )
     .returning({ id: repository.githubRepositoryId });
@@ -312,6 +313,8 @@ export async function getCurrentExecutionProfile(
       and(
         eq(repository.githubRepositoryId, executionProfile.githubRepositoryId),
         eq(repository.workspaceId, context.workspace.id),
+        eq(repository.installationId, executionProfile.installationId),
+        eq(repository.isSelected, true),
       ),
     )
     .innerJoin(

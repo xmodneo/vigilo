@@ -153,7 +153,6 @@ export const repository = pgTable(
     githubRepositoryId: bigint('github_repository_id', { mode: 'number' }).primaryKey(),
     workspaceId: text('workspace_id')
       .notNull()
-      .unique()
       .references(() => workspace.id, { onDelete: 'cascade' }),
     installationId: bigint('installation_id', { mode: 'number' })
       .notNull()
@@ -164,10 +163,15 @@ export const repository = pgTable(
     fullName: text('full_name').notNull(),
     defaultBranch: text('default_branch'),
     isPrivate: boolean('is_private').notNull(),
+    isSelected: boolean('is_selected').notNull().default(true),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
   },
-  (table) => [index('repository_installation_id_idx').on(table.installationId)],
+  (table) => [
+    index('repository_installation_id_idx').on(table.installationId),
+    index('repository_workspace_id_idx').on(table.workspaceId),
+    uniqueIndex('repository_one_selected_per_workspace_unique').on(table.workspaceId).where(sql`${table.isSelected} = true`),
+  ],
 );
 
 export const githubRepositoryAccessAttempt = pgTable(

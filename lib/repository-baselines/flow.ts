@@ -153,9 +153,13 @@ export async function getCurrentRepositoryBaseline(database: VigiloDatabase, con
     .innerJoin(repository, and(
       eq(repository.githubRepositoryId, repositoryBaseline.githubRepositoryId),
       eq(repository.workspaceId, context.workspace.id),
+      eq(repository.installationId, repositoryBaseline.installationId),
+      eq(repository.isSelected, true),
     ))
     .innerJoin(executionProfile, and(
       eq(executionProfile.githubRepositoryId, repositoryBaseline.githubRepositoryId),
+      eq(executionProfile.workspaceId, context.workspace.id),
+      eq(executionProfile.installationId, repositoryBaseline.installationId),
       eq(executionProfile.profileIdentity, repositoryBaseline.profileIdentity),
       eq(executionProfile.status, 'ready'),
     ))
