@@ -848,6 +848,11 @@ test('protected handlers keep temporary tokens out of browser responses and enfo
   assert.equal(unauthorized.status, 401);
   assert.equal(crossOrigin.status, 403);
   assert.equal(started.status, 303);
+  const authorizationTarget = new URL(started.headers.get('location') ?? '');
+  assert.equal(authorizationTarget.origin, 'https://github.com');
+  assert.equal(authorizationTarget.pathname, '/login/oauth/authorize');
+  assert.equal((await testContext.database.select().from(githubRepositoryAccessAttempt)).length, 1);
+  assert.deepEqual(await testContext.database.select().from(repository), []);
   assert.doesNotMatch(started.headers.get('location') ?? '', /token-sentinel/);
   assert.equal(await handlers.matchesCallback(new Request(`http://localhost:3000/api/github/installations/callback?state=${STATE}`)), true);
 

@@ -10,14 +10,17 @@ function isHttpsUrl(value: string | undefined): boolean {
   try { return new URL(value).protocol === 'https:'; } catch { return false; }
 }
 
-export function createSecurityHeaders(environment: SecurityHeaderEnvironment): Array<{ key: string; value: string }> {
+export function createSecurityHeaders(
+  environment: SecurityHeaderEnvironment,
+  options: { allowGitHubOAuthFormAction?: boolean } = {},
+): Array<{ key: string; value: string }> {
   const secureProduction = environment.production && isHttpsUrl(environment.baseUrl);
   const directives = [
     "default-src 'self'",
     "base-uri 'self'",
     "object-src 'none'",
     "frame-ancestors 'none'",
-    "form-action 'self'",
+    `form-action 'self'${options.allowGitHubOAuthFormAction ? ' https://github.com' : ''}`,
     `script-src 'self' 'unsafe-inline'${environment.production ? '' : " 'unsafe-eval'"}`,
     "style-src 'self' 'unsafe-inline'",
     "img-src 'self' data:",
@@ -42,10 +45,12 @@ export function createSecurityHeaders(environment: SecurityHeaderEnvironment): A
 const nextConfig: NextConfig = {
   agentRules: false,
   async headers() {
-    return [{
-      source: '/:path*',
-      headers: createSecurityHeaders({ production: process.env.NODE_ENV === 'production', baseUrl: process.env.BETTER_AUTH_URL }),
-    }];
+    const environment = { production: process.env.NODE_ENV === 'production', baseUrl: process.env.BETTER_AUTH_URL };
+    return [
+      // Exclude this one page so a second, stricter CSP cannot intersect its GitHub form allowance.
+      { source: '/:path((?!app/github/?$).*)', headers: createSecurityHeaders(environment) },
+      { source: '/app/github', headers: createSecurityHeaders(environment, { allowGitHubOAuthFormAction: true }) },
+    ];
   },
   logging: {
     incomingRequests: {

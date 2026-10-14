@@ -109,7 +109,7 @@ test('connected installation requires temporary GitHub App authorization before 
   );
 
   assert.match(html, /Load repositories/);
-  assert.match(html, /action="\/api\/github\/repositories\/authorize"/);
+  assert.match(html, /<form action="\/api\/github\/repositories\/authorize" method="post">[\s\S]*Load repositories[\s\S]*<\/form>/);
   assert.doesNotMatch(html, /name="repositoryId"/);
 });
 

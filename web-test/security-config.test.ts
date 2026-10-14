@@ -1,8 +1,32 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
+import { createRequire } from 'node:module';
 import test from 'node:test';
 
 import nextConfig, { createSecurityHeaders } from '../next.config.js';
+
+const require = createRequire(import.meta.url);
+const { tryToParsePath } = require('next/dist/lib/try-to-parse-path.js') as typeof import('next/dist/lib/try-to-parse-path.js');
+
+async function securityHeadersFor(pathname: string) {
+  const configured = await nextConfig.headers?.() ?? [];
+  return configured.flatMap((route) => {
+    const parsed = tryToParsePath(route.source);
+    assert.equal(parsed.error, undefined);
+    assert.ok(parsed.regexStr);
+    return new RegExp(parsed.regexStr).test(pathname) ? route.headers : [];
+  });
+}
+
+function cspValues(headers: Array<{ key: string; value: string }>) {
+  return headers.filter((header) => header.key.toLowerCase() === 'content-security-policy').map((header) => header.value);
+}
+
+function formActionSources(csp: string) {
+  const directive = csp.split(';').map((part) => part.trim()).find((part) => part.startsWith('form-action '));
+  assert.ok(directive);
+  return directive.split(/\s+/).slice(1);
+}
 
 test('development logs omit identity and GitHub App callback URLs', () => {
   const logging = nextConfig.logging;
@@ -50,8 +74,7 @@ function headersByName(headers: ReturnType<typeof createSecurityHeaders>) {
 test('global response headers provide a restrictive Next-compatible security baseline', async () => {
   const configured = await nextConfig.headers?.();
   assert.ok(configured);
-  assert.equal(configured.length, 1);
-  assert.equal(configured[0]?.source, '/:path*');
+  assert.equal(cspValues(await securityHeadersFor('/')).length, 1);
 
   const headers = headersByName(createSecurityHeaders({ production: false, baseUrl: 'http://localhost:3000' }));
   const csp = headers.get('content-security-policy') ?? '';
@@ -81,11 +104,41 @@ test('production HTTPS enables HSTS without development-only CSP allowances', ()
 });
 
 test('security headers apply to OAuth callbacks, application pages, and API routes without blocking same-origin forms', async () => {
-  const configured = await nextConfig.headers?.();
-  assert.equal(configured?.[0]?.source, '/:path*');
   const csp = headersByName(createSecurityHeaders({ production: true, baseUrl: 'https://vigilo.example' })).get('content-security-policy') ?? '';
   assert.match(csp, /form-action 'self'/);
   assert.doesNotMatch(csp, /navigate-to/);
+  for (const pathname of ['/sign-in', '/api/auth/callback/github', '/api/github/repositories/authorize']) {
+    assert.deepEqual(formActionSources(cspValues(await securityHeadersFor(pathname))[0] ?? ''), ["'self'"]);
+  }
+});
+
+test('GitHub repository page has one effective CSP allowing only self and the exact GitHub HTTPS origin for forms', async () => {
+  for (const pathname of ['/app/github', '/app/github/']) {
+    const headers = await securityHeadersFor(pathname);
+    const policies = cspValues(headers);
+    assert.equal(policies.length, 1, `${pathname} must not receive an intersecting CSP`);
+    assert.deepEqual(formActionSources(policies[0] ?? ''), ["'self'", 'https://github.com']);
+    assert.doesNotMatch(policies[0] ?? '', /form-action[^;]*\*/);
+    assert.deepEqual(
+      headers.filter((header) => header.key.toLowerCase() !== 'content-security-policy'),
+      createSecurityHeaders({ production: false, baseUrl: 'http://localhost:3000' })
+        .filter((header) => header.key.toLowerCase() !== 'content-security-policy'),
+    );
+  }
+
+  const githubPolicy = cspValues(await securityHeadersFor('/app/github'))[0] ?? '';
+  const otherPolicy = cspValues(await securityHeadersFor('/app'))[0] ?? '';
+  assert.equal(githubPolicy.replace("form-action 'self' https://github.com", "form-action 'self'"), otherPolicy);
+  const productionEnvironment = { production: true, baseUrl: 'https://vigilo.example' };
+  const productionGithubPolicy = cspValues(createSecurityHeaders(productionEnvironment, { allowGitHubOAuthFormAction: true }))[0] ?? '';
+  const productionDefaultPolicy = cspValues(createSecurityHeaders(productionEnvironment))[0] ?? '';
+  assert.deepEqual(formActionSources(productionGithubPolicy), ["'self'", 'https://github.com']);
+  assert.equal(productionGithubPolicy.replace("form-action 'self' https://github.com", "form-action 'self'"), productionDefaultPolicy);
+  for (const pathname of ['/', '/app', '/app/github/other', '/sign-in', '/api/auth/callback/github']) {
+    const policies = cspValues(await securityHeadersFor(pathname));
+    assert.equal(policies.length, 1);
+    assert.deepEqual(formActionSources(policies[0] ?? ''), ["'self'"]);
+  }
 });
 
 test('release documentation keeps local migration facts separate from production readiness', async () => {
