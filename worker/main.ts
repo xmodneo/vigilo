@@ -108,7 +108,7 @@ async function main(): Promise<void> {
       const job = jobs[0];
       if (!job) return [];
       try {
-        return [await processRepairJob(job, { configuration, database, gateway, logger, shutdownSignal: shutdown.signal, executionAuthority })];
+        return [await processRepairJob(job, { configuration, database, gateway, logger, shutdownSignal: shutdown.signal, executionAuthority, runtimeReleaseSha: releaseSha })];
       } catch {
         return [{ id: job.id, status: 'failed' as const, output: { code: 'worker_operation_failed' } }];
       }
@@ -152,7 +152,7 @@ async function main(): Promise<void> {
     const repairLoopWorkerId = await boss.work<unknown, { code?: string }, typeof workOptions>(REPAIR_LOOP_QUEUE, workOptions, async (jobs) => {
       const job = jobs[0]; if (!job) return [];
       try {
-        return [await processRepairLoopJob(job, { database, executionAuthority, queues: {
+        return [await processRepairLoopJob(job, { database, executionAuthority, runtimeReleaseSha: releaseSha, queues: {
           enqueueRepairLoop: loopQueue.enqueueRepairLoop.bind(loopQueue),
           enqueueAiCandidateGeneration: generationQueue.enqueueAiCandidateGeneration.bind(generationQueue),
           enqueueVerification: verificationQueue.enqueueVerification.bind(verificationQueue),

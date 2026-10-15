@@ -4,6 +4,7 @@ import {
   executionProfile,
   githubInstallation,
   repository,
+  workspace,
 } from '../../db/schema.ts';
 import type { AuthenticatedWorkspace } from '../auth/protected-context.ts';
 import type { VigiloDatabase } from '../db/types.ts';
@@ -15,6 +16,8 @@ import type {
   InstallationRepositoryMetadata,
 } from './types.ts';
 import { assertPublicRepository } from '../github-repositories/policy.ts';
+import { lockExternalExecution } from '../external-execution/business-fence.ts';
+import { hasRepositorySwitchConflict } from '../github-repositories/switch-guard.ts';
 
 export type ExecutionProfileErrorCode =
   | 'installation_unavailable'
@@ -147,50 +150,53 @@ async function persistProfile(
   draft: ExecutionProfileDraft,
   now: Date,
 ) {
-  const updatedRepositories = await database
-    .update(repository)
-    .set({
-      defaultBranch: metadata.defaultBranch,
-      fullName: metadata.fullName,
-      isPrivate: metadata.isPrivate,
-      name: metadata.name,
-      ownerId: metadata.ownerId,
-      ownerLogin: metadata.ownerLogin,
-      updatedAt: now,
-    })
-    .where(
-      and(
+  return database.transaction(async (transaction) => {
+    await lockExternalExecution(transaction);
+    const [lockedWorkspace] = await transaction.select({ id: workspace.id }).from(workspace)
+      .where(eq(workspace.id, context.workspace.id)).for('update').limit(1);
+    if (!lockedWorkspace || context.user.id !== context.workspace.ownerUserId)
+      throw new ExecutionProfileError('repository_access_changed');
+    const [selected] = await transaction.select().from(repository).where(and(
+      eq(repository.githubRepositoryId, draft.githubRepositoryId), eq(repository.workspaceId, context.workspace.id),
+      eq(repository.installationId, draft.installationId), eq(repository.isSelected, true),
+    )).for('update').limit(1);
+    if (!selected || selected.isPrivate) throw new ExecutionProfileError('repository_access_changed');
+    const [previous] = await transaction.select().from(executionProfile)
+      .where(eq(executionProfile.githubRepositoryId, draft.githubRepositoryId)).for('update').limit(1);
+    const values = profileValues(draft, now);
+    if (previous && (previous.profileIdentity !== values.profileIdentity || previous.baseCommitSha !== draft.baseCommitSha) &&
+        await hasRepositorySwitchConflict(transaction, context.workspace.id, now))
+      throw new ExecutionProfileError('repository_state_changed');
+    const updatedRepositories = await transaction
+      .update(repository)
+      .set({
+        defaultBranch: metadata.defaultBranch,
+        fullName: metadata.fullName,
+        isPrivate: metadata.isPrivate,
+        name: metadata.name,
+        ownerId: metadata.ownerId,
+        ownerLogin: metadata.ownerLogin,
+        updatedAt: now,
+      })
+      .where(and(
         eq(repository.githubRepositoryId, draft.githubRepositoryId),
         eq(repository.workspaceId, context.workspace.id),
         eq(repository.installationId, draft.installationId),
         eq(repository.isSelected, true),
-      ),
-    )
-    .returning({ id: repository.githubRepositoryId });
-  if (updatedRepositories.length !== 1) {
-    throw new ExecutionProfileError('repository_access_changed');
-  }
+      ))
+      .returning({ id: repository.githubRepositoryId });
+    if (updatedRepositories.length !== 1) throw new ExecutionProfileError('repository_access_changed');
 
-  const values = profileValues(draft, now);
-  await database
-    .insert(executionProfile)
-    .values(values)
-    .onConflictDoUpdate({
-      set: values,
-      target: executionProfile.githubRepositoryId,
+    await transaction.insert(executionProfile).values(values).onConflictDoUpdate({
+      set: values, target: executionProfile.githubRepositoryId,
     });
-  const [saved] = await database
-    .select()
-    .from(executionProfile)
-    .where(
-      and(
-        eq(executionProfile.githubRepositoryId, draft.githubRepositoryId),
-        eq(executionProfile.workspaceId, context.workspace.id),
-      ),
-    )
-    .limit(1);
-  if (!saved) throw new ExecutionProfileError('profile_unavailable');
-  return saved;
+    const [saved] = await transaction.select().from(executionProfile).where(and(
+      eq(executionProfile.githubRepositoryId, draft.githubRepositoryId),
+      eq(executionProfile.workspaceId, context.workspace.id),
+    )).limit(1);
+    if (!saved) throw new ExecutionProfileError('profile_unavailable');
+    return saved;
+  });
 }
 
 export async function detectSelectedRepositoryExecutionProfile(

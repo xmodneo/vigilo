@@ -27,6 +27,7 @@ import {
   cancelCreatedRepairRun,
   getRepairRun,
   startRepairRun,
+  transitionRepairRun,
 } from '../lib/repair-runs/flow.ts';
 import { createRepairRunHandlers } from '../lib/repair-runs/handlers.ts';
 import {
@@ -521,10 +522,12 @@ test('completed failing baseline reconciliation finalizes a staged source checkp
   const { run } = await queuedRun(context, owner);
   await context.database.insert(repairRunSourceCheckpoint).values({ repairRunId: run.id,
     expectedSourceIdentity: 'd'.repeat(64), reviewedBy: owner.user.id, planIdentity: 'f'.repeat(64) });
-  let entered!: () => void;
-  const started = new Promise<void>((resolve) => { entered = resolve; });
-  void processRepairJob(job(run.id), workerDependencies(context.database, async () => { entered(); return new Promise<never>(() => {}); }));
-  await started;
+  // Reconstruct the pre-crash durable attempt directly: a newly claimed
+  // arbitrary checkpoint must now fail plan integrity before dispatch.
+  await transitionRepairRun(context.database, owner.workspace.id, run.id, 'created', 'baseline_running', NOW, { eventId: randomUUID() });
+  await context.database.insert(repairRunAttempt).values({ id: randomUUID(), repairRunId: run.id,
+    queueJobId: run.id, attemptNumber: 1, expectedBaselineId: randomUUID(), ownershipToken: randomUUID(),
+    state: 'active', claimedAt: NOW, heartbeatAt: NOW, leaseExpiresAt: new Date(NOW.getTime() + 90_000) });
   const [attempt] = await context.database.select().from(repairRunAttempt); assert.ok(attempt);
   await persistEvidence(context.database, evidence({ workspaceId: owner.workspace.id,
     profileIdentity: run.identity.profileIdentity, baselineId: attempt.expectedBaselineId, outcome: 'test_failed' }));

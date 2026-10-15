@@ -97,8 +97,23 @@ Deterministic controlled-request input totals were 8,207 investigation bytes and
 20 KiB respectively (32 KiB account aggregate); larger real requests may safely
 exhaust them. The ledger field named `inputTokens` charges serialized UTF-8 Gemini
 request bytes, not tokenizer-measured input tokens. Output allowances are at most
-5,000 investigation and 18,000 generation tokens. These are planning/test limits,
-not issued grants or live validation; live acceptance remains pending.
+5,000 investigation and 18,000 generation tokens. The supported M7.7B staging
+service now fixes these limits in a versioned reviewed plan; no real acceptance
+grant has been issued and live acceptance remains pending.
+
+The local-only `operations/stage-reviewed-repair-run.ts` entrypoint accepts a
+strict `m77b_repair_v1` plan through protected stdin. `--dry-run` requires
+`{ "actor": { "workspaceId", "reviewerUserId" }, "plan": { ... } }` and returns
+only a plan hash, run ID, and grant count without database writes. A separately
+approved `--apply` request additionally requires the exact reviewed
+`approvedPlanIdentity` and a current session cookie in protected stdin, never a
+command-line argument. It resolves the existing authenticated owner, checks the
+configured release and provider-account identities, and atomically writes one
+RepairRun, its intent/event, pending source checkpoint, one account grant, five
+operation grants, and one inert baseline job. The full `ReviewedStagingInput`
+shape is defined in `lib/external-execution/reviewed-plan.ts`; arbitrary grant
+rows are not accepted. Do not invoke `--apply` for the real acceptance fixture
+without separate authorization. No worker or provider is started by staging.
 
 The development and live acceptance model is Google Gemini
 `gemini-3.1-flash-lite`; this is not the final production model. The Gemini Free
@@ -163,9 +178,11 @@ endpoint contacts an external provider.
   identified persistent local Vigilo development database, whose ledger has 26
   consistent entries. This local fact says nothing about production, staging,
   shared databases, or arbitrary deployments.
-- The local selected repository remains `xmodneo/vigilo`. The authenticated
-  switch to `xmodneo/vigilo-acceptance-fixture` has not occurred, and M7.7 live
-  acceptance has not started.
+- The positively identified local development database currently selects the
+  public `xmodneo/vigilo-acceptance-fixture` repository and has one ready
+  fixture execution profile. No fixture RepairRun, baseline, source checkpoint,
+  execution grant, reservation, or acceptance has been created; M7.7 live
+  acceptance has not started. This local state does not describe other deployments.
 - With 0025 applied locally, changing the selected repository retains old
   repository, profile, run, and baseline rows as history. A switch or loss-of-access
   deselection is blocked by active run/investigation/AI-generation/verification/

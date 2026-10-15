@@ -18,6 +18,7 @@ import { SandboxTransportError } from './sandbox-auth.ts';
 import { assertRunBusinessAllowed, lockExternalExecution } from './business-fence.ts';
 import { SandboxTransportPolicy, type SandboxTransportBinding, type SandboxTransportKind } from './sandbox-transport.ts';
 import { assertMatchedSourceCheckpoint } from './source-checkpoint.ts';
+import { assertReviewedPlanIntegrity } from './reviewed-plan-integrity.ts';
 import {
   ExternalExecutionAuthorityError,
   type ExternalExecutionAuthorizer,
@@ -102,6 +103,8 @@ export class DurableExternalExecutionAuthorizer implements ExternalExecutionAuth
           binding = { ...binding, sessionId: row.sessionId };
         } else {
           await assertRunBusinessAllowed(transaction, request.scope, now);
+          if (request.scope.repairRunId)
+            await assertReviewedPlanIntegrity(transaction, request.scope.repairRunId, this.options.runtimeReleaseSha ?? '', now);
           if (request.scope.repairRunId && request.scope.operationCategory.startsWith('gemini_'))
             await assertMatchedSourceCheckpoint(transaction, request.scope.repairRunId);
         }
@@ -327,6 +330,8 @@ export class DurableExternalExecutionAuthorizer implements ExternalExecutionAuth
       } else if (kind !== 'cleanup') {
         if (recovery) throw new ExternalExecutionAuthorityError('execution_authority_mismatch');
         await assertRunBusinessAllowed(transaction, reservation, clock());
+        if (reservation.repairRunId)
+          await assertReviewedPlanIntegrity(transaction, reservation.repairRunId, this.options.runtimeReleaseSha ?? '', clock());
         if (reservation.repairRunId && reservation.operationCategory.startsWith('gemini_'))
           await assertMatchedSourceCheckpoint(transaction, reservation.repairRunId);
       }
@@ -342,7 +347,11 @@ export class DurableExternalExecutionAuthorizer implements ExternalExecutionAuth
       await owned(transaction, { lock: true, requireFresh: outcome === 'succeeded', requireGrant: outcome === 'succeeded' });
       // A valid lease is insufficient once another operation fences this run.
       // Only the privately classified exact cleanup transport may still succeed.
-      if (outcome === 'succeeded' && kind !== 'cleanup') await assertRunBusinessAllowed(transaction, reservation, clock());
+      if (outcome === 'succeeded' && kind !== 'cleanup') {
+        await assertRunBusinessAllowed(transaction, reservation, clock());
+        if (reservation.repairRunId)
+          await assertReviewedPlanIntegrity(transaction, reservation.repairRunId, this.options.runtimeReleaseSha ?? '', clock());
+      }
       await transaction.insert(externalExecutionEvent).values({
         id: randomId(), reservationId: reservation.id, eventType: terminalEvent(outcome), attemptOrdinal: ordinal,
         failureCode: outcome === 'ambiguous' ? 'provider_attempt_ambiguous' : null,
@@ -373,7 +382,11 @@ export class DurableExternalExecutionAuthorizer implements ExternalExecutionAuth
           && !audit.some((terminal) => terminal.attemptOrdinal === event.attemptOrdinal && ['attempt_succeeded', 'attempt_failed', 'attempt_ambiguous'].includes(terminal.eventType)));
         if (uncertain) { outcome = 'ambiguous'; failureCode = 'provider_attempt_ambiguous'; }
         await owned(transaction, { lock: true, requireFresh: outcome === 'succeeded', requireGrant: outcome === 'succeeded' });
-        if (outcome === 'succeeded' && !recovery) await assertRunBusinessAllowed(transaction, reservation, clock());
+        if (outcome === 'succeeded' && !recovery) {
+          await assertRunBusinessAllowed(transaction, reservation, clock());
+          if (reservation.repairRunId)
+            await assertReviewedPlanIntegrity(transaction, reservation.repairRunId, this.options.runtimeReleaseSha ?? '', clock());
+        }
         const now = clock();
         const state = outcome === 'succeeded' ? 'succeeded' : outcome === 'failed' ? 'failed' : 'ambiguous';
         const code = state === 'succeeded' ? null : failureCode ?? (state === 'ambiguous' ? 'provider_attempt_ambiguous' : 'execution_authority_mismatch');
@@ -396,6 +409,8 @@ export class DurableExternalExecutionAuthorizer implements ExternalExecutionAuth
             // Retain exact parsed identity for cleanup, not as business success.
             policy.confirm(identity);
             await assertRunBusinessAllowed(transaction, reservation, clock());
+            if (reservation.repairRunId)
+              await assertReviewedPlanIntegrity(transaction, reservation.repairRunId, this.options.runtimeReleaseSha ?? '', clock());
           }
           if (started && !existing) {
             await transaction.insert(externalExecutionEvent).values({ id: randomId(), reservationId: reservation.id, eventType: identity ? 'attempt_succeeded' : 'attempt_ambiguous', attemptOrdinal: 1, failureCode: identity ? null : 'provider_attempt_ambiguous', createdAt: clock() });

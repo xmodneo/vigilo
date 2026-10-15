@@ -16,6 +16,7 @@ import { recoverSandbox, type SandboxLifecycleObserver } from '../../src/sandbox
 import type { AuthenticatedWorkspace } from '../auth/protected-context.ts';
 import type { VigiloDatabase } from '../db/types.ts';
 import { DurableExternalExecutionAuthorizer } from '../external-execution/authority.ts';
+import { assertReviewedPlanIntegrity } from '../external-execution/reviewed-plan-integrity.ts';
 import { assertRunBusinessAllowed, lockExternalExecution } from '../external-execution/business-fence.ts';
 import { ExternalExecutionAuthorityError, type ExternalExecutionAuthorizer } from '../external-execution/types.ts';
 import type { GitHubAppConfiguration } from '../github-app/types.ts';
@@ -69,6 +70,7 @@ export interface RepairWorkerDependencies {
   randomId?: () => string;
   recover?: Recovery;
   executionAuthority?: ExternalExecutionAuthorizer;
+  runtimeReleaseSha?: string;
 }
 
 type Claim =
@@ -414,6 +416,11 @@ async function executeAttempt(dependencies: RepairWorkerDependencies, run: Store
   try {
     const authority = await resolveBaselineAuthority(dependencies.database, context);
     if (!sameAuthority(run, authority)) throw Object.assign(new Error('authority_changed'), { code: 'authority_changed' });
+    await dependencies.database.transaction(async (transaction) => {
+      await lockExternalExecution(transaction);
+      await assertReviewedPlanIntegrity(transaction, run.id, dependencies.runtimeReleaseSha ?? process.env.VIGILO_RELEASE_SHA ?? '',
+        (dependencies.clock ?? (() => new Date()))());
+    });
   } catch (error) {
     const now = (dependencies.clock ?? (() => new Date()))();
     const code = safeFailureCode(error);

@@ -1,6 +1,6 @@
 import { and, eq } from 'drizzle-orm';
 
-import { account } from '../../db/schema.ts';
+import { account, workspace } from '../../db/schema.ts';
 import type { VigiloDatabase } from '../db/types.ts';
 import { ensureWorkspaceForUser } from '../workspaces.ts';
 
@@ -38,6 +38,7 @@ export async function resolveAuthenticatedWorkspace(
   getSession: SessionReader,
   database: VigiloDatabase,
   headers: Headers,
+  options: { existingWorkspaceOnly?: boolean } = {},
 ): Promise<AuthenticatedWorkspace> {
   const currentSession = await getSession(headers);
   if (!currentSession) {
@@ -59,7 +60,10 @@ export async function resolveAuthenticatedWorkspace(
     throw new AccessDeniedError('unauthorized');
   }
 
-  const ownedWorkspace = await ensureWorkspaceForUser(database, currentSession.user.id);
+  const ownedWorkspace = options.existingWorkspaceOnly
+    ? (await database.select().from(workspace).where(eq(workspace.ownerUserId, currentSession.user.id)).limit(1))[0]
+    : await ensureWorkspaceForUser(database, currentSession.user.id);
+  if (!ownedWorkspace) throw new AccessDeniedError('unauthorized');
 
   return {
     sessionId: currentSession.session.id,

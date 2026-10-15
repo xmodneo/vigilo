@@ -9,3 +9,14 @@ export function resolveRequestWorkspace(headers: Headers) {
     headers,
   );
 }
+
+/** Operator staging must not provision a workspace outside its transaction. */
+export function resolveExistingRequestWorkspace(headers: Headers) {
+  const auth = getAuth();
+  return resolveAuthenticatedWorkspace(
+    (requestHeaders) => auth.api.getSession({ headers: requestHeaders }),
+    getAuthDatabase(),
+    headers,
+    { existingWorkspaceOnly: true },
+  );
+}
