@@ -4,6 +4,7 @@ import { fromDrizzle, PgBoss, type DrizzleTransactionLike, type Job, type JobWit
 import type { VigiloDatabase } from '../db/types.ts';
 
 export const REPAIR_BASELINE_QUEUE = 'repair-baseline-v1';
+export const REVIEWED_BASELINE_QUEUE = 'repair-baseline-reviewed-v1';
 export const REPAIR_JOB_VERSION = 1 as const;
 export const REPAIR_JOB_MAX_ATTEMPTS = 3;
 export const INVESTIGATION_CONTEXT_QUEUE = 'investigation-context-v1';
@@ -79,6 +80,10 @@ export type VigiloTransaction = Parameters<Parameters<VigiloDatabase['transactio
 
 export interface TransactionalRepairQueue {
   enqueue(transaction: VigiloTransaction, payload: RepairJobPayload): Promise<string>;
+}
+
+export interface TransactionalReviewedBaselineQueue {
+  enqueueReviewedBaseline(transaction: VigiloTransaction, payload: RepairJobPayload): Promise<string>;
 }
 
 export interface TransactionalInvestigationQueue {
@@ -173,6 +178,22 @@ export class PgBossRepairQueue implements TransactionalRepairQueue {
   }
 }
 
+/** New reviewed jobs cannot be published to the general worker's baseline queue. */
+export class PgBossReviewedBaselineQueue implements TransactionalReviewedBaselineQueue {
+  constructor(private readonly boss: Pick<PgBoss, 'send'>) {}
+
+  async enqueueReviewedBaseline(transaction: VigiloTransaction, payload: RepairJobPayload): Promise<string> {
+    const validated = parseRepairJobPayload(payload);
+    const id = await this.boss.send(REVIEWED_BASELINE_QUEUE, validated, {
+      ...REPAIR_QUEUE_OPTIONS,
+      db: fromDrizzle(transaction as unknown as DrizzleTransactionLike, sql),
+      id: validated.repairRunId,
+    });
+    if (id !== validated.repairRunId) throw new Error('repair_job_not_persisted');
+    return id;
+  }
+}
+
 export class PgBossInvestigationQueue implements TransactionalInvestigationQueue {
   constructor(private readonly boss: Pick<PgBoss, 'send'>) {}
 
@@ -247,6 +268,8 @@ export class PgBossRepairPublicationQueue implements TransactionalRepairPublicat
 export async function configureRepairQueue(boss: Pick<PgBoss, 'createQueue' | 'updateQueue'>): Promise<void> {
   await boss.createQueue(REPAIR_BASELINE_QUEUE, { policy: 'standard', ...REPAIR_QUEUE_OPTIONS });
   await boss.updateQueue(REPAIR_BASELINE_QUEUE, REPAIR_QUEUE_OPTIONS);
+  await boss.createQueue(REVIEWED_BASELINE_QUEUE, { policy: 'standard', ...REPAIR_QUEUE_OPTIONS });
+  await boss.updateQueue(REVIEWED_BASELINE_QUEUE, REPAIR_QUEUE_OPTIONS);
   await boss.createQueue(INVESTIGATION_CONTEXT_QUEUE, { policy: 'standard', ...REPAIR_QUEUE_OPTIONS });
   await boss.updateQueue(INVESTIGATION_CONTEXT_QUEUE, REPAIR_QUEUE_OPTIONS);
   await boss.createQueue(CANDIDATE_VERIFICATION_QUEUE, { policy: 'standard', ...REPAIR_QUEUE_OPTIONS });
@@ -261,16 +284,65 @@ export async function configureRepairQueue(boss: Pick<PgBoss, 'createQueue' | 'u
   await boss.updateQueue(REPAIR_PUBLICATION_QUEUE, REPAIR_QUEUE_OPTIONS);
 }
 
+const BOSS_GRACEFUL_STOP_MS = 5_000;
+const BOSS_CLEANUP_DEADLINE_MS = 8_000;
+
+export class RepairBossInitializationError extends Error {
+  readonly code: 'repair_boss_construction_failed' | 'repair_boss_start_failed' | 'repair_boss_configuration_failed';
+
+  constructor(phase: 'construction' | 'start' | 'configuration', readonly cleanupFailed: boolean) {
+    const code = phase === 'construction' ? 'repair_boss_construction_failed'
+      : phase === 'start' ? 'repair_boss_start_failed' : 'repair_boss_configuration_failed';
+    super(code);
+    this.code = code;
+  }
+}
+
+async function stopFailedInitialization(boss: PgBoss): Promise<boolean> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      Promise.resolve().then(() => boss.stop({ graceful: true, timeout: BOSS_GRACEFUL_STOP_MS })),
+      new Promise<never>((_, reject) => {
+        timeout = setTimeout(() => reject(new Error('repair_boss_cleanup_timeout')), BOSS_CLEANUP_DEADLINE_MS);
+      }),
+    ]);
+    return true;
+  } catch {
+    return false;
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
+}
+
+/** The helper owns pg-boss through start and queue setup; ownership transfers only on return. */
 export async function createRepairBoss(databaseUrl: string, role: 'publisher' | 'worker'): Promise<PgBoss> {
-  const boss = new PgBoss({
-    application_name: `vigilo-${role}`,
-    connectionString: databaseUrl,
-    max: role === 'worker' ? 3 : 2,
-    schedule: false,
-    supervise: role === 'worker',
-    useListenNotify: false,
-  });
-  await boss.start();
-  await configureRepairQueue(boss);
-  return boss;
+  let boss: PgBoss;
+  try {
+    boss = new PgBoss({
+      application_name: `vigilo-${role}`,
+      connectionString: databaseUrl,
+      max: role === 'worker' ? 3 : 2,
+      schedule: false,
+      // pg-boss's automatic supervisor enumerates every queue in its schema,
+      // including the exact-claim-only reviewed queue. The general worker
+      // instead supervises only its canonical queues explicitly.
+      supervise: false,
+      useListenNotify: false,
+    });
+  } catch {
+    throw new RepairBossInitializationError('construction', false);
+  }
+  let startAttempted = false;
+  let phase: 'start' | 'configuration' = 'start';
+  try {
+    startAttempted = true;
+    await boss.start();
+    phase = 'configuration';
+    await configureRepairQueue(boss);
+    return boss;
+  } catch {
+    const cleanupFailed = startAttempted ? !(await stopFailedInitialization(boss)) : false;
+    throw new RepairBossInitializationError(phase, cleanupFailed);
+  }
 }

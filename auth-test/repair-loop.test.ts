@@ -30,7 +30,8 @@ import { createTestExternalExecutionAuthorizer } from './external-execution-supp
 import { DurableExternalExecutionAuthorizer } from '../lib/external-execution/authority.ts';
 import { computeExecutionGrantIdentity } from '../lib/external-execution/identity.ts';
 
-const NOW = new Date('2031-01-02T03:04:05.000Z');
+// The reviewed plan's four-hour window is checked against live database time.
+const NOW = new Date();
 const COMMIT = 'a'.repeat(40); const PROFILE = 'b'.repeat(64); const TREE = 'c'.repeat(40);
 const SOURCE_IDENTITY = 'd'.repeat(64); const REPOSITORY_ID = 51001; const INSTALLATION_ID = 52001;
 const PATH = 'src/fix.ts'; const BASE = 'export const value = 1;\n'; const FIX = 'export const value = 2;\n';

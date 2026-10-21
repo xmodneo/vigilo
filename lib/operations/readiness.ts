@@ -1,7 +1,7 @@
 import postgres from 'postgres';
 
 import { readDatabaseEnvironment } from '../auth/environment.ts';
-import { canonicalRepairQueues } from './queues.ts';
+import { configuredRepairQueues } from './queues.ts';
 import { parseTrustedProxyHops } from './rate-limit.ts';
 import { readRuntimeRelease } from './release.ts';
 import { EXPECTED_SCHEMA_VERSION, validateMigrationLedger } from './migrations.ts';
@@ -112,7 +112,7 @@ async function readDatabaseFacts(databaseUrl: string, releaseSha: string): Promi
     `;
     const queues = catalog?.queueTable ? await client<{ name: string }[]>`select name from pgboss.queue order by name` : [];
     const names = queues.map((row) => row.name);
-    const queueSet = names.length === canonicalRepairQueues.length && names.every((name, index) => name === canonicalRepairQueues[index]);
+    const queueSet = names.length === configuredRepairQueues.length && names.every((name, index) => name === configuredRepairQueues[index]);
     const [worker] = catalog?.heartbeatTable ? await client<{ present: boolean; fresh: boolean; releaseSha: string | null; expectedSchemaVersion: string | null }[]>`
       with workers as (
         select release_sha, expected_schema_version, last_heartbeat_at,

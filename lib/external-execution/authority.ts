@@ -16,6 +16,7 @@ import { computeExecutionReservationIdentity, executionGrantIdentityMatches } fr
 import { accountIdentityMatches, canonicalProviderAccountIdentity, vercelTeamProjectIdentity } from './provider-account.ts';
 import { SandboxTransportError } from './sandbox-auth.ts';
 import { assertRunBusinessAllowed, lockExternalExecution } from './business-fence.ts';
+import { freshDatabaseTime } from './database-clock.ts';
 import { SandboxTransportPolicy, type SandboxTransportBinding, type SandboxTransportKind } from './sandbox-transport.ts';
 import { assertMatchedSourceCheckpoint } from './source-checkpoint.ts';
 import { assertReviewedPlanIntegrity } from './reviewed-plan-integrity.ts';
@@ -66,13 +67,13 @@ function terminalEvent(outcome: ProviderAttemptOutcome): 'attempt_succeeded' | '
 export class DurableExternalExecutionAuthorizer implements ExternalExecutionAuthorizer {
   constructor(
     private readonly database: VigiloDatabase,
-    private readonly options: { clock?: () => Date; randomId?: () => string; leaseMs?: number; fetch?: typeof fetch; runtimeReleaseSha?: string } = {},
+    private readonly options: { clock?: () => Date; randomId?: () => string; leaseMs?: number; fetch?: typeof fetch; runtimeReleaseSha?: string;
+      afterPostLockValidation?: () => Promise<void> } = {},
   ) {}
 
   async reserve(request: ExternalExecutionReservationRequest): Promise<ExternalExecutionPermit> {
     const clock = this.options.clock ?? (() => new Date());
     const randomId = this.options.randomId ?? randomUUID;
-    const now = clock();
     const leaseMs = this.options.leaseMs ?? DEFAULT_LEASE_MS;
     try {
       const stored = await this.database.transaction(async (transaction) => {
@@ -80,6 +81,10 @@ export class DurableExternalExecutionAuthorizer implements ExternalExecutionAuth
         const [semaphore] = await transaction.select().from(externalExecutionSemaphore)
           .where(eq(externalExecutionSemaphore.id, 'global')).limit(1);
         if (!semaphore) throw new ExternalExecutionAuthorityError('execution_authority_missing');
+        const grants = await transaction.select().from(executionBudgetGrant)
+          .orderBy(asc(executionBudgetGrant.id)).for('update');
+        // Global and grant locks are both held before taking authority time.
+        const now = await freshDatabaseTime(transaction);
 
         let binding: SandboxTransportBinding | undefined = request.sandbox;
         if (request.cleanup) {
@@ -109,8 +114,6 @@ export class DurableExternalExecutionAuthorizer implements ExternalExecutionAuth
             await assertMatchedSourceCheckpoint(transaction, request.scope.repairRunId);
         }
 
-        const grants = await transaction.select().from(executionBudgetGrant)
-          .orderBy(asc(executionBudgetGrant.id)).for('update');
         const candidateIds = grants.map((grant) => grant.id);
         const revocations = candidateIds.length === 0 ? [] : await transaction.select({ grantId: executionBudgetGrantRevocation.grantId })
           .from(executionBudgetGrantRevocation).where(inArray(executionBudgetGrantRevocation.grantId, candidateIds));
@@ -229,6 +232,7 @@ export class DurableExternalExecutionAuthorizer implements ExternalExecutionAuth
         const fence = semaphore.nextFence + 1;
         await transaction.update(externalExecutionSemaphore).set({ nextFence: fence, updatedAt: now })
           .where(eq(externalExecutionSemaphore.id, 'global'));
+        await this.options.afterPostLockValidation?.();
         const id = randomId();
         const operationKey = request.operationKey ?? randomId();
         const ownershipToken = randomId();
@@ -251,14 +255,17 @@ export class DurableExternalExecutionAuthorizer implements ExternalExecutionAuth
           sandboxResourceClass: request.amounts.sandboxResourceClass ?? null,
           reservedVerificationAttempts: request.amounts.verificationAttempts,
           reservedRepairLoopIterations: request.amounts.repairLoopIterations,
-          fence, reservationIdentity, createdAt: now,
+          // The existing INSERT trigger compares NEW.created_at with both
+          // locked grants. Database time here is the atomic final expiry guard.
+          fence, reservationIdentity, createdAt: sql`clock_timestamp()`,
         }).returning();
         if (!reservation) throw new ExternalExecutionAuthorityError('execution_authority_mismatch');
+        const reservationTime = reservation.createdAt;
         await transaction.insert(externalExecutionLease).values({
-          reservationId: id, ownershipToken, fence, state: 'active', heartbeatAt: now,
-          leaseExpiresAt: new Date(now.getTime() + leaseMs),
+          reservationId: id, ownershipToken, fence, state: 'active', heartbeatAt: reservationTime,
+          leaseExpiresAt: new Date(Math.min(reservationTime.getTime() + leaseMs, grant.expiresAt.getTime(), account.expiresAt.getTime())),
         });
-        await transaction.insert(externalExecutionEvent).values({ id: randomId(), reservationId: id, eventType: 'reserved', createdAt: now });
+        await transaction.insert(externalExecutionEvent).values({ id: randomId(), reservationId: id, eventType: 'reserved', createdAt: reservationTime });
         return { reservation, ownershipToken, binding };
       });
       return this.permit(stored.reservation, stored.ownershipToken, clock, randomId, leaseMs, stored.binding, request.cleanup !== undefined);
@@ -283,13 +290,43 @@ export class DurableExternalExecutionAuthorizer implements ExternalExecutionAuth
     const policy = sandbox && binding ? new SandboxTransportPolicy(binding, recovery, {
       runtimeMs: reservation.reservedSandboxRuntimeMs, vcpus: Number(reservation.sandboxResourceClass?.slice('vcpu_'.length)),
     }) : undefined;
+    // The global fence and both grant rows are locked before protected writes.
+    // Repeat time-sensitive checks at the write itself: a lease can expire while
+    // a transaction waits for its row lock, even after an earlier valid read.
+    const liveGrants = sql`exists (
+      select 1 from execution_budget_grant operation_grant
+      join execution_budget_grant account_grant on account_grant.id = ${reservation.accountGrantId}
+      where operation_grant.id = ${reservation.grantId}
+        and operation_grant.version = 2
+        and operation_grant.authorized_release_sha = ${reservation.executingReleaseSha}
+        and operation_grant.expires_at > clock_timestamp()
+        and account_grant.expires_at > clock_timestamp()
+        and not exists (select 1 from execution_budget_grant_revocation revocation
+          where revocation.grant_id in (${reservation.grantId}, ${reservation.accountGrantId}))
+    )`;
+    const insertActiveEvent = async (transaction: VigiloDatabase,
+      eventType: 'attempt_started' | 'attempt_succeeded' | 'lease_renewed', ordinal: number | null = null,
+      usage: { inputTokens?: number; outputTokens?: number } = {}) => {
+      const inserted = await transaction.execute(sql`
+        insert into external_execution_event (id, reservation_id, event_type, attempt_ordinal, input_tokens, output_tokens, created_at)
+        select ${randomId()}, ${reservation.id}, ${eventType}, ${ordinal}, ${usage.inputTokens ?? null}, ${usage.outputTokens ?? null}, clock_timestamp()
+        from external_execution_lease lease
+        where lease.reservation_id = ${reservation.id}
+          and lease.ownership_token = ${ownershipToken} and lease.fence = ${reservation.fence}
+          and lease.state = 'active' and lease.lease_expires_at > clock_timestamp()
+          and ${liveGrants}
+        returning id
+      `);
+      const rows = (inserted as unknown as { rows?: { id: string }[] }).rows ?? inserted as unknown as { id: string }[];
+      if (rows.length !== 1) throw new ExternalExecutionAuthorityError('execution_authority_expired');
+    };
     const owned = async (transaction: VigiloDatabase, options: { lock?: boolean; requireFresh?: boolean; requireGrant?: boolean } = {}) => {
       const { lock = false, requireFresh = true, requireGrant = true } = options;
-      const now = clock();
       let query = transaction.select({ id: externalExecutionLease.reservationId }).from(externalExecutionLease).where(and(
         eq(externalExecutionLease.reservationId, reservation.id), eq(externalExecutionLease.ownershipToken, ownershipToken),
         eq(externalExecutionLease.fence, reservation.fence), eq(externalExecutionLease.state, 'active'),
-        ...(requireFresh ? [gt(externalExecutionLease.leaseExpiresAt, now)] : []),
+        ...(requireFresh ? [sql`${externalExecutionLease.leaseExpiresAt} > clock_timestamp()`] : []),
+        ...(requireGrant ? [liveGrants] : []),
       ));
       if (requireGrant) {
         let grantQuery = transaction.select().from(executionBudgetGrant)
@@ -313,6 +350,7 @@ export class DurableExternalExecutionAuthorizer implements ExternalExecutionAuth
         const revocations = await transaction.select({ grantId: executionBudgetGrantRevocation.grantId })
           .from(executionBudgetGrantRevocation).where(inArray(executionBudgetGrantRevocation.grantId, [reservation.accountGrantId, reservation.grantId]));
         if (revocations.length > 0) throw new ExternalExecutionAuthorityError('execution_authority_missing');
+        const now = await freshDatabaseTime(transaction);
         if (grants.some((grant) => grant.expiresAt <= now)) throw new ExternalExecutionAuthorityError('execution_authority_expired');
       }
       if (lock) query = query.for('update') as typeof query;
@@ -339,7 +377,7 @@ export class DurableExternalExecutionAuthorizer implements ExternalExecutionAuth
       if (sandbox && !recovery && reservation.reservedSandboxIdentities === 1 && ordinal === 1 && kind !== 'create') throw new ExternalExecutionAuthorityError('execution_authority_mismatch');
       if (kind === 'create' && (reservation.reservedSandboxIdentities !== 1 || ordinal !== 1)) throw new ExternalExecutionAuthorityError('sandbox_creation_failed');
       if (ordinal > reservation.reservedProviderAttempts) throw new ExternalExecutionAuthorityError('execution_budget_exhausted');
-      await transaction.insert(externalExecutionEvent).values({ id: randomId(), reservationId: reservation.id, eventType: 'attempt_started', attemptOrdinal: ordinal, createdAt: clock() });
+      await insertActiveEvent(transaction, 'attempt_started', ordinal);
       return ordinal;
     }));
     const finish = async (ordinal: number, outcome: ProviderAttemptOutcome, usage: { inputTokens?: number; outputTokens?: number } = {}, kind: SandboxTransportKind = 'business') => authorityOperation(() => database.transaction(async (transaction) => {
@@ -352,10 +390,11 @@ export class DurableExternalExecutionAuthorizer implements ExternalExecutionAuth
         if (reservation.repairRunId)
           await assertReviewedPlanIntegrity(transaction, reservation.repairRunId, this.options.runtimeReleaseSha ?? '', clock());
       }
-      await transaction.insert(externalExecutionEvent).values({
+      if (outcome === 'succeeded') await insertActiveEvent(transaction, 'attempt_succeeded', ordinal, usage);
+      else await transaction.insert(externalExecutionEvent).values({
         id: randomId(), reservationId: reservation.id, eventType: terminalEvent(outcome), attemptOrdinal: ordinal,
         failureCode: outcome === 'ambiguous' ? 'provider_attempt_ambiguous' : null,
-        inputTokens: usage.inputTokens ?? null, outputTokens: usage.outputTokens ?? null, createdAt: clock(),
+        inputTokens: usage.inputTokens ?? null, outputTokens: usage.outputTokens ?? null, createdAt: sql`clock_timestamp()`,
       });
     }));
     const permit: ExternalExecutionPermit = {
@@ -363,17 +402,27 @@ export class DurableExternalExecutionAuthorizer implements ExternalExecutionAuth
       ownershipToken,
       fence: reservation.fence,
       sandboxResourceClass: reservation.sandboxResourceClass as ExternalExecutionPermit['sandboxResourceClass'],
-      assertOwnership: () => authorityOperation(() => owned(database)),
+      assertOwnership: () => authorityOperation(() => database.transaction(async (transaction) => {
+        await lockExternalExecution(transaction);
+        await owned(transaction, { lock: true });
+      })),
       beginProviderAttempt: () => begin(),
       finishProviderAttempt: (ordinal, outcome, usage) => finish(ordinal, outcome, usage),
       renew: async () => authorityOperation(() => database.transaction(async (transaction) => {
         await lockExternalExecution(transaction);
         await owned(transaction, { lock: true });
-        const now = clock();
-        await transaction.update(externalExecutionLease).set({ heartbeatAt: now, leaseExpiresAt: new Date(now.getTime() + leaseMs) }).where(and(
-          eq(externalExecutionLease.reservationId, reservation.id), eq(externalExecutionLease.ownershipToken, ownershipToken), eq(externalExecutionLease.state, 'active'),
-        ));
-        await transaction.insert(externalExecutionEvent).values({ id: randomId(), reservationId: reservation.id, eventType: 'lease_renewed', createdAt: now });
+        const updated = await transaction.update(externalExecutionLease).set({
+          heartbeatAt: sql`clock_timestamp()`,
+          leaseExpiresAt: sql`least(clock_timestamp() + ${leaseMs} * interval '1 millisecond',
+            (select expires_at from execution_budget_grant where id = ${reservation.grantId}),
+            (select expires_at from execution_budget_grant where id = ${reservation.accountGrantId}))`,
+        }).where(and(
+          eq(externalExecutionLease.reservationId, reservation.id), eq(externalExecutionLease.ownershipToken, ownershipToken),
+          eq(externalExecutionLease.fence, reservation.fence), eq(externalExecutionLease.state, 'active'),
+          sql`${externalExecutionLease.leaseExpiresAt} > clock_timestamp()`, liveGrants,
+        )).returning({ reservationId: externalExecutionLease.reservationId });
+        if (updated.length !== 1) throw new ExternalExecutionAuthorityError('execution_authority_expired');
+        await insertActiveEvent(transaction, 'lease_renewed');
       })),
       complete: async (outcome, failureCode) => authorityOperation(() => database.transaction(async (transaction) => {
         await lockExternalExecution(transaction);
@@ -390,9 +439,12 @@ export class DurableExternalExecutionAuthorizer implements ExternalExecutionAuth
         const now = clock();
         const state = outcome === 'succeeded' ? 'succeeded' : outcome === 'failed' ? 'failed' : 'ambiguous';
         const code = state === 'succeeded' ? null : failureCode ?? (state === 'ambiguous' ? 'provider_attempt_ambiguous' : 'execution_authority_mismatch');
-        await transaction.update(externalExecutionLease).set({ state, completedAt: now, failureCode: code }).where(and(
-          eq(externalExecutionLease.reservationId, reservation.id), eq(externalExecutionLease.ownershipToken, ownershipToken), eq(externalExecutionLease.state, 'active'),
-        ));
+        const completed = await transaction.update(externalExecutionLease).set({ state, completedAt: now, failureCode: code }).where(and(
+          eq(externalExecutionLease.reservationId, reservation.id), eq(externalExecutionLease.ownershipToken, ownershipToken),
+          eq(externalExecutionLease.fence, reservation.fence), eq(externalExecutionLease.state, 'active'),
+          ...(state === 'succeeded' ? [sql`${externalExecutionLease.leaseExpiresAt} > clock_timestamp()`, liveGrants] : []),
+        )).returning({ reservationId: externalExecutionLease.reservationId });
+        if (completed.length !== 1) throw new ExternalExecutionAuthorityError('execution_authority_expired');
         await transaction.insert(externalExecutionEvent).values({ id: randomId(), reservationId: reservation.id, eventType: state === 'succeeded' ? 'completed' : 'failed', failureCode: code, createdAt: now });
       })),
       resolveSandboxCreation: async (identity) => {
@@ -413,7 +465,9 @@ export class DurableExternalExecutionAuthorizer implements ExternalExecutionAuth
               await assertReviewedPlanIntegrity(transaction, reservation.repairRunId, this.options.runtimeReleaseSha ?? '', clock());
           }
           if (started && !existing) {
-            await transaction.insert(externalExecutionEvent).values({ id: randomId(), reservationId: reservation.id, eventType: identity ? 'attempt_succeeded' : 'attempt_ambiguous', attemptOrdinal: 1, failureCode: identity ? null : 'provider_attempt_ambiguous', createdAt: clock() });
+            if (identity) await insertActiveEvent(transaction, 'attempt_succeeded', 1);
+            else await transaction.insert(externalExecutionEvent).values({ id: randomId(), reservationId: reservation.id,
+              eventType: 'attempt_ambiguous', attemptOrdinal: 1, failureCode: 'provider_attempt_ambiguous', createdAt: sql`clock_timestamp()` });
           }
         }));
       },
@@ -424,6 +478,17 @@ export class DurableExternalExecutionAuthorizer implements ExternalExecutionAuth
           const signal = init?.signal ?? (input instanceof Request ? input.signal : undefined);
           signal?.throwIfAborted();
           const ordinal = await begin(kind);
+          try {
+            signal?.throwIfAborted();
+            await permit.assertOwnership();
+          } catch (error) {
+            // Admission committed, but no transport was attempted. Record a
+            // local failure; if settlement itself is fenced, retain the
+            // conservative unmatched-start ambiguity.
+            try { await finish(ordinal, 'failed', {}, kind); }
+            catch { throw new ExternalExecutionAuthorityError('provider_attempt_ambiguous'); }
+            throw error;
+          }
           let response: Response;
           try {
             signal?.throwIfAborted();

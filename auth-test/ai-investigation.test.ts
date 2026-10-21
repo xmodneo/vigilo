@@ -7,6 +7,7 @@ import { and, eq } from 'drizzle-orm';
 
 import { account, aiInvestigation, aiInvestigationAttempt, aiInvestigationEvent, executionProfile, githubInstallation, investigation, investigationContextEntry, investigationContextEvent, repairCandidate, repairIntent, repairRun, repository, repositoryBaseline, user, workspace } from '../db/schema.ts';
 import { GeminiInvestigationProvider } from '../lib/ai-investigations/gemini-provider.ts';
+import { modelRequestKey } from '../lib/ai-investigations/model-request-key.ts';
 import { createTestExternalExecutionAuthorizer } from './external-execution-support.ts';
 import { AI_LIMITS, type InvestigationModelProvider, type InvestigationModelSession, type InvestigationConclusion, type ModelTurn } from '../lib/ai-investigations/types.ts';
 import { getAiInvestigation, startAiInvestigation, AiInvestigationFlowError } from '../lib/ai-investigations/flow.ts';
@@ -198,6 +199,33 @@ test('worker runs only audited context tools and persists a schema-valid conclus
   await assert.rejects(context.database.delete(aiInvestigationEvent).where(eq(aiInvestigationEvent.aiInvestigationId, ai.id)));
 });
 
+test('a database failure after a valid model conclusion never retries Gemini as a provider failure', async (t) => {
+  const context = await createTestContext(); t.after(() => context.client.close());
+  const root = await seedRoot(context); const seeded = await seedReady(context, root.workspaceId);
+  const ai = await startAiInvestigation(context.database, root.owner, seeded.investigationId, new MemoryQueue());
+  let failNextTransaction = false; let modelCalls = 0;
+  const database = new Proxy(context.database, { get(target, property) {
+    if (property === 'transaction') return (...args: Parameters<typeof target.transaction>) => {
+      if (failNextTransaction) { failNextTransaction = false; throw new Error('controlled post-provider database failure'); }
+      return target.transaction(...args);
+    };
+    return Reflect.get(target, property, target);
+  } });
+  const execution = async () => {
+    modelCalls += 1; failNextTransaction = true;
+    return { completionReason: 'model_conclusion' as const, conclusion: { status: 'insufficient_evidence' as const,
+      summary: 'No supported diagnosis.', suspectedFiles: [], evidence: [], proposedApproach: 'Review evidence.', confidence: 'low' as const },
+      usage: { inputTokens: 1, outputTokens: 1, toolCallCount: 0, modelTurnCount: 1 } };
+  };
+  const dependencies = { database, gateway: new Gateway(), configuration: CONFIGURATION,
+    createProvider: () => new ScriptedProvider(), executor: execution as never, clock: () => NOW };
+  await processAiInvestigationJob(job(ai.id), dependencies);
+  await processAiInvestigationJob(job(ai.id), dependencies);
+  assert.equal(modelCalls, 1);
+  const [stored] = await context.database.select().from(aiInvestigation).where(eq(aiInvestigation.id, ai.id));
+  assert.notEqual(stored?.failureCode, 'model_provider_failed');
+});
+
 test('duplicate delivery has one owner and stale ownership cannot finalize', async (t) => {
   const context = await createTestContext(); t.after(() => context.client.close()); const root = await seedRoot(context); const seeded = await seedReady(context, root.workspaceId); const ai = await startAiInvestigation(context.database, root.owner, seeded.investigationId, new MemoryQueue());
   let entered!: () => void; let release!: () => void; const started = new Promise<void>((resolve) => { entered = resolve; }); const gate = new Promise<void>((resolve) => { release = resolve; });
@@ -215,7 +243,10 @@ test('an expired worker lease cannot finalize its AI investigation', async (t) =
   let clockNow = NOW;
   const executor = async () => { entered(); await gate; return { completionReason: 'budget_exhausted' as const, conclusion: { status: 'insufficient_evidence' as const, summary: 'Safe.', suspectedFiles: [], evidence: [], proposedApproach: 'Review.', confidence: 'low' as const }, usage: { inputTokens: 0, outputTokens: 0, toolCallCount: 0, modelTurnCount: 1 } }; };
   const execution = processAiInvestigationJob(job(ai.id), { database: context.database, gateway: new Gateway(), configuration: CONFIGURATION, createProvider: () => new ScriptedProvider(), executor: executor as never, clock: () => clockNow });
-  await started; clockNow = new Date(NOW.getTime() + (5 * 60_000)); release();
+  await started;
+  const [ownedAttempt] = await context.database.select().from(aiInvestigationAttempt).where(eq(aiInvestigationAttempt.aiInvestigationId, ai.id));
+  await context.database.update(aiInvestigationAttempt).set({ leaseExpiresAt: new Date(Date.now() - 1_000) }).where(eq(aiInvestigationAttempt.id, ownedAttempt!.id));
+  clockNow = new Date(NOW.getTime() + (5 * 60_000)); release();
   assert.deepEqual((await execution).output, { code: 'ai_investigation_ownership_lost' });
   assert.equal((await getAiInvestigation(context.database, root.owner, ai.id))?.state, 'investigating');
   const [attempt] = await context.database.select().from(aiInvestigationAttempt).where(eq(aiInvestigationAttempt.aiInvestigationId, ai.id));
@@ -274,9 +305,9 @@ test('recorded Gemini quota-response ambiguity fails once without repository or 
 test('controlled investigation input accounting uses serialized request bytes within a small two-request envelope', async (t) => {
   const context = await createTestContext(); t.after(() => context.client.close()); const root = await seedRoot(context);
   const seeded = await seedReady(context, root.workspaceId); const ai = await startAiInvestigation(context.database, root.owner, seeded.investigationId, new MemoryQueue());
-  const charges: number[] = []; const requestBytes: number[] = [];
+  const charges: number[] = []; const requestBytes: number[] = []; const operationKeys: Array<string | undefined> = [];
   const underlying = createTestExternalExecutionAuthorizer();
-  const executionAuthority = { reserve: async (request: Parameters<typeof underlying.reserve>[0]) => { charges.push(request.amounts.inputTokens); return underlying.reserve(request); } };
+  const executionAuthority = { reserve: async (request: Parameters<typeof underlying.reserve>[0]) => { charges.push(request.amounts.inputTokens); operationKeys.push(request.operationKey); return underlying.reserve(request); } };
   const client = { create: async (request: Record<string, any>) => {
     requestBytes.push(Buffer.byteLength(JSON.stringify(request), 'utf8'));
     if (requestBytes.length === 1) return { status: 'requires_action', steps: [{ type: 'function_call', id: 'read', name: 'readTextFile', arguments: { path: 'src/shipping.ts' } }] };
@@ -288,6 +319,8 @@ test('controlled investigation input accounting uses serialized request bytes wi
   assert.equal((await processAiInvestigationJob(job(ai.id), { database: context.database, gateway: new Gateway(), configuration: CONFIGURATION, createProvider: () => provider, clock: () => NOW })).status, 'completed');
   assert.equal((await getAiInvestigation(context.database, root.owner, ai.id))?.state, 'completed');
   assert.equal(requestBytes.length, 2); assert.deepEqual(charges, requestBytes);
+  const [attempt] = await context.database.select({ id: aiInvestigationAttempt.id }).from(aiInvestigationAttempt).where(eq(aiInvestigationAttempt.aiInvestigationId, ai.id));
+  assert.deepEqual(operationKeys, [modelRequestKey(attempt!.id, 1), modelRequestKey(attempt!.id, 2)]);
   assert.ok(charges.reduce((sum, bytes) => sum + bytes, 0) <= 12 * 1024);
   t.diagnostic(`Controlled investigation serialized input bytes: ${charges.join(' + ')} = ${charges.reduce((sum, bytes) => sum + bytes, 0)}; tested cumulative allowance 12288 bytes (not tokenizer-measured tokens).`);
 });

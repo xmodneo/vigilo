@@ -2,15 +2,18 @@ import type postgres from 'postgres';
 
 import { canonicalRepairQueues } from './queues.ts';
 import { EXPECTED_SCHEMA_VERSION } from './migrations.ts';
+import { REVIEWED_BASELINE_QUEUE } from '../repair-runs/queue.ts';
 
 export type WorkerHeartbeatState = 'starting' | 'ready' | 'draining' | 'stopped';
 
-export interface WorkerHeartbeatValue {
-  id: string;
-  releaseSha: string;
+export type WorkerHeartbeatIdentity = { id: string; releaseSha: string; kind?: 'general' } | {
+  id: string; releaseSha: string; kind: 'baseline-one-shot'; targetRepairRunId: string; targetJobId: string;
+};
+
+export type WorkerHeartbeatValue = WorkerHeartbeatIdentity & {
   state: 'starting';
   registeredQueues: readonly string[];
-}
+};
 
 export interface WorkerHeartbeatStore {
   create(value: WorkerHeartbeatValue): Promise<void>;
@@ -22,10 +25,12 @@ export class PostgresWorkerHeartbeatStore implements WorkerHeartbeatStore {
   constructor(private readonly client: ReturnType<typeof postgres>) {}
 
   async create(value: WorkerHeartbeatValue): Promise<void> {
+    const oneShot = value.kind === 'baseline-one-shot';
     await this.client`
       insert into operational_worker_heartbeat
-        (id, service, release_sha, expected_schema_version, registered_queues, state, started_at, last_heartbeat_at)
-      values (${value.id}, 'vigilo-worker', ${value.releaseSha}, ${EXPECTED_SCHEMA_VERSION}, ${JSON.stringify(value.registeredQueues)}::jsonb, 'starting', statement_timestamp(), statement_timestamp())
+        (id, service, release_sha, expected_schema_version, registered_queues, target_repair_run_id, target_job_id, state, started_at, last_heartbeat_at)
+      values (${value.id}, ${oneShot ? 'vigilo-baseline-one-shot' : 'vigilo-worker'}, ${value.releaseSha}, ${EXPECTED_SCHEMA_VERSION}, ${JSON.stringify(value.registeredQueues)}::text::jsonb,
+        ${oneShot ? value.targetRepairRunId : null}, ${oneShot ? value.targetJobId : null}, 'starting', statement_timestamp(), statement_timestamp())
     `;
   }
 
@@ -60,15 +65,16 @@ export class WorkerHeartbeatLifecycle {
 
   constructor(
     private readonly store: WorkerHeartbeatStore,
-    private readonly identity: { id: string; releaseSha: string },
+    private readonly identity: WorkerHeartbeatIdentity,
     private readonly options: { heartbeatIntervalMs?: number } = {},
   ) {}
 
   async start(): Promise<void> {
     if (this.state !== 'new') throw new Error('worker_heartbeat_transition_invalid');
-    await this.store.create({ ...this.identity, state: 'starting', registeredQueues: canonicalRepairQueues });
+    await this.store.create({ ...this.identity, state: 'starting', registeredQueues: this.identity.kind === 'baseline-one-shot' ? [REVIEWED_BASELINE_QUEUE] : canonicalRepairQueues });
     this.state = 'starting';
-    await this.store.cleanup();
+    // The exact-job process has no authority to prune unrelated worker rows.
+    if (this.identity.kind !== 'baseline-one-shot') await this.store.cleanup();
   }
 
   async ready(): Promise<void> {
@@ -108,6 +114,7 @@ export class WorkerHeartbeatLifecycle {
     await this.store.transition(this.identity.id, 'draining');
   }
 
+  /** Terminal execution stop; the caller still owns reporter close and process exit. */
   async stopped(failureCode?: string): Promise<void> {
     if (this.state === 'new' || this.state === 'stopped') throw new Error('worker_heartbeat_transition_invalid');
     if (this.timer) clearTimeout(this.timer);

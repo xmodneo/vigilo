@@ -29,7 +29,7 @@ test('disposable 0023→0024 upgrade preserves provenance-free historical rows a
   t.after(async () => { await client.close(); await rm(directory, { recursive: true, force: true }); });
   await mkdir(join(directory, 'meta'));
   const journal = JSON.parse(await readFile(join(root, 'meta', '_journal.json'), 'utf8')) as { entries: Array<{ idx: number; tag: string }> };
-  assert.equal(journal.entries.length, 26);
+  assert.equal(journal.entries.length, 27);
   await writeFile(join(directory, 'meta', '_journal.json'), JSON.stringify({ ...journal, entries: journal.entries.slice(0, 24) }));
   for (const entry of journal.entries.slice(0, 24)) await copyFile(join(root, `${entry.tag}.sql`), join(directory, `${entry.tag}.sql`));
   const database = drizzle(client);
@@ -129,7 +129,7 @@ test('disposable 0023→0024 upgrade preserves provenance-free historical rows a
   await migrate(database, { migrationsFolder: root });
   await validateMigrationFiles(process.cwd());
   const ledger = (await client.query<{ hash: string; created_at: string }>('select hash, created_at from drizzle.__drizzle_migrations order by id')).rows;
-  assert.equal(ledger.length, 26);
+  assert.equal(ledger.length, 27);
   assert.deepEqual(ledger.slice(0, 24), originalLedger);
   assert.deepEqual(ledger.map((row) => row.hash), MIGRATION_MANIFEST.map((entry) => entry.hash));
   assert.equal(ledger[24]?.hash, sha256(await readFile(join(root, '0024_execution-provenance.sql'), 'utf8')));

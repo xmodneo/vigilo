@@ -173,16 +173,29 @@ endpoint contacts an external provider.
 
 ## Current release and acceptance state
 
-- The checked source migration ledger is `0000` through `0025`.
-  `0025_repository-selection-history.sql` has been applied to the positively
-  identified persistent local Vigilo development database, whose ledger has 26
+- The checked source migration ledger is `0000` through `0026`.
+  `0026_baseline-one-shot-worker.sql` has been applied to the positively
+  identified persistent local Vigilo development database, whose ledger has 27
   consistent entries. This local fact says nothing about production, staging,
-  shared databases, or arbitrary deployments.
+  shared databases, or arbitrary deployments. The one-shot worker and retirement
+  operator still require separate authorization.
 - The positively identified local development database currently selects the
   public `xmodneo/vigilo-acceptance-fixture` repository and has one ready
-  fixture execution profile. No fixture RepairRun, baseline, source checkpoint,
-  execution grant, reservation, or acceptance has been created; M7.7 live
-  acceptance has not started. This local state does not describe other deployments.
+  fixture execution profile. One reviewed fixture RepairRun was staged with a
+  pending source checkpoint, grants, and an unclaimed baseline job. Its external
+  baseline execution has not started. No fixture baseline evidence, reservation,
+  or acceptance exists. This local state does not describe other deployments.
+  That historical reviewed job is on the general `repair-baseline-v1` queue;
+  its authority is expired and it must never execute. Keep general workers OFF
+  against the persistent database until the old run is retired. Backup and
+  migration 0026 are complete locally; the remaining separately authorized
+  sequence is: commit/push and promote the new release, keep workers off,
+  retire the old staged run, verify its old job is
+  terminal, then stage a fresh reviewed run on `repair-baseline-reviewed-v1`.
+  Only a later, separately authorized exact one-shot worker may claim the fresh
+  reviewed job. The general worker neither consumes nor supervises that queue:
+  pg-boss schema-wide automatic supervision is disabled, and its normal queue
+  maintenance is explicitly scoped to the seven canonical queues.
 - With 0025 applied locally, changing the selected repository retains old
   repository, profile, run, and baseline rows as history. A switch or loss-of-access
   deselection is blocked by active run/investigation/AI-generation/verification/

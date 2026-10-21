@@ -128,7 +128,7 @@ export class GeminiInvestigationProvider implements InvestigationModelProvider {
     const callNames = new Map<string, string>();
 
     return {
-      next: async ({ toolOutputs = [], finalization = false, signal }): Promise<ModelTurn> => {
+      next: async ({ toolOutputs = [], finalization = false, operationKey, signal }): Promise<ModelTurn> => {
         for (const output of toolOutputs) {
           const name = callNames.get(output.callId);
           if (!name) throw new Error('model_protocol_error');
@@ -161,6 +161,7 @@ export class GeminiInvestigationProvider implements InvestigationModelProvider {
         if (!configuration.externalExecutionScope) throw new ModelProviderError('provider_configuration_failed');
         const permit = await this.executionAuthority.reserve({
           scope: configuration.externalExecutionScope,
+          ...(operationKey ? { operationKey } : {}),
           ...(this.accountIdentity ? { providerAccountIdentity: this.accountIdentity } : {}),
           amounts: {
             logicalRequests: 1,
@@ -174,6 +175,18 @@ export class GeminiInvestigationProvider implements InvestigationModelProvider {
           },
         });
         const attempt = await permit.beginProviderAttempt();
+        try {
+          // A durable admission is not authority to send later, after expiry.
+          await permit.assertOwnership();
+        } catch (error) {
+          // No SDK request was made. Settle this as a local failed attempt,
+          // never as an uncertain provider response.
+          try {
+            await permit.finishProviderAttempt(attempt, 'failed');
+            await permit.complete('failed', error instanceof ExternalExecutionAuthorityError ? error.code : 'execution_authority_mismatch');
+          } catch { throw new ExternalExecutionAuthorityError('provider_attempt_ambiguous'); }
+          throw error;
+        }
         let response: Interactions.Interaction;
         try {
           response = await this.client.create(request, { signal, retries: { strategy: 'none' } });

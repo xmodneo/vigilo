@@ -10,7 +10,7 @@ import {
 } from '../lib/operations/migrations.js';
 import { readRuntimeRelease } from '../lib/operations/release.js';
 import { redactLogValue, writeOperationalLog } from '../lib/operations/logging.js';
-import { canonicalRepairQueues } from '../lib/operations/queues.js';
+import { canonicalRepairQueues, configuredRepairQueues } from '../lib/operations/queues.js';
 import { parseTrustedProxyHops, resolveRateLimitSubject } from '../lib/operations/rate-limit.js';
 import { classifyRateLimitAction, rateLimitedResponse } from '../lib/operations/http-rate-limit.js';
 import { assertPublicRepository } from '../lib/github-repositories/policy.js';
@@ -19,10 +19,10 @@ import { readGitHubWorkerEnvironment } from '../lib/github-app/environment.js';
 import { validateOperationalSnapshot } from '../lib/operations/snapshot.js';
 
 test('checked migration manifest is complete, ordered, and matches repository bytes', async () => {
-  assert.equal(EXPECTED_SCHEMA_VERSION, '0025');
-  assert.equal(MIGRATION_MANIFEST.length, 26);
+  assert.equal(EXPECTED_SCHEMA_VERSION, '0026');
+  assert.equal(MIGRATION_MANIFEST.length, 27);
   assert.deepEqual(MIGRATION_MANIFEST.map((entry) => entry.tag.slice(0, 4)),
-    Array.from({ length: 26 }, (_, index) => String(index).padStart(4, '0')));
+    Array.from({ length: 27 }, (_, index) => String(index).padStart(4, '0')));
   await validateMigrationFiles(process.cwd());
 });
 
@@ -55,6 +55,11 @@ test('canonical worker queue set is exact and sorted', () => {
     'repair-baseline-v1',
     'repair-loop-v1',
     'repair-publication-v1',
+  ]);
+  assert.deepEqual(configuredRepairQueues, [
+    'ai-candidate-generation-v1', 'ai-investigation-v1', 'candidate-verification-v1',
+    'investigation-context-v1', 'repair-baseline-reviewed-v1', 'repair-baseline-v1',
+    'repair-loop-v1', 'repair-publication-v1',
   ]);
 });
 
@@ -162,6 +167,21 @@ test('worker heartbeat lifecycle starts, becomes ready, drains, and stops in ord
   await lifecycle.draining();
   await lifecycle.stopped();
   assert.deepEqual(states, ['starting', 'ready', 'draining', 'stopped']);
+});
+
+test('baseline one-shot heartbeat advertises only its exact job and never the general queue set', async () => {
+  const created: unknown[] = [];
+  const store: WorkerHeartbeatStore = {
+    create: async (value) => { created.push(value); },
+    transition: async () => {}, cleanup: async () => 0,
+  };
+  const id = '11111111-1111-4111-8111-111111111111';
+  const lifecycle = new WorkerHeartbeatLifecycle(store, { id: '22222222-2222-4222-8222-222222222222', releaseSha: 'a'.repeat(40),
+    kind: 'baseline-one-shot', targetRepairRunId: id, targetJobId: id });
+  await lifecycle.start();
+  assert.deepEqual(created[0], { id: '22222222-2222-4222-8222-222222222222', releaseSha: 'a'.repeat(40),
+    kind: 'baseline-one-shot', targetRepairRunId: id, targetJobId: id, state: 'starting', registeredQueues: ['repair-baseline-reviewed-v1'] });
+  await lifecycle.stopped();
 });
 
 test('terminal worker heartbeat cannot be restarted by the lifecycle', async () => {

@@ -23,6 +23,7 @@ import {
 import type { VigiloDatabase } from '../db/types.ts';
 import { DurableExternalExecutionAuthorizer } from '../external-execution/authority.ts';
 import { assertRunBusinessAllowed, lockExternalExecution } from '../external-execution/business-fence.ts';
+import { freshDatabaseTime } from '../external-execution/database-clock.ts';
 import { executionGrantIdentityMatches, executionReservationIdentityMatches } from '../external-execution/identity.ts';
 import { assertReviewedPlanIntegrity } from '../external-execution/reviewed-plan-integrity.ts';
 import { ExternalExecutionAuthorityError, type ExternalExecutionAuthorizer } from '../external-execution/types.ts';
@@ -98,12 +99,12 @@ async function authorizeIteration(
   const existingAuthority = async (): Promise<boolean> => {
     return dependencies.database.transaction(async (transaction) => {
       await lockExternalExecution(transaction);
-      await assertRunBusinessAllowed(transaction, { workspaceId: loop.workspaceId, repairRunId: loop.repairRunId }, (dependencies.clock ?? (() => new Date()))());
+      await assertRunBusinessAllowed(transaction, { workspaceId: loop.workspaceId, repairRunId: loop.repairRunId });
       const [reservation] = await transaction.select().from(externalExecutionReservation)
         .where(eq(externalExecutionReservation.operationKey, operationKey)).limit(1);
       if (!reservation) return false;
       await assertReviewedPlanIntegrity(transaction, loop.repairRunId, dependencies.runtimeReleaseSha ?? '',
-        (dependencies.clock ?? (() => new Date()))());
+        await freshDatabaseTime(transaction));
       const [lease] = await transaction.select().from(externalExecutionLease)
         .where(eq(externalExecutionLease.reservationId, reservation.id)).limit(1);
       const grants = await transaction.select().from(executionBudgetGrant)
@@ -113,7 +114,7 @@ async function authorizeIteration(
         .where(inArray(executionBudgetGrantRevocation.grantId, [reservation.accountGrantId, reservation.grantId]));
       if (grants.length !== 2 || !lease) throw new ExternalExecutionAuthorityError('execution_authority_missing');
       if (revocations.length > 0) throw new ExternalExecutionAuthorityError('execution_authority_missing');
-      const now = (dependencies.clock ?? (() => new Date()))();
+      const now = await freshDatabaseTime(transaction);
       if (grants.some((grant) => grant.expiresAt <= now)) throw new ExternalExecutionAuthorityError('execution_authority_expired');
       if (grants.some((grant) => !executionGrantIdentityMatches(grant)) || !executionReservationIdentityMatches(reservation)) {
         throw new ExternalExecutionAuthorityError('execution_authority_mismatch');
@@ -184,9 +185,14 @@ async function event(transaction: VigiloTransaction, randomId: () => string, val
   await transaction.insert(repairLoopEvent).values({ id: randomId(), repairLoopId: values.loop.id, iterationId: values.iterationId ?? null, fromState: values.fromState, toState: values.toState, eventType: values.eventType, decision: values.decision ?? null, failureCode: values.failureCode ?? null, createdAt: values.now });
 }
 
-async function scheduleWake(transaction: VigiloTransaction, loop: LoopRow, expectedWakeJobId: string, queues: RepairLoopWorkerQueues, randomId: () => string, now: Date, runtimeReleaseSha: string, clock: () => Date): Promise<void> {
+async function scheduleWake(transaction: VigiloTransaction, loop: LoopRow, expectedWakeJobId: string, queues: RepairLoopWorkerQueues, randomId: () => string, now: Date, runtimeReleaseSha: string): Promise<void> {
   await lockExternalExecution(transaction);
-  await assertReviewedPlanIntegrity(transaction, loop.repairRunId, runtimeReleaseSha, clock());
+  const [ownedLoop] = await transaction.select({ id: repairLoop.id }).from(repairLoop)
+    .where(and(eq(repairLoop.id, loop.id), eq(repairLoop.wakeJobId, expectedWakeJobId), inArray(repairLoop.state, ACTIVE_LOOP_STATES)))
+    .for('update').limit(1);
+  if (!ownedLoop) return;
+  await assertRunBusinessAllowed(transaction, { workspaceId: loop.workspaceId, repairRunId: loop.repairRunId });
+  await assertReviewedPlanIntegrity(transaction, loop.repairRunId, runtimeReleaseSha, await freshDatabaseTime(transaction));
   const wakeJobId = randomId();
   const [updated] = await transaction.update(repairLoop).set({ wakeJobId, updatedAt: now }).where(and(eq(repairLoop.id, loop.id), eq(repairLoop.wakeJobId, expectedWakeJobId), inArray(repairLoop.state, ACTIVE_LOOP_STATES))).returning();
   if (!updated) return;
@@ -219,13 +225,13 @@ async function bindOrCreateVerification(dependencies: RepairLoopWorkerDependenci
   catch { throw new RepairLoopIntegrityError('candidate_artifact_invalid'); }
   await dependencies.database.transaction(async (transaction) => {
     await lockExternalExecution(transaction);
-    await assertRunBusinessAllowed(transaction, { workspaceId: loop.workspaceId, repairRunId: loop.repairRunId }, now);
-    await assertReviewedPlanIntegrity(transaction, loop.repairRunId, dependencies.runtimeReleaseSha ?? '',
-      (dependencies.clock ?? (() => new Date()))());
     const [ownedLoop] = await transaction.select({ id: repairLoop.id }).from(repairLoop).where(and(eq(repairLoop.id, loop.id), eq(repairLoop.state, 'running'), eq(repairLoop.wakeJobId, expectedWakeJobId))).for('update').limit(1);
     if (!ownedLoop) return;
     const [owned] = await transaction.select().from(repairLoopIteration).where(and(eq(repairLoopIteration.id, iteration.id), eq(repairLoopIteration.repairLoopId, loop.id), eq(repairLoopIteration.aiCandidateGenerationId, generation.id))).for('update').limit(1);
     if (!owned || owned.decision !== null || owned.candidateVerificationId !== null) return;
+    await assertRunBusinessAllowed(transaction, { workspaceId: loop.workspaceId, repairRunId: loop.repairRunId });
+    await assertReviewedPlanIntegrity(transaction, loop.repairRunId, dependencies.runtimeReleaseSha ?? '',
+      await freshDatabaseTime(transaction));
     const current = await transaction.select().from(candidateVerification).where(eq(candidateVerification.candidateId, candidate.id)).orderBy(asc(candidateVerification.createdAt), asc(candidateVerification.id));
     if (current.length > 0) throw new RepairLoopIntegrityError('verification_provenance_ambiguous');
     const id = randomId();
@@ -247,7 +253,7 @@ async function bindOrCreateVerification(dependencies: RepairLoopWorkerDependenci
     await transaction.update(repairLoopIteration).set({ candidateVerificationId: verification.id }).where(and(eq(repairLoopIteration.id, iteration.id), isNull(repairLoopIteration.candidateVerificationId)));
     await event(transaction, randomId, { loop, iterationId: iteration.id, fromState: 'running', toState: 'running', eventType: 'verification_created', now });
     await scheduleWake(transaction, loop, expectedWakeJobId, dependencies.queues, randomId, now,
-      dependencies.runtimeReleaseSha ?? '', dependencies.clock ?? (() => new Date()));
+      dependencies.runtimeReleaseSha ?? '');
   });
   await dependencies.afterVerificationCreated?.();
 }
@@ -298,12 +304,13 @@ async function decideCompletedVerification(dependencies: RepairLoopWorkerDepende
   if (!decision.scheduleNext) {
     await dependencies.database.transaction(async (transaction) => {
       await lockExternalExecution(transaction);
-      await assertReviewedPlanIntegrity(transaction, loop.repairRunId, dependencies.runtimeReleaseSha ?? '',
-        (dependencies.clock ?? (() => new Date()))());
       const [ownedLoop] = await transaction.select({ id: repairLoop.id }).from(repairLoop).where(and(eq(repairLoop.id, loop.id), eq(repairLoop.state, 'running'), eq(repairLoop.wakeJobId, expectedWakeJobId))).for('update').limit(1);
       if (!ownedLoop) return;
       const [owned] = await transaction.select().from(repairLoopIteration).where(and(eq(repairLoopIteration.id, iteration.id), eq(repairLoopIteration.candidateVerificationId, verification.id))).for('update').limit(1);
       if (!owned || owned.decision !== null) return;
+      await assertRunBusinessAllowed(transaction, { workspaceId: loop.workspaceId, repairRunId: loop.repairRunId });
+      await assertReviewedPlanIntegrity(transaction, loop.repairRunId, dependencies.runtimeReleaseSha ?? '',
+        await freshDatabaseTime(transaction));
       await transaction.update(repairLoopIteration).set({ objectiveEvidence: evaluated.result, objectiveEvidenceSnapshot: objective.snapshot, objectiveEvidenceHash: objective.hash, objectiveEvidenceBytes: objective.bytes, decision: decision.iterationDecision, decidedAt: now }).where(eq(repairLoopIteration.id, iteration.id));
       const [finished] = await transaction.update(repairLoop).set({ state: decision.loopState, completedAt: now, updatedAt: now, ...(decision.loopState === 'verified' ? { selectedCandidateId: candidate.id, selectedVerificationId: verification.id, selectedEvidenceId: evidence.id } : {}) }).where(and(eq(repairLoop.id, loop.id), eq(repairLoop.state, 'running'), eq(repairLoop.wakeJobId, expectedWakeJobId))).returning();
       if (!finished) return;
@@ -339,13 +346,13 @@ async function decideCompletedVerification(dependencies: RepairLoopWorkerDepende
   await authorizeIteration(dependencies, loop, generation, iteration.id);
   await dependencies.database.transaction(async (transaction) => {
     await lockExternalExecution(transaction);
-    await assertRunBusinessAllowed(transaction, { workspaceId: loop.workspaceId, repairRunId: loop.repairRunId }, now);
-    await assertReviewedPlanIntegrity(transaction, loop.repairRunId, dependencies.runtimeReleaseSha ?? '',
-      (dependencies.clock ?? (() => new Date()))());
     const [ownedLoop] = await transaction.select({ id: repairLoop.id }).from(repairLoop).where(and(eq(repairLoop.id, loop.id), eq(repairLoop.state, 'running'), eq(repairLoop.wakeJobId, expectedWakeJobId))).for('update').limit(1);
     if (!ownedLoop) return;
     const [owned] = await transaction.select().from(repairLoopIteration).where(and(eq(repairLoopIteration.id, iteration.id), eq(repairLoopIteration.candidateVerificationId, verification.id))).for('update').limit(1);
     if (!owned || owned.decision !== null || owned.ordinal !== 1) return;
+    await assertRunBusinessAllowed(transaction, { workspaceId: loop.workspaceId, repairRunId: loop.repairRunId });
+    await assertReviewedPlanIntegrity(transaction, loop.repairRunId, dependencies.runtimeReleaseSha ?? '',
+      await freshDatabaseTime(transaction));
     const [other] = await transaction.select({ id: repairLoopIteration.id }).from(repairLoopIteration).where(eq(repairLoopIteration.repairLoopId, loop.id)).orderBy(desc(repairLoopIteration.ordinal)).limit(1);
     if (!other || other.id !== owned.id) return;
     const [ordinalValue] = await transaction.select({ value: max(aiCandidateGeneration.executionOrdinal) }).from(aiCandidateGeneration).where(eq(aiCandidateGeneration.aiInvestigationId, loop.aiInvestigationId));
@@ -383,10 +390,16 @@ async function decideCompletedVerification(dependencies: RepairLoopWorkerDepende
 async function reconcile(dependencies: RepairLoopWorkerDependencies, loop: LoopRow, expectedWakeJobId: string, randomId: () => string, now: Date): Promise<void> {
   await dependencies.database.transaction(async (transaction) => {
     await lockExternalExecution(transaction);
-    await assertRunBusinessAllowed(transaction, { workspaceId: loop.workspaceId, repairRunId: loop.repairRunId }, now);
+    await assertRunBusinessAllowed(transaction, { workspaceId: loop.workspaceId, repairRunId: loop.repairRunId });
   });
   if (loop.state === 'queued') {
     await dependencies.database.transaction(async (transaction) => {
+      await lockExternalExecution(transaction);
+      const [ownedLoop] = await transaction.select({ id: repairLoop.id }).from(repairLoop)
+        .where(and(eq(repairLoop.id, loop.id), eq(repairLoop.state, 'queued'), eq(repairLoop.wakeJobId, expectedWakeJobId)))
+        .for('update').limit(1);
+      if (!ownedLoop) return;
+      await assertRunBusinessAllowed(transaction, { workspaceId: loop.workspaceId, repairRunId: loop.repairRunId });
       const [started] = await transaction.update(repairLoop).set({ state: 'running', startedAt: now, updatedAt: now }).where(and(eq(repairLoop.id, loop.id), eq(repairLoop.state, 'queued'), eq(repairLoop.wakeJobId, expectedWakeJobId))).returning();
       if (started) await event(transaction, randomId, { loop, fromState: 'queued', toState: 'running', eventType: 'started', now });
     });
@@ -400,7 +413,7 @@ async function reconcile(dependencies: RepairLoopWorkerDependencies, loop: LoopR
   await authorizeIteration(dependencies, loop, generation, iteration.ordinal === 1 ? loop.id : iteration.previousIterationId!);
   if (['created', 'queued', 'generating'].includes(generation.state)) {
     await dependencies.database.transaction((transaction) => scheduleWake(transaction, currentLoop, expectedWakeJobId,
-      dependencies.queues, randomId, now, dependencies.runtimeReleaseSha ?? '', dependencies.clock ?? (() => new Date()))); return;
+      dependencies.queues, randomId, now, dependencies.runtimeReleaseSha ?? '')); return;
   }
   if (generation.state === 'abstained' || generation.state === 'failed' || generation.state === 'cancelled') {
     await terminalWithoutVerification(dependencies.database, currentLoop, expectedWakeJobId, iteration, generation, randomId, now); return;
@@ -415,7 +428,7 @@ async function reconcile(dependencies: RepairLoopWorkerDependencies, loop: LoopR
   if (!verification || verification.candidateId !== candidate.id || verification.candidateIdentity !== candidate.candidateIdentity) throw new RepairLoopIntegrityError('repair_loop_verification_invalid');
   if (['created', 'queued', 'verifying'].includes(verification.state)) {
     await dependencies.database.transaction((transaction) => scheduleWake(transaction, currentLoop, expectedWakeJobId,
-      dependencies.queues, randomId, now, dependencies.runtimeReleaseSha ?? '', dependencies.clock ?? (() => new Date()))); return;
+      dependencies.queues, randomId, now, dependencies.runtimeReleaseSha ?? '')); return;
   }
   if (verification.state === 'infrastructure_failed' || verification.state === 'cancelled') {
     await stopAfterVerification(dependencies, currentLoop, expectedWakeJobId, iteration, verification, null, 'infrastructure_failure', verification.failureCode ?? 'verification_infrastructure_failed', randomId, now); return;

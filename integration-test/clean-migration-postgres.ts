@@ -121,7 +121,7 @@ try {
       (select tgname from pg_trigger where tgname = 'operational_worker_heartbeat_guard' and not tgisinternal) as "heartbeatGuard",
       (select count(*)::int from drizzle.__drizzle_migrations) as "ledgerCount"
   `;
-  const operationalPassed = operationalFacts?.heartbeat === 'operational_worker_heartbeat' && operationalFacts.bucket === 'http_rate_limit_bucket' && operationalFacts.heartbeatGuard === 'operational_worker_heartbeat_guard' && operationalFacts.ledgerCount === 26;
+  const operationalPassed = operationalFacts?.heartbeat === 'operational_worker_heartbeat' && operationalFacts.bucket === 'http_rate_limit_bucket' && operationalFacts.heartbeatGuard === 'operational_worker_heartbeat_guard' && operationalFacts.ledgerCount === 27;
   const [selectionFacts] = await probe<{ selectedColumn: string | null; selectedIndex: string | null; oldWorkspaceUnique: number }[]>`
     select
       (select column_name from information_schema.columns where table_schema = 'public' and table_name = 'repository' and column_name = 'is_selected') as "selectedColumn",
@@ -139,7 +139,7 @@ try {
   const provenancePassed = provenanceFacts?.checkpoint === 'repair_run_source_checkpoint' && provenanceFacts.grantRelease === 'authorized_release_sha' && provenanceFacts.reservationRelease === 'executing_release_sha' && provenanceFacts.guardCount === 6 &&
     JSON.stringify(ledger.map((row) => row.hash)) === JSON.stringify(MIGRATION_MANIFEST.map((entry) => entry.hash));
   if (!passed || !reviewPassed || !publicationPassed || !authorityPassed || !operationalPassed || !provenancePassed || !selectionPassed) throw new Error('clean_migration_probe_failed');
-  process.stdout.write(`${JSON.stringify({ migrations: '0000-0025', repairRunAttempt: 'present', investigation: 'present', repairCandidate: 'present', candidateVerification: 'present', aiInvestigation: 'present', repairLoop: 'present', humanReview: 'present', repairPublication: 'present', externalExecutionAuthority: 'present', releaseAcceptance: 'present', operationalReadiness: 'present', executionProvenance: 'present', repositorySelectionHistory: 'present', constraints: 'current', result: 'passed' })}\n`);
+  process.stdout.write(`${JSON.stringify({ migrations: '0000-0026', repairRunAttempt: 'present', investigation: 'present', repairCandidate: 'present', candidateVerification: 'present', aiInvestigation: 'present', repairLoop: 'present', humanReview: 'present', repairPublication: 'present', externalExecutionAuthority: 'present', releaseAcceptance: 'present', operationalReadiness: 'present', executionProvenance: 'present', repositorySelectionHistory: 'present', constraints: 'current', result: 'passed' })}\n`);
 } finally {
   if (probe) await probe.end();
   await admin`select pg_terminate_backend(pid) from pg_stat_activity where datname = ${databaseName} and pid <> pg_backend_pid()`;

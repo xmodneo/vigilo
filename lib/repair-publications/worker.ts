@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 
-import { and, desc, eq, gt, inArray, lte } from 'drizzle-orm';
+import { and, desc, eq, gt, inArray, lte, sql } from 'drizzle-orm';
 import type { JobResult } from 'pg-boss';
 
 import { executionBudgetGrant, externalExecutionLease, externalExecutionReservation, releaseAcceptance, repairCandidateFile, repairPublication, repairPublicationAttempt, repairPublicationEvent, repository } from '../../db/schema.ts';
@@ -8,6 +8,7 @@ import type { VigiloDatabase } from '../db/types.ts';
 import type { GitHubAppConfiguration } from '../github-app/types.ts';
 import { assertPublicRepositoryAuthority, RepositoryPolicyError } from '../github-repositories/policy.ts';
 import { DurableExternalExecutionAuthorizer } from '../external-execution/authority.ts';
+import { freshDatabaseTime } from '../external-execution/database-clock.ts';
 import { ExternalExecutionAuthorityError, type ExternalExecutionAuthorizer, type ExternalExecutionPermit } from '../external-execution/types.ts';
 import { HumanReviewError, resolveApprovedPublicationWorkerAuthority } from '../human-reviews/flow.ts';
 import type { ApprovedHumanReviewAuthority } from '../human-reviews/types.ts';
@@ -48,7 +49,6 @@ class PublicationWorkerError extends Error {
   constructor(public readonly code: string, public readonly disposition: 'failed' | 'review_required' | 'retryable') { super(code); this.name = 'PublicationWorkerError'; }
 }
 
-const leaseEnd = (now: Date) => new Date(now.getTime() + LEASE_MS);
 const safeCode = (error: unknown) => error instanceof PublicationWorkerError || error instanceof PublicationArtifactError || error instanceof HumanReviewError || error instanceof ExternalExecutionAuthorityError ? error.code : 'github_publication_failed';
 
 function authorityMatches(publication: PublicationRow, authority: ApprovedHumanReviewAuthority): boolean {
@@ -91,14 +91,18 @@ async function mutationAuthority(
   await assertOwnership(dependencies.database, attempt, now);
 }
 
-async function claimAttempt(database: VigiloDatabase, publicationId: string, queueJobId: string, now: Date, randomId: () => string): Promise<Claim> {
+async function claimAttempt(database: VigiloDatabase, publicationId: string, queueJobId: string, randomId: () => string): Promise<Claim> {
   return database.transaction(async (transaction) => {
     let [publication] = await transaction.select().from(repairPublication).where(eq(repairPublication.id, publicationId)).for('update').limit(1);
     if (!publication) throw new PublicationWorkerError('publication_not_found', 'failed');
+    const now = await freshDatabaseTime(transaction);
     if (['published', 'failed', 'review_required'].includes(publication.state)) return { kind: 'terminal', publication };
     const [active] = await transaction.select().from(repairPublicationAttempt).where(and(eq(repairPublicationAttempt.publicationId, publication.id), eq(repairPublicationAttempt.state, 'active'))).limit(1);
     if (active && active.leaseExpiresAt.getTime() > now.getTime()) return { kind: 'busy', publication };
-    if (active) await transaction.update(repairPublicationAttempt).set({ state: 'abandoned', failureCode: 'stale_worker_recovery', completedAt: now }).where(and(eq(repairPublicationAttempt.id, active.id), eq(repairPublicationAttempt.ownershipToken, active.ownershipToken), eq(repairPublicationAttempt.state, 'active'), lte(repairPublicationAttempt.leaseExpiresAt, now)));
+    if (active) {
+      const [abandoned] = await transaction.update(repairPublicationAttempt).set({ state: 'abandoned', failureCode: 'stale_worker_recovery', completedAt: now }).where(and(eq(repairPublicationAttempt.id, active.id), eq(repairPublicationAttempt.ownershipToken, active.ownershipToken), eq(repairPublicationAttempt.state, 'active'), lte(repairPublicationAttempt.leaseExpiresAt, sql`clock_timestamp()`))).returning({ id: repairPublicationAttempt.id });
+      if (!abandoned) return { kind: 'busy', publication };
+    }
     const [latest] = await transaction.select().from(repairPublicationAttempt).where(eq(repairPublicationAttempt.publicationId, publication.id)).orderBy(desc(repairPublicationAttempt.attemptNumber)).limit(1);
     if ((latest?.attemptNumber ?? 0) >= REPAIR_JOB_MAX_ATTEMPTS) return { kind: 'exhausted', publication };
     const claimedFromState = publication.state;
@@ -108,7 +112,7 @@ async function claimAttempt(database: VigiloDatabase, publicationId: string, que
     }
     const [attempt] = await transaction.insert(repairPublicationAttempt).values({
       id: randomId(), publicationId: publication.id, queueJobId, attemptNumber: (latest?.attemptNumber ?? 0) + 1,
-      ownershipToken: randomId(), state: 'active', claimedAt: now, heartbeatAt: now, leaseExpiresAt: leaseEnd(now),
+      ownershipToken: randomId(), state: 'active', claimedAt: sql`clock_timestamp()`, heartbeatAt: sql`clock_timestamp()`, leaseExpiresAt: sql`clock_timestamp() + interval '90 seconds'`,
     }).returning();
     if (!attempt) throw new PublicationWorkerError('publication_ownership_lost', 'retryable');
     await transaction.insert(repairPublicationEvent).values({ id: randomId(), publicationId: publication.id, attemptId: attempt.id, workspaceId: publication.workspaceId, fromState: claimedFromState, toState: publication.state, checkpoint: publication.checkpoint, eventType: 'claimed', createdAt: now });
@@ -116,15 +120,19 @@ async function claimAttempt(database: VigiloDatabase, publicationId: string, que
   });
 }
 
-async function assertOwnership(database: VigiloDatabase, attempt: AttemptRow, now: Date): Promise<void> {
-  const [owned] = await database.update(repairPublicationAttempt).set({ heartbeatAt: now, leaseExpiresAt: leaseEnd(now) }).where(and(eq(repairPublicationAttempt.id, attempt.id), eq(repairPublicationAttempt.ownershipToken, attempt.ownershipToken), eq(repairPublicationAttempt.state, 'active'), gt(repairPublicationAttempt.leaseExpiresAt, now))).returning();
+async function assertOwnership(database: VigiloDatabase, attempt: AttemptRow, _now: Date): Promise<void> {
+  const [owned] = await database.update(repairPublicationAttempt).set({ heartbeatAt: sql`clock_timestamp()`, leaseExpiresAt: sql`clock_timestamp() + ${LEASE_MS} * interval '1 millisecond'` }).where(and(eq(repairPublicationAttempt.id, attempt.id), eq(repairPublicationAttempt.ownershipToken, attempt.ownershipToken), eq(repairPublicationAttempt.state, 'active'), gt(repairPublicationAttempt.leaseExpiresAt, sql`clock_timestamp()`))).returning();
   if (!owned) throw new PublicationWorkerError('publication_ownership_lost', 'retryable');
 }
 
 async function checkpoint(dependencies: RepairPublicationWorkerDependencies, publication: PublicationRow, attempt: AttemptRow, values: Partial<PublicationRow> & { checkpoint: string; eventType: string; state?: string }, now: Date): Promise<PublicationRow> {
   return dependencies.database.transaction(async (transaction) => {
-    const [ownedAttempt] = await transaction.select({ id: repairPublicationAttempt.id }).from(repairPublicationAttempt).where(and(eq(repairPublicationAttempt.id, attempt.id), eq(repairPublicationAttempt.ownershipToken, attempt.ownershipToken), eq(repairPublicationAttempt.state, 'active'))).limit(1);
-    if (!ownedAttempt) throw new PublicationWorkerError('publication_ownership_lost', 'retryable');
+    // Keep claim's publication -> attempt lock order. Recheck the lease after
+    // any publication-row wait, then renew it atomically before checkpointing.
+    const [lockedPublication] = await transaction.select({ id: repairPublication.id }).from(repairPublication)
+      .where(eq(repairPublication.id, publication.id)).for('update').limit(1);
+    if (!lockedPublication) throw new PublicationWorkerError('publication_ownership_lost', 'retryable');
+    await assertOwnership(transaction, attempt, now);
     const fromState = publication.state;
     const { eventType, ...updates } = values;
     const [updated] = await transaction.update(repairPublication).set({ ...updates, updatedAt: now }).where(and(eq(repairPublication.id, publication.id), eq(repairPublication.state, publication.state), eq(repairPublication.checkpoint, publication.checkpoint))).returning();
@@ -136,8 +144,11 @@ async function checkpoint(dependencies: RepairPublicationWorkerDependencies, pub
 
 async function terminal(dependencies: RepairPublicationWorkerDependencies, publication: PublicationRow, attempt: AttemptRow | null, disposition: 'failed' | 'review_required', code: string, now: Date): Promise<boolean> {
   return dependencies.database.transaction(async (transaction) => {
+    const [lockedPublication] = await transaction.select({ state: repairPublication.state, checkpoint: repairPublication.checkpoint })
+      .from(repairPublication).where(eq(repairPublication.id, publication.id)).for('update').limit(1);
+    if (lockedPublication?.state !== publication.state || lockedPublication.checkpoint !== publication.checkpoint) return false;
     if (attempt) {
-      const [finishedAttempt] = await transaction.update(repairPublicationAttempt).set({ state: 'failed', failureCode: code, completedAt: now }).where(and(eq(repairPublicationAttempt.id, attempt.id), eq(repairPublicationAttempt.ownershipToken, attempt.ownershipToken), eq(repairPublicationAttempt.state, 'active'))).returning({ id: repairPublicationAttempt.id });
+      const [finishedAttempt] = await transaction.update(repairPublicationAttempt).set({ state: 'failed', failureCode: code, completedAt: now }).where(and(eq(repairPublicationAttempt.id, attempt.id), eq(repairPublicationAttempt.ownershipToken, attempt.ownershipToken), eq(repairPublicationAttempt.state, 'active'), gt(repairPublicationAttempt.leaseExpiresAt, sql`clock_timestamp()`))).returning({ id: repairPublicationAttempt.id });
       if (!finishedAttempt) return false;
     }
     const [updated] = await transaction.update(repairPublication).set({ state: disposition, failureCode: code, completedAt: now, updatedAt: now }).where(and(eq(repairPublication.id, publication.id), eq(repairPublication.state, publication.state), eq(repairPublication.checkpoint, publication.checkpoint))).returning();
@@ -312,7 +323,7 @@ export async function processRepairPublicationJobWithResolverInternal(job: Repai
   let payload;
   try { payload = parseRepairPublicationJobPayload(job.data); } catch { return { id: job.id, status: 'deadletter', output: { code: 'invalid_repair_publication_job_payload' } }; }
   const clock = dependencies.clock ?? (() => new Date()); const randomId = dependencies.randomId ?? randomUUID;
-  const claim = await claimAttempt(dependencies.database, payload.publicationId, job.id, clock(), randomId);
+  const claim = await claimAttempt(dependencies.database, payload.publicationId, job.id, randomId);
   if (claim.kind === 'terminal' || claim.kind === 'busy') return { id: job.id, status: 'completed' };
   if (claim.kind === 'exhausted') { await terminal(dependencies, claim.publication, null, 'failed', 'publication_retry_exhausted', clock()); return { id: job.id, status: 'completed' }; }
   const controller = new AbortController(); const abort = () => controller.abort();
@@ -381,9 +392,15 @@ export async function processRepairPublicationJobWithResolverInternal(job: Repai
           if (!lockedLease) throw new PublicationWorkerError('publication_authority_mismatch', 'failed');
         }
       }
+      // Claim/reclaim and checkpoint both take publication before attempt.
+      // This lock must precede the implicit attempt-row lock in UPDATE below.
+      const [lockedPublication] = await transaction.select({ state: repairPublication.state, checkpoint: repairPublication.checkpoint })
+        .from(repairPublication).where(eq(repairPublication.id, current.id)).for('update').limit(1);
+      if (lockedPublication?.state !== 'publishing' || lockedPublication.checkpoint !== 'pr_verified')
+        throw new PublicationWorkerError('publication_ownership_lost', 'retryable');
       const fencedAuthority = await currentAuthority(transaction as unknown as VigiloDatabase, current, resolver);
       if (!sameReleaseAuthorization(finalAuthority, fencedAuthority)) throw new PublicationWorkerError('publication_authority_mismatch', 'failed');
-      const [finishedAttempt] = await transaction.update(repairPublicationAttempt).set({ state: 'succeeded', completedAt: clock() }).where(and(eq(repairPublicationAttempt.id, claim.attempt.id), eq(repairPublicationAttempt.ownershipToken, claim.attempt.ownershipToken), eq(repairPublicationAttempt.state, 'active'), gt(repairPublicationAttempt.leaseExpiresAt, clock()))).returning();
+      const [finishedAttempt] = await transaction.update(repairPublicationAttempt).set({ state: 'succeeded', completedAt: clock() }).where(and(eq(repairPublicationAttempt.id, claim.attempt.id), eq(repairPublicationAttempt.ownershipToken, claim.attempt.ownershipToken), eq(repairPublicationAttempt.state, 'active'), gt(repairPublicationAttempt.leaseExpiresAt, sql`clock_timestamp()`))).returning();
       if (!finishedAttempt) throw new PublicationWorkerError('publication_ownership_lost', 'retryable');
       const [published] = await transaction.update(repairPublication).set({ state: 'published', checkpoint: 'completed', completedAt: clock(), updatedAt: clock() }).where(and(eq(repairPublication.id, current.id), eq(repairPublication.state, 'publishing'), eq(repairPublication.checkpoint, 'pr_verified'))).returning();
       if (!published) throw new PublicationWorkerError('publication_ownership_lost', 'retryable');
@@ -398,7 +415,7 @@ export async function processRepairPublicationJobWithResolverInternal(job: Repai
     const disposition = error instanceof PublicationWorkerError ? error.disposition : error instanceof PublicationArtifactError || error instanceof HumanReviewError ? 'failed' : 'retryable';
     const code = safeCode(error);
     if (disposition === 'retryable') {
-      await dependencies.database.update(repairPublicationAttempt).set({ state: 'failed', failureCode: code, completedAt: clock() }).where(and(eq(repairPublicationAttempt.id, claim.attempt.id), eq(repairPublicationAttempt.ownershipToken, claim.attempt.ownershipToken), eq(repairPublicationAttempt.state, 'active')));
+      await dependencies.database.update(repairPublicationAttempt).set({ state: 'failed', failureCode: code, completedAt: clock() }).where(and(eq(repairPublicationAttempt.id, claim.attempt.id), eq(repairPublicationAttempt.ownershipToken, claim.attempt.ownershipToken), eq(repairPublicationAttempt.state, 'active'), gt(repairPublicationAttempt.leaseExpiresAt, sql`clock_timestamp()`)));
       dependencies.logger.write({ event: 'retry_classified', code });
       return { id: job.id, status: 'failed', output: { code } };
     }

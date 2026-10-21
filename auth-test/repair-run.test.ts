@@ -479,6 +479,26 @@ test('stale ownership cleans the abandoned sandbox before a replacement attempt'
   assert.equal((await context.database.select().from(repairRunAttempt)).length, 2);
 });
 
+test('claim does not steal a live lease using a caller clock from the future', async (t) => {
+  const context = await createTestContext(); t.after(() => context.client.close());
+  const owner = await authenticated(context); await seed(context, owner);
+  const { run } = await queuedRun(context, owner);
+  let entered!: () => void;
+  const started = new Promise<void>((resolve) => { entered = resolve; });
+  void processRepairJob(job(run.id), workerDependencies(context.database, async () => {
+    entered(); return new Promise<never>(() => {});
+  }));
+  await started;
+  const [active] = await context.database.select().from(repairRunAttempt);
+  assert.ok(active);
+  await context.database.update(repairRunAttempt).set({ leaseExpiresAt: new Date(Date.now() + 60_000) }).where(eq(repairRunAttempt.id, active.id));
+  const result = await processRepairJob(job(run.id), workerDependencies(context.database, executorFor(), {
+    clock: () => new Date(Date.now() + 3_600_000),
+  }));
+  assert.deepEqual(result.output, { code: 'active_attempt' });
+  assert.equal((await context.database.select().from(repairRunAttempt))[0]?.ownershipToken, active.ownershipToken);
+});
+
 test('unconfirmed abandoned sandbox cleanup blocks replacement execution', async (t) => {
   const context = await createTestContext(); t.after(() => context.client.close());
   const owner = await authenticated(context); await seed(context, owner);

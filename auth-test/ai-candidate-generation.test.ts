@@ -4,12 +4,13 @@ import test from 'node:test';
 
 import { and, eq } from 'drizzle-orm';
 
-import { account, aiCandidateGeneration, aiCandidateGenerationAttempt, aiCandidateGenerationEvent, aiInvestigation, candidateVerification, executionProfile, githubInstallation, investigation, investigationContextEntry, investigationContextEvent, repairCandidate, repairCandidateFile, repairIntent, repairRun, repository, repositoryBaseline, user, workspace } from '../db/schema.ts';
+import { account, aiCandidateGeneration, aiCandidateGenerationAttempt, aiCandidateGenerationEvent, aiInvestigation, candidateVerification, executionProfile, externalExecutionReservation, githubInstallation, investigation, investigationContextEntry, investigationContextEvent, repairCandidate, repairCandidateFile, repairIntent, repairRun, repository, repositoryBaseline, user, workspace } from '../db/schema.ts';
 import { startAiInvestigation } from '../lib/ai-investigations/flow.ts';
 import { getAiCandidateGenerationForAiInvestigation, startAiCandidateGeneration, AiCandidateGenerationFlowError } from '../lib/ai-candidate-generations/flow.ts';
 import { processAiCandidateGenerationJob } from '../lib/ai-candidate-generations/worker.ts';
 import { runAiCandidateGeneration } from '../lib/ai-candidate-generations/runner.ts';
 import { GeminiInvestigationProvider } from '../lib/ai-investigations/gemini-provider.ts';
+import { modelRequestKey } from '../lib/ai-investigations/model-request-key.ts';
 import { createTestExternalExecutionAuthorizer } from './external-execution-support.ts';
 import type { AuthenticatedWorkspace } from '../lib/auth/protected-context.ts';
 import type { GitHubAppConfiguration } from '../lib/github-app/types.ts';
@@ -19,7 +20,8 @@ import { ModelProviderError, type InvestigationModelProvider, type Investigation
 import { createTestContext } from './support.ts';
 import { ExternalExecutionAuthorityError } from '../lib/external-execution/types.ts';
 
-const NOW = new Date('2030-09-12T12:00:00.000Z');
+// Production claims use PostgreSQL time; fixture time must be near that clock.
+const NOW = new Date();
 const COMMIT = 'a'.repeat(40); const PROFILE = 'b'.repeat(64); const TREE = 'c'.repeat(40);
 const REPOSITORY_ID = 41001; const INSTALLATION_ID = 42001;
 const sha256 = (value: string) => createHash('sha256').update(value).digest('hex');
@@ -406,9 +408,9 @@ test('generation durable ambiguity takes precedence over a simultaneous model ab
 test('controlled generation input accounting uses serialized request bytes within a small three-request envelope', async (t) => {
   const context = await createTestContext(); t.after(() => context.client.close()); const seeded = await seed(context);
   const queued = await startAiCandidateGeneration(context.database, seeded.workspaceContext, seeded.aiId, new CandidateQueue(), { clock: () => NOW });
-  const charges: number[] = []; const requestBytes: number[] = [];
+  const charges: number[] = []; const requestBytes: number[] = []; const operationKeys: Array<string | undefined> = [];
   const underlying = createTestExternalExecutionAuthorizer();
-  const executionAuthority = { reserve: async (request: Parameters<typeof underlying.reserve>[0]) => { charges.push(request.amounts.inputTokens); return underlying.reserve(request); } };
+  const executionAuthority = { reserve: async (request: Parameters<typeof underlying.reserve>[0]) => { charges.push(request.amounts.inputTokens); operationKeys.push(request.operationKey); return underlying.reserve(request); } };
   const client = { create: async (request: Record<string, unknown>) => {
     requestBytes.push(Buffer.byteLength(JSON.stringify(request), 'utf8'));
     if (requestBytes.length <= 2) return { status: 'requires_action', steps: [{ type: 'function_call', id: `call-${requestBytes.length}`, name: requestBytes.length === 1 ? 'readBaselineSummary' : 'readTextFile', arguments: requestBytes.length === 1 ? {} : { path: SOURCE_PATH } }] };
@@ -419,6 +421,8 @@ test('controlled generation input accounting uses serialized request bytes withi
   const [generation] = await context.database.select().from(aiCandidateGeneration).where(eq(aiCandidateGeneration.id, queued.id));
   assert.equal(generation?.state, 'abstained'); assert.equal((await context.database.select().from(repairCandidate)).length, 0);
   assert.equal(requestBytes.length, 3); assert.deepEqual(charges, requestBytes);
+  const [attempt] = await context.database.select({ id: aiCandidateGenerationAttempt.id }).from(aiCandidateGenerationAttempt).where(eq(aiCandidateGenerationAttempt.generationId, queued.id));
+  assert.deepEqual(operationKeys, [1, 2, 3].map((turn) => modelRequestKey(attempt!.id, turn)));
   assert.ok(charges.reduce((sum, bytes) => sum + bytes, 0) <= 20 * 1024);
   t.diagnostic(`Controlled generation serialized input bytes: ${charges.join(' + ')} = ${charges.reduce((sum, bytes) => sum + bytes, 0)}; tested cumulative allowance 20480 bytes (not tokenizer-measured tokens).`);
 });
@@ -503,6 +507,128 @@ test('a crash after candidate persistence reconciles without a second provider c
   assert.equal((await context.database.select().from(repairCandidate)).length, 1); let providerCalls = 0;
   assert.equal((await processAiCandidateGenerationJob(job, { database: context.database, gateway: new Gateway(), configuration: CONFIGURATION, createProvider: () => { providerCalls += 1; return new ProposalProvider(); }, clock: () => new Date(NOW.getTime() + 2) })).status, 'completed');
   assert.equal(providerCalls, 0); assert.equal((await context.database.select().from(aiCandidateGeneration).where(eq(aiCandidateGeneration.id, queued.id)))[0]?.state, 'frozen'); assert.equal((await context.database.select().from(repairCandidate)).length, 1);
+});
+
+test('freezing candidate after model success cannot authorize a second provider request on concurrent reclaim', async (t) => {
+  const context = await createTestContext(); t.after(() => context.client.close());
+  const seeded = await seed(context);
+  const queued = await startAiCandidateGeneration(context.database, seeded.workspaceContext, seeded.aiId, new CandidateQueue(), { clock: () => NOW });
+  const job = { id: queued.id, name: 'ai-candidate-generation-v1', data: { version: 1, proposalGenerationId: queued.id }, signal: new AbortController().signal } as never;
+  let failedTransactions = 0;
+  const database = new Proxy(context.database, { get(target, property) {
+    if (property === 'transaction') return (...args: Parameters<typeof target.transaction>) => {
+      if (failedTransactions > 0) { failedTransactions--; throw new Error('controlled post-model persistence failure'); }
+      return target.transaction(...args);
+    };
+    return Reflect.get(target, property, target);
+  } });
+  class InterruptedFreezeGateway extends Gateway {
+    async getCommitTree(): ReturnType<Gateway['getCommitTree']> {
+      failedTransactions = 2; // rejectCandidate, then worker failure persistence
+      throw new Error('controlled interruption after freezing reservation');
+    }
+  }
+  const first = await processAiCandidateGenerationJob(job, { database, gateway: new InterruptedFreezeGateway(),
+    configuration: CONFIGURATION, createProvider: () => new ProposalProvider(), clock: () => NOW });
+  assert.equal(first.status, 'failed');
+  const [candidate] = await context.database.select().from(repairCandidate).where(eq(repairCandidate.proposalKey, queued.id));
+  assert.equal(candidate?.state, 'freezing');
+  const [priorAttempt] = await context.database.select().from(aiCandidateGenerationAttempt).where(eq(aiCandidateGenerationAttempt.generationId, queued.id));
+  assert.equal(priorAttempt?.state, 'active');
+  const priorReservations = await context.database.select({ id: externalExecutionReservation.id }).from(externalExecutionReservation);
+  // This provider is mocked: request construction is observed, while no real
+  // transport reservation is necessary to establish the freezing-row guard.
+  await context.database.update(aiCandidateGenerationAttempt).set({ leaseExpiresAt: new Date(0) }).where(eq(aiCandidateGenerationAttempt.id, priorAttempt!.id));
+  let providerCreations = 0;
+  const dependencies = { database: context.database, gateway: new Gateway(), configuration: CONFIGURATION,
+    createProvider: () => { providerCreations++; return new ProposalProvider(); }, clock: () => NOW };
+  await Promise.all([processAiCandidateGenerationJob(job, dependencies), processAiCandidateGenerationJob(job, dependencies)]);
+  assert.equal(providerCreations, 0);
+  const [generation] = await context.database.select().from(aiCandidateGeneration).where(eq(aiCandidateGeneration.id, queued.id));
+  const candidates = await context.database.select().from(repairCandidate).where(eq(repairCandidate.proposalKey, queued.id));
+  const attempts = await context.database.select().from(aiCandidateGenerationAttempt).where(eq(aiCandidateGenerationAttempt.generationId, queued.id));
+  assert.equal(generation?.state, 'failed');
+  assert.equal(generation?.failureCode, 'provider_result_unpersisted');
+  assert.equal(candidates.length, 1);
+  assert.equal(candidates[0]?.state, 'freezing');
+  assert.equal(attempts.length, 1);
+  assert.deepEqual(await context.database.select({ id: externalExecutionReservation.id }).from(externalExecutionReservation), priorReservations);
+});
+
+for (const state of ['freezing', 'rejected'] as const) {
+  test(`existing ${state} candidate never dispatches another model request`, async (t) => {
+    const context = await createTestContext(); t.after(() => context.client.close());
+    const seeded = await seed(context);
+    const queued = await startAiCandidateGeneration(context.database, seeded.workspaceContext, seeded.aiId, new CandidateQueue(), { clock: () => NOW });
+    await context.database.update(aiCandidateGeneration).set({ state: 'generating', generationStartedAt: NOW }).where(eq(aiCandidateGeneration.id, queued.id));
+    const [generation] = await context.database.select().from(aiCandidateGeneration).where(eq(aiCandidateGeneration.id, queued.id));
+    await context.database.insert(repairCandidate).values({ id: randomUUID(), investigationId: seeded.investigationId,
+      repairRunId: generation!.repairRunId, workspaceId: generation!.workspaceId, githubRepositoryId: REPOSITORY_ID,
+      installationId: INSTALLATION_ID, baseCommitSha: COMMIT, profileIdentity: PROFILE, formatVersion: 1,
+      ordinal: 1, proposalKey: queued.id, proposalIdentity: 'd'.repeat(64), state,
+      changedFileCount: 1, totalResultBytes: 10, rejectionCode: state === 'rejected' ? 'base_file_missing' : null,
+      freezingStartedAt: NOW, completedAt: state === 'rejected' ? NOW : null });
+    let providerCreations = 0;
+    const outcome = await processAiCandidateGenerationJob({ id: queued.id, name: 'ai-candidate-generation-v1',
+      data: { version: 1, proposalGenerationId: queued.id }, signal: new AbortController().signal } as never,
+    { database: context.database, gateway: new Gateway(), configuration: CONFIGURATION,
+      createProvider: () => { providerCreations++; return new ProposalProvider(); }, clock: () => NOW });
+    assert.equal(outcome.status, 'completed');
+    assert.equal(providerCreations, 0);
+    const [stored] = await context.database.select().from(aiCandidateGeneration).where(eq(aiCandidateGeneration.id, queued.id));
+    assert.equal(stored?.state, 'failed');
+    assert.equal(stored?.failureCode, state === 'freezing' ? 'provider_result_unpersisted' : 'candidate_generation_authority_mismatch');
+  });
+}
+
+test('a rejected candidate with different frozen source authority cannot be locally reconciled', async (t) => {
+  const context = await createTestContext(); t.after(() => context.client.close());
+  const seeded = await seed(context);
+  const queued = await startAiCandidateGeneration(context.database, seeded.workspaceContext, seeded.aiId, new CandidateQueue(), { clock: () => NOW });
+  await context.database.update(aiCandidateGeneration).set({ state: 'generating', generationStartedAt: NOW }).where(eq(aiCandidateGeneration.id, queued.id));
+  const [generation] = await context.database.select().from(aiCandidateGeneration).where(eq(aiCandidateGeneration.id, queued.id));
+  await context.database.insert(repairCandidate).values({ id: randomUUID(), investigationId: seeded.investigationId,
+    repairRunId: generation!.repairRunId, workspaceId: generation!.workspaceId, githubRepositoryId: REPOSITORY_ID,
+    installationId: INSTALLATION_ID, baseCommitSha: 'e'.repeat(40), profileIdentity: PROFILE, formatVersion: 1,
+    ordinal: 1, proposalKey: queued.id, proposalIdentity: 'd'.repeat(64), state: 'rejected',
+    changedFileCount: 1, totalResultBytes: 10, rejectionCode: 'base_file_missing',
+    freezingStartedAt: NOW, completedAt: NOW });
+  let providerCreations = 0;
+  const outcome = await processAiCandidateGenerationJob({ id: queued.id, name: 'ai-candidate-generation-v1',
+    data: { version: 1, proposalGenerationId: queued.id }, signal: new AbortController().signal } as never,
+  { database: context.database, gateway: new Gateway(), configuration: CONFIGURATION,
+    createProvider: () => { providerCreations++; return new ProposalProvider(); }, clock: () => NOW });
+  assert.equal(outcome.status, 'completed');
+  assert.equal(providerCreations, 0);
+  const [stored] = await context.database.select().from(aiCandidateGeneration).where(eq(aiCandidateGeneration.id, queued.id));
+  assert.equal(stored?.failureCode, 'candidate_generation_authority_mismatch');
+});
+
+test('a database failure after a valid model proposal cannot be retried as a provider failure', async (t) => {
+  const context = await createTestContext(); t.after(() => context.client.close());
+  const seeded = await seed(context);
+  const queued = await startAiCandidateGeneration(context.database, seeded.workspaceContext, seeded.aiId, new CandidateQueue(), { clock: () => NOW });
+  const job = { id: queued.id, name: 'ai-candidate-generation-v1', data: { version: 1, proposalGenerationId: queued.id }, signal: new AbortController().signal } as never;
+  let failNextTransaction = false; let modelCalls = 0;
+  const database = new Proxy(context.database, { get(target, property) {
+    if (property === 'transaction') return (...args: Parameters<typeof target.transaction>) => {
+      if (failNextTransaction) { failNextTransaction = false; throw new Error('controlled post-provider database failure'); }
+      return target.transaction(...args);
+    };
+    return Reflect.get(target, property, target);
+  } });
+  const execution = async () => {
+    modelCalls += 1; failNextTransaction = true;
+    return { result: { status: 'insufficient_evidence' as const },
+      usage: { inputTokens: 1, outputTokens: 1, toolCallCount: 0, modelTurnCount: 1 } };
+  };
+  const dependencies = { database, gateway: new Gateway(), configuration: CONFIGURATION,
+    createProvider: () => new ProposalProvider(), executor: execution as never, clock: () => NOW };
+  await processAiCandidateGenerationJob(job, dependencies);
+  await processAiCandidateGenerationJob(job, dependencies);
+  assert.equal(modelCalls, 1);
+  const [stored] = await context.database.select().from(aiCandidateGeneration).where(eq(aiCandidateGeneration.id, queued.id));
+  assert.notEqual(stored?.failureCode, 'model_provider_failed');
 });
 
 test('non-diagnosis, terminal failure, and cross-workspace AI executions cannot generate a candidate', async (t) => {

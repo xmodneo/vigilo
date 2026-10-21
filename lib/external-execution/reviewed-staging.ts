@@ -9,9 +9,10 @@ import {
 import type { AuthenticatedWorkspace } from '../auth/protected-context.ts';
 import type { VigiloDatabase } from '../db/types.ts';
 import { frozenBaselineProfile } from '../repository-baselines/authority.ts';
-import { REPAIR_JOB_VERSION, type TransactionalRepairQueue } from '../repair-runs/queue.ts';
+import { REPAIR_JOB_VERSION, type TransactionalReviewedBaselineQueue } from '../repair-runs/queue.ts';
 import { hasRepositorySwitchConflict } from '../github-repositories/switch-guard.ts';
 import { lockExternalExecution } from './business-fence.ts';
+import { assertDatabaseExpiryLive, freshDatabaseTime } from './database-clock.ts';
 import { buildReviewedStagingPlan, type ReviewedStagingInput } from './reviewed-plan.ts';
 import { assertReviewedPlanIntegrity } from './reviewed-plan-integrity.ts';
 import { stageReviewedSourceCheckpoint } from './source-checkpoint.ts';
@@ -40,10 +41,12 @@ export async function stageReviewedRepairRun(
   context: AuthenticatedWorkspace,
   input: ReviewedStagingInput,
   approvedPlanIdentity: string,
-  queue: TransactionalRepairQueue,
+  queue: TransactionalReviewedBaselineQueue,
   options: { runtimeReleaseSha: string; configuredProviderAccounts: ReviewedStagingInput['providerAccounts']; clock?: () => Date; randomId?: () => string },
 ): Promise<ReviewedStagingReceipt> {
-  const now = options.clock?.() ?? new Date();
+  // This reference time only constructs the immutable, already-approved plan.
+  // It is never proof that the plan remains live after database lock waits.
+  const referenceTime = options.clock?.() ?? new Date();
   const randomId = options.randomId ?? randomUUID;
   if (context.user.id !== context.workspace.ownerUserId) throw new ReviewedStagingError('reviewed_staging_unauthorized');
   if (!SHA.test(options.runtimeReleaseSha) || input.authorizedReleaseSha !== options.runtimeReleaseSha)
@@ -52,7 +55,7 @@ export async function stageReviewedRepairRun(
       input.providerAccounts.vercelTeamId !== options.configuredProviderAccounts.vercelTeamId ||
       input.providerAccounts.vercelProjectId !== options.configuredProviderAccounts.vercelProjectId)
     throw new ReviewedStagingError('reviewed_staging_authority_changed');
-  const planned = buildReviewedStagingPlan({ workspaceId: context.workspace.id, reviewerUserId: context.user.id }, input, now);
+  const planned = buildReviewedStagingPlan({ workspaceId: context.workspace.id, reviewerUserId: context.user.id }, input, referenceTime);
   if (planned.planIdentity !== approvedPlanIdentity) throw new ReviewedStagingError('reviewed_plan_mismatch');
 
   return database.transaction(async (transaction) => {
@@ -62,6 +65,7 @@ export async function stageReviewedRepairRun(
     const [owner] = await transaction.select().from(workspace)
       .where(eq(workspace.id, context.workspace.id)).for('update').limit(1);
     if (!owner || owner.ownerUserId !== context.user.id) throw new ReviewedStagingError('reviewed_staging_unauthorized');
+    const lockedTime = await freshDatabaseTime(transaction);
 
     // A byte-for-byte replay is the sole exception to the active-run conflict.
     const [existing] = await transaction.select().from(repairRun).where(and(
@@ -84,7 +88,7 @@ export async function stageReviewedRepairRun(
           grants.length !== 5 || operations.some((row) => !row) || !account) {
         throw new ReviewedStagingError('reviewed_staging_conflict');
       }
-      await assertReviewedPlanIntegrity(transaction, existing.id, options.runtimeReleaseSha, now);
+      await assertReviewedPlanIntegrity(transaction, existing.id, options.runtimeReleaseSha, lockedTime);
       return {
         repairRunId: existing.id, planIdentity: planned.planIdentity,
         sourceCheckpointState: 'pending' as const, accountGrantId: account.id,
@@ -93,11 +97,11 @@ export async function stageReviewedRepairRun(
     }
 
     const [idCollision] = await transaction.select({ id: repairRun.id }).from(repairRun).where(eq(repairRun.id, input.repairRunId)).limit(1);
-    if (idCollision || await hasRepositorySwitchConflict(transaction, context.workspace.id, now))
+    if (idCollision || await hasRepositorySwitchConflict(transaction, context.workspace.id, lockedTime))
       throw new ReviewedStagingError('reviewed_staging_conflict');
     const [activeAccount] = await transaction.select({ id: executionBudgetGrant.id }).from(executionBudgetGrant)
       .leftJoin(executionBudgetGrantRevocation, eq(executionBudgetGrantRevocation.grantId, executionBudgetGrant.id))
-      .where(and(eq(executionBudgetGrant.scope, 'account'), gt(executionBudgetGrant.expiresAt, now), isNull(executionBudgetGrantRevocation.id))).limit(1);
+      .where(and(eq(executionBudgetGrant.scope, 'account'), gt(executionBudgetGrant.expiresAt, lockedTime), isNull(executionBudgetGrantRevocation.id))).limit(1);
     if (activeAccount) throw new ReviewedStagingError('reviewed_staging_conflict');
 
     const [selected] = await transaction.select().from(repository).where(and(
@@ -116,30 +120,35 @@ export async function stageReviewedRepairRun(
       profile.profileIdentity !== input.profileIdentity || profile.baseCommitSha !== input.baseCommitSha)
       throw new ReviewedStagingError('reviewed_staging_authority_changed');
     frozenBaselineProfile(profile);
+    await assertDatabaseExpiryLive(transaction, planned.accountGrant.expiresAt);
+    const createdAt = await freshDatabaseTime(transaction);
 
     await transaction.insert(repairRun).values({
       id: input.repairRunId, workspaceId: context.workspace.id, githubRepositoryId: input.githubRepositoryId,
       installationId: input.installationId, profileIdentity: input.profileIdentity,
       baseCommitSha: input.baseCommitSha, idempotencyKey: input.idempotencyKey,
-      state: 'created', createdAt: now, stateChangedAt: now, updatedAt: now,
+      state: 'created', createdAt, stateChangedAt: createdAt, updatedAt: createdAt,
     });
     await transaction.insert(repairIntent).values({ id: randomId(), repairRunId: input.repairRunId,
       workspaceId: context.workspace.id, objective: planned.objective.objective,
-      objectiveHash: planned.objective.objectiveHash, createdAt: now });
+      objectiveHash: planned.objective.objectiveHash, createdAt });
     await transaction.insert(repairRunEvent).values({ id: randomId(), repairRunId: input.repairRunId,
-      fromState: null, toState: 'created', createdAt: now });
+      fromState: null, toState: 'created', createdAt });
     await stageReviewedSourceCheckpoint(transaction, context, input.repairRunId,
       input.expectedSourceIdentity, planned.planIdentity);
     const accountGrantId = randomId();
-    await transaction.insert(executionBudgetGrant).values({ ...planned.accountGrant, id: accountGrantId, createdAt: now });
+    await transaction.insert(executionBudgetGrant).values({ ...planned.accountGrant, id: accountGrantId, createdAt });
     const operationGrantIds: string[] = [];
     for (const grant of planned.operationGrants) {
       const id = randomId();
-      await transaction.insert(executionBudgetGrant).values({ ...grant, id, createdAt: now });
+      await transaction.insert(executionBudgetGrant).values({ ...grant, id, createdAt });
       operationGrantIds.push(id);
     }
-    const baselineJobId = await queue.enqueue(transaction, { version: REPAIR_JOB_VERSION, repairRunId: input.repairRunId });
+    const baselineJobId = await queue.enqueueReviewedBaseline(transaction, { version: REPAIR_JOB_VERSION, repairRunId: input.repairRunId });
     if (baselineJobId !== input.repairRunId) throw new ReviewedStagingError('reviewed_staging_handoff_failed');
+    // The final database-clock assertion is the last operation before commit;
+    // an expired plan rolls the entire run/grant/checkpoint/job transaction back.
+    await assertDatabaseExpiryLive(transaction, planned.accountGrant.expiresAt);
     return { repairRunId: input.repairRunId, planIdentity: planned.planIdentity,
       sourceCheckpointState: 'pending' as const, accountGrantId, operationGrantIds, baselineJobId };
   });

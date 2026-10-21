@@ -156,7 +156,9 @@ test('README presents the truthful controlled-beta contract', async () => {
   assert.match(readme, /does not automatically merge or deploy/i);
   assert.match(readme, /0025_repository-selection-history\.sql` has been applied to the positively\s+identified persistent local Vigilo development database, whose ledger has 26\s+consistent entries/i);
   assert.match(readme, /local development database currently selects the\s+public `xmodneo\/vigilo-acceptance-fixture` repository and has one ready\s+fixture execution profile/i);
-  assert.match(readme, /No fixture RepairRun, baseline, source checkpoint,\s+execution grant, reservation, or acceptance has been created; M7\.7 live\s+acceptance has not started/i);
+  assert.match(readme, /One reviewed fixture RepairRun was staged with a\s+pending source checkpoint, grants, and an unclaimed baseline job/i);
+  assert.match(readme, /baseline execution has not started\. No fixture baseline evidence, reservation,\s+or acceptance exists/i);
+  assert.match(readme, /0026_baseline-one-shot-worker\.sql` is implemented and verified only on\s+disposable PostgreSQL databases; it has \*\*not\*\* been applied to the persistent/i);
   assert.match(readme, /Task 4\.3 live acceptance remains pending/i);
   assert.match(readme, /publication remains hard-closed with `live_acceptance_pending`/i);
   assert.match(readme, /Application budgets[\s\S]*do not guarantee a provider bill or dollar amount/i);

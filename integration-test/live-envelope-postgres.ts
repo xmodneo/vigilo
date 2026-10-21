@@ -12,8 +12,10 @@ import postgres from 'postgres';
 
 import * as schema from '../db/schema.ts';
 import { DurableExternalExecutionAuthorizer } from '../lib/external-execution/authority.ts';
+import { assertRunBusinessAllowed, lockExternalExecution } from '../lib/external-execution/business-fence.ts';
 import { computeExecutionGrantIdentity } from '../lib/external-execution/identity.ts';
 import { googleProjectIdentity } from '../lib/external-execution/provider-account.ts';
+import { processRepairJob } from '../lib/repair-runs/worker.ts';
 import type { ExternalExecutionAmounts, ExternalExecutionReservationRequest, ExternalExecutionScope } from '../lib/external-execution/types.ts';
 import type { VigiloDatabase } from '../lib/db/types.ts';
 
@@ -104,7 +106,7 @@ try {
   await migrate(drizzle(a), { migrationsFolder });
   const history = await a`select hash from drizzle.__drizzle_migrations order by created_at, id`;
   assert.deepEqual(history.map((row) => row.hash), readMigrationFiles({ migrationsFolder }).map((migration) => migration.hash));
-  assert.equal(history.length, 26);
+  assert.equal(history.length, 27);
 
   const databaseA = drizzle(a, { schema }); const databaseB = drizzle(b, { schema });
   const now = new Date(); const expiresAt = new Date(now.getTime() + 3_600_000); const accountId = randomUUID();
@@ -120,8 +122,9 @@ try {
       acceptancePurpose: null, limits, expiresAt: expiresAt.toISOString(), authorizedBy: 'disposable-test' }) });
   const amounts: ExternalExecutionAmounts = { logicalRequests: 1, providerAttempts: 1, inputTokens: 1, outputTokens: 1,
     sandboxIdentities: 0, sandboxRuntimeMs: 0, verificationAttempts: 0, repairLoopIterations: 0 };
-  const seed = async () => {
+  const seed = async (operationExpiryMs = 3_600_000) => {
     const userId = randomUUID(); const workspaceId = randomUUID(); const repairRunId = randomUUID(); const grantId = randomUUID();
+    const operationExpiresAt = new Date(Date.now() + operationExpiryMs);
     await databaseA.insert(schema.user).values({ id: userId, name: 'Synthetic operator', email: `${userId}@test.invalid`, emailVerified: true });
     await databaseA.insert(schema.workspace).values({ id: workspaceId, ownerUserId: userId });
     await databaseA.insert(schema.repairRun).values({ id: repairRunId, workspaceId, githubRepositoryId: 42, installationId: 77,
@@ -133,11 +136,11 @@ try {
       ...scope, maxLogicalRequests: 10, maxProviderAttempts: 10, maxInputTokens: limits.inputTokens, maxOutputTokens: limits.outputTokens,
       maxSandboxIdentities: 0, maxSandboxRuntimeMs: 0, maxVerificationAttempts: 0, maxRepairLoopIterations: 0,
       authorizedReleaseSha: RELEASE_SHA, authorizedProviderAccountIdentity: PROVIDER_ACCOUNT,
-      maxConcurrentExternalOperations: 0, expiresAt, authorizedBy: 'disposable-test', createdAt: now,
+      maxConcurrentExternalOperations: 0, expiresAt: operationExpiresAt, authorizedBy: 'disposable-test', createdAt: now,
       grantIdentity: computeExecutionGrantIdentity({ version: 2, scope: 'operation', workspaceId, repairRunId,
         githubRepositoryId: 42, baseCommitSha: scope.baseCommitSha!, operationCategory: scope.operationCategory,
         providerId: scope.providerId, modelId: scope.modelId!, acceptancePurpose: null, limits: operationLimits,
-        expiresAt: expiresAt.toISOString(), authorizedBy: 'disposable-test',
+        expiresAt: operationExpiresAt.toISOString(), authorizedBy: 'disposable-test',
         authorizedReleaseSha: RELEASE_SHA, authorizedProviderAccountIdentity: PROVIDER_ACCOUNT }) });
     return { scope, grantId };
   };
@@ -151,8 +154,114 @@ try {
   };
   const passed: string[] = [];
   const check = async (title: string, operation: () => Promise<void>) => { stage = title; await operation(); passed.push(title); };
+  const afterLeaseExpiry = async (reservationId: string) => {
+    const [lease] = await observer`select lease_expires_at from external_execution_lease where reservation_id = ${reservationId}`;
+    assert.ok(lease?.lease_expires_at);
+    return new Date(new Date(lease.lease_expires_at as string).getTime() + 1);
+  };
   let calls = 0;
   const fakeFetch: typeof fetch = async () => { calls += 1; return Response.json({ ok: true }); };
+  let nextLeaseRepositoryId = 1000;
+  const seedRepairLease = async (expiryOffsetMs: number) => {
+    const userId = randomUUID(); const workspaceId = randomUUID(); const runId = randomUUID();
+    const attemptId = randomUUID(); const ownershipToken = randomUUID(); const repositoryId = nextLeaseRepositoryId++;
+    const installedAt = new Date();
+    await databaseA.insert(schema.user).values({ id: userId, name: 'Lease test operator', email: `${userId}@test.invalid` });
+    await databaseA.insert(schema.workspace).values({ id: workspaceId, ownerUserId: userId });
+    await databaseA.insert(schema.githubInstallation).values({ installationId: repositoryId, workspaceId,
+      githubAccountId: repositoryId, accountLogin: 'lease-test', accountType: 'User', status: 'active' });
+    await databaseA.insert(schema.repository).values({ githubRepositoryId: repositoryId, workspaceId,
+      installationId: repositoryId, ownerId: repositoryId, ownerLogin: 'lease-test', name: 'fixture',
+      fullName: 'lease-test/fixture', defaultBranch: 'main', isPrivate: false, isSelected: true });
+    await databaseA.insert(schema.repairRun).values({ id: runId, workspaceId, githubRepositoryId: repositoryId,
+      installationId: repositoryId, profileIdentity: 'b'.repeat(64), baseCommitSha: 'a'.repeat(40),
+      idempotencyKey: randomUUID(), state: 'baseline_running', baselineStartedAt: installedAt });
+    await databaseA.insert(schema.repairRunAttempt).values({ id: attemptId, repairRunId: runId, queueJobId: runId,
+      attemptNumber: 1, expectedBaselineId: randomUUID(), ownershipToken, state: 'active',
+      claimedAt: installedAt, heartbeatAt: installedAt,
+      leaseExpiresAt: new Date(installedAt.getTime() + expiryOffsetMs) });
+    return { runId, attemptId, ownershipToken };
+  };
+  const repairLeaseJob = (runId: string) => ({ id: runId, name: 'repair-baseline-v1',
+    data: { version: 1, repairRunId: runId }, signal: new AbortController().signal }) as never;
+  const repairLeaseDependencies = { database: databaseB, configuration: { appId: 1, appSlug: 'disposable-test',
+    clientId: 'disposable-test', baseUrl: 'http://localhost:3000' }, gateway: {} as never,
+    logger: { write: () => undefined }, clock: () => new Date(Date.now() + 3_600_000),
+    baselineExecutor: (async () => { throw new Error('unexpected_sandbox_execution'); }) as never };
+  const waitUntil = async (time: Date) => {
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      const [value] = await observer`select clock_timestamp() >= ${time.toISOString()}::timestamptz as crossed`;
+      if (value?.crossed) return;
+      await delay(10);
+    }
+    throw new Error('disposable_lease_deadline_not_crossed');
+  };
+
+  await check('repair lease expiring during global-lock wait is reclaimed from fresh database time', async () => {
+    const lease = await seedRepairLease(400);
+    let pendingClaim!: ReturnType<typeof pending<Awaited<ReturnType<typeof processRepairJob>>>>;
+    await a.begin(async (transaction) => {
+      await transaction`select id from external_execution_semaphore where id = 'global' for update`;
+      pendingClaim = pending(processRepairJob(repairLeaseJob(lease.runId), repairLeaseDependencies));
+      await blocked(transaction, 'vigilo-envelope-b');
+      await waitUntil(new Date(Date.now() + 450));
+    });
+    const result = await pendingClaim;
+    assert.ok('value' in result);
+    assert.deepEqual(result.value.output, { code: 'worker_process_lost' });
+    const [attempt] = await observer`select state, ownership_token from repair_run_attempt where id = ${lease.attemptId}`;
+    assert.equal(attempt?.state, 'abandoned'); assert.notEqual(attempt?.ownership_token, lease.ownershipToken);
+  });
+
+  await check('renewed owner during global-lock wait cannot be stolen', async () => {
+    const lease = await seedRepairLease(-1000); const newOwner = randomUUID();
+    let pendingClaim!: ReturnType<typeof pending<Awaited<ReturnType<typeof processRepairJob>>>>;
+    await a.begin(async (transaction) => {
+      await transaction`select id from external_execution_semaphore where id = 'global' for update`;
+      pendingClaim = pending(processRepairJob(repairLeaseJob(lease.runId), repairLeaseDependencies));
+      await blocked(transaction, 'vigilo-envelope-b');
+      await transaction`update repair_run_attempt set ownership_token = ${newOwner}, lease_expires_at = clock_timestamp() + interval '60 seconds' where id = ${lease.attemptId}`;
+    });
+    const result = await pendingClaim;
+    assert.ok('value' in result); assert.deepEqual(result.value.output, { code: 'active_attempt' });
+    const [attempt] = await observer`select state, ownership_token from repair_run_attempt where id = ${lease.attemptId}`;
+    assert.equal(attempt?.state, 'active'); assert.equal(attempt?.ownership_token, newOwner);
+  });
+
+  await check('repair claim final predicate defeats renewal after classification', async () => {
+    const lease = await seedRepairLease(-1000); const newOwner = randomUUID();
+    let pendingClaim!: ReturnType<typeof pending<Awaited<ReturnType<typeof processRepairJob>>>>;
+    await a.begin(async (transaction) => {
+      await transaction`select id from repair_run_attempt where id = ${lease.attemptId} for update`;
+      pendingClaim = pending(processRepairJob(repairLeaseJob(lease.runId), repairLeaseDependencies));
+      await blocked(transaction, 'vigilo-envelope-b');
+      await transaction`update repair_run_attempt set ownership_token = ${newOwner}, lease_expires_at = clock_timestamp() + interval '60 seconds' where id = ${lease.attemptId}`;
+    });
+    const result = await pendingClaim;
+    assert.ok('value' in result); assert.deepEqual(result.value.output, { code: 'active_attempt' });
+    const [attempt] = await observer`select state, ownership_token from repair_run_attempt where id = ${lease.attemptId}`;
+    assert.equal(attempt?.state, 'active'); assert.equal(attempt?.ownership_token, newOwner);
+  });
+
+  await check('unmatched provider attempt crossing ambiguity deadline during lock wait fails closed', async () => {
+    const { scope } = await seed();
+    const permit = await new EnvelopeAuthorizer(databaseA, { leaseMs: 400, fetch: fakeFetch }).reserve({ scope, amounts });
+    await permit.beginProviderAttempt();
+    let pendingCheck!: ReturnType<typeof pending<void>>;
+    await a.begin(async (transaction) => {
+      await transaction`select id from external_execution_semaphore where id = 'global' for update`;
+      pendingCheck = pending(databaseB.transaction(async (locked) => {
+        await lockExternalExecution(locked);
+        await assertRunBusinessAllowed(locked, { workspaceId: scope.workspaceId, ...(scope.repairRunId ? { repairRunId: scope.repairRunId } : {}) });
+      }));
+      await blocked(transaction, 'vigilo-envelope-b');
+      const [lease] = await observer`select lease_expires_at from external_execution_lease where reservation_id = ${permit.reservationId}`;
+      assert.ok(lease?.lease_expires_at);
+      await waitUntil(new Date(lease.lease_expires_at as string));
+    });
+    expectFailure(await pendingCheck, 'provider_attempt_ambiguous');
+    await permit.complete('ambiguous');
+  });
 
   await check('ambiguity completion wins admission atomically across independent connections', async () => {
     const { scope } = await seed(); const first = new EnvelopeAuthorizer(databaseA, { fetch: fakeFetch });
@@ -188,8 +297,9 @@ try {
 
   await check('expired unmatched start fences restart and changed operation identity', async () => {
     const { scope } = await seed(); let clock = new Date();
-    const first = new EnvelopeAuthorizer(databaseA, { clock: () => clock, leaseMs: 10, fetch: fakeFetch });
-    const permit = await first.reserve({ scope, amounts }); await permit.beginProviderAttempt(); clock = new Date(clock.getTime() + 11);
+    const first = new EnvelopeAuthorizer(databaseA, { clock: () => clock, leaseMs: 400, fetch: fakeFetch });
+    const permit = await first.reserve({ scope, amounts }); await permit.beginProviderAttempt(); clock = await afterLeaseExpiry(permit.reservationId);
+    await waitUntil(clock);
     const restarted = new EnvelopeAuthorizer(databaseB, { clock: () => clock, fetch: fakeFetch });
     await assert.rejects(restarted.reserve({ scope, amounts, operationKey: randomUUID() }), /provider_attempt_ambiguous/);
     await permit.complete('failed'); assert.equal(calls, 0);
@@ -197,10 +307,164 @@ try {
 
   await check('lease expiry between reservation and transport denies dispatch', async () => {
     const { scope } = await seed(); let clock = new Date();
-    const first = new EnvelopeAuthorizer(databaseA, { clock: () => clock, leaseMs: 10, fetch: fakeFetch });
-    const permit = await first.reserve({ scope, amounts }); clock = new Date(clock.getTime() + 11);
+    const first = new EnvelopeAuthorizer(databaseA, { clock: () => clock, leaseMs: 400, fetch: fakeFetch });
+    const permit = await first.reserve({ scope, amounts }); clock = await afterLeaseExpiry(permit.reservationId);
+    await waitUntil(clock);
     await assert.rejects(permit.meteredFetch('https://provider.invalid'), /execution_authority_expired/);
     await permit.complete('failed'); assert.equal(calls, 0);
+  });
+
+  await check('renewal blocked on lease row cannot resurrect expired permit', async () => {
+    const { scope } = await seed();
+    const permit = await new EnvelopeAuthorizer(databaseB, { leaseMs: 500, fetch: fakeFetch }).reserve({ scope, amounts });
+    const [before] = await observer`select lease_expires_at from external_execution_lease where reservation_id = ${permit.reservationId}`;
+    assert.ok(before?.lease_expires_at);
+    let renewal!: ReturnType<typeof pending<void>>;
+    await a.begin(async (transaction) => {
+      await transaction`select reservation_id from external_execution_lease where reservation_id = ${permit.reservationId} for update`;
+      renewal = pending(permit.renew());
+      await blocked(transaction, 'vigilo-envelope-b');
+      await waitUntil(new Date(before.lease_expires_at as string));
+    });
+    expectFailure(await renewal, 'execution_authority_expired');
+    const [after] = await observer`select lease_expires_at from external_execution_lease where reservation_id = ${permit.reservationId}`;
+    assert.equal(new Date(after?.lease_expires_at as string).getTime(), new Date(before.lease_expires_at as string).getTime());
+    const events = await observer`select event_type from external_execution_event where reservation_id = ${permit.reservationId}`;
+    assert.deepEqual(events.map((event) => event.event_type), ['reserved']);
+  });
+
+  await check('valid renewal remains within both approved grant deadlines', async () => {
+    const { scope, grantId } = await seed();
+    const permit = await new EnvelopeAuthorizer(databaseA, { leaseMs: 3_000, fetch: fakeFetch }).reserve({ scope, amounts });
+    const [before] = await observer`select lease_expires_at from external_execution_lease where reservation_id = ${permit.reservationId}`;
+    await permit.renew();
+    const [after] = await observer`select lease_expires_at from external_execution_lease where reservation_id = ${permit.reservationId}`;
+    const [operation] = await observer`select expires_at from execution_budget_grant where id = ${grantId}`;
+    const [account] = await observer`select expires_at from execution_budget_grant where id = ${accountId}`;
+    assert.ok(new Date(after?.lease_expires_at as string) > new Date(before?.lease_expires_at as string));
+    assert.ok(new Date(after?.lease_expires_at as string) <= new Date(operation?.expires_at as string));
+    assert.ok(new Date(after?.lease_expires_at as string) <= new Date(account?.expires_at as string));
+    await permit.complete('succeeded');
+  });
+
+  await check('concurrent renewal requests cannot extend past a near grant deadline', async () => {
+    const { scope, grantId } = await seed(3_000);
+    const permit = await new EnvelopeAuthorizer(databaseA, { leaseMs: 5_000, fetch: fakeFetch }).reserve({ scope, amounts });
+    const renewals = await Promise.all([pending(permit.renew()), pending(permit.renew())]);
+    renewals.forEach((result) => assert.equal(Object.hasOwn(result, 'error'), false));
+    const [lease] = await observer`select lease_expires_at from external_execution_lease where reservation_id = ${permit.reservationId}`;
+    const [grant] = await observer`select expires_at from execution_budget_grant where id = ${grantId}`;
+    assert.equal(new Date(lease?.lease_expires_at as string).getTime(), new Date(grant?.expires_at as string).getTime());
+    await permit.complete('succeeded');
+  });
+
+  await check('already-expired lease cannot renew with its old token and fence', async () => {
+    const { scope } = await seed();
+    const permit = await new EnvelopeAuthorizer(databaseA, { leaseMs: 300, fetch: fakeFetch }).reserve({ scope, amounts });
+    const [lease] = await observer`select lease_expires_at from external_execution_lease where reservation_id = ${permit.reservationId}`;
+    await waitUntil(new Date(lease?.lease_expires_at as string));
+    expectFailure(await pending(permit.renew()), 'execution_authority_expired');
+    const events = await observer`select event_type from external_execution_event where reservation_id = ${permit.reservationId}`;
+    assert.deepEqual(events.map((event) => event.event_type), ['reserved']);
+  });
+
+  await check('attempt admission blocked on lease row cannot use expired lease or grant', async () => {
+    const { scope } = await seed(800);
+    const permit = await new EnvelopeAuthorizer(databaseB, { leaseMs: 500, fetch: fakeFetch }).reserve({ scope, amounts });
+    const [lease] = await observer`select lease_expires_at from external_execution_lease where reservation_id = ${permit.reservationId}`;
+    assert.ok(lease?.lease_expires_at);
+    let admission!: ReturnType<typeof pending<number>>;
+    await a.begin(async (transaction) => {
+      await transaction`select reservation_id from external_execution_lease where reservation_id = ${permit.reservationId} for update`;
+      admission = pending(permit.beginProviderAttempt());
+      await blocked(transaction, 'vigilo-envelope-b');
+      await waitUntil(new Date(lease.lease_expires_at as string));
+    });
+    expectFailure(await admission, 'execution_authority_expired');
+    const events = await observer`select event_type from external_execution_event where reservation_id = ${permit.reservationId}`;
+    assert.deepEqual(events.map((event) => event.event_type), ['reserved']);
+    assert.equal(calls, 0);
+  });
+
+  await check('attempt admission blocked on lease row cannot outlive a grant even with an older overlong lease', async () => {
+    const { scope, grantId } = await seed(500);
+    const permit = await new EnvelopeAuthorizer(databaseB, { leaseMs: 2_000, fetch: fakeFetch }).reserve({ scope, amounts });
+    // Existing pre-correction rows could have leases extending beyond grants.
+    await a`update external_execution_lease set lease_expires_at = clock_timestamp() + interval '3 seconds' where reservation_id = ${permit.reservationId}`;
+    const [grant] = await observer`select expires_at from execution_budget_grant where id = ${grantId}`;
+    let admission!: ReturnType<typeof pending<number>>;
+    await a.begin(async (transaction) => {
+      await transaction`select reservation_id from external_execution_lease where reservation_id = ${permit.reservationId} for update`;
+      admission = pending(permit.beginProviderAttempt());
+      await blocked(transaction, 'vigilo-envelope-b');
+      await waitUntil(new Date(grant?.expires_at as string));
+    });
+    expectFailure(await admission, 'execution_authority_expired');
+    const events = await observer`select event_type from external_execution_event where reservation_id = ${permit.reservationId}`;
+    assert.deepEqual(events.map((event) => event.event_type), ['reserved']);
+    assert.equal(calls, 0);
+    await permit.complete('failed', 'execution_authority_expired');
+  });
+
+  await check('terminal ownership transition while blocked cannot renew or admit', async () => {
+    const { scope } = await seed();
+    const permit = await new EnvelopeAuthorizer(databaseB, { leaseMs: 2_000, fetch: fakeFetch }).reserve({ scope, amounts });
+    let renewal!: ReturnType<typeof pending<void>>;
+    await a.begin(async (transaction) => {
+      await transaction`select reservation_id from external_execution_lease where reservation_id = ${permit.reservationId} for update`;
+      renewal = pending(permit.renew());
+      await blocked(transaction, 'vigilo-envelope-b');
+      await transaction`update external_execution_lease set state = 'failed', completed_at = clock_timestamp(), failure_code = 'execution_authority_mismatch' where reservation_id = ${permit.reservationId}`;
+    });
+    expectFailure(await renewal, 'execution_authority_expired');
+    expectFailure(await pending(permit.beginProviderAttempt()), 'execution_authority_expired');
+    const events = await observer`select event_type from external_execution_event where reservation_id = ${permit.reservationId}`;
+    assert.deepEqual(events.map((event) => event.event_type), ['reserved']);
+  });
+
+  await check('successor fence created while old renewal waits cannot revive old ownership', async () => {
+    const { scope } = await seed();
+    const oldPermit = await new EnvelopeAuthorizer(databaseB, { leaseMs: 1_000, fetch: fakeFetch }).reserve({ scope, amounts });
+    const [oldLease] = await observer`select lease_expires_at from external_execution_lease where reservation_id = ${oldPermit.reservationId}`;
+    assert.ok(oldLease?.lease_expires_at);
+    const successorAuthority = new EnvelopeAuthorizer(drizzle(observer, { schema }), { leaseMs: 2_000, fetch: fakeFetch });
+    let successor!: ReturnType<typeof pending<Awaited<ReturnType<typeof successorAuthority.reserve>>>>;
+    let renewal!: ReturnType<typeof pending<void>>;
+    await a.begin(async (transaction) => {
+      await transaction`select id from external_execution_semaphore where id = 'global' for update`;
+      successor = pending(successorAuthority.reserve({ scope, amounts }));
+      await blocked(transaction, 'vigilo-envelope-observer');
+      renewal = pending(oldPermit.renew());
+      await blocked(transaction, 'vigilo-envelope-b');
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        const [time] = await transaction`select clock_timestamp() >= ${new Date(oldLease.lease_expires_at as string).toISOString()}::timestamptz as crossed`;
+        if (time?.crossed) return;
+        await delay(10);
+      }
+      throw new Error('disposable_lease_deadline_not_crossed');
+    });
+    const next = await successor;
+    assert.ok('value' in next);
+    assert.ok(next.value.fence > oldPermit.fence);
+    expectFailure(await renewal, 'execution_authority_expired');
+    expectFailure(await pending(oldPermit.beginProviderAttempt()), 'execution_authority_expired');
+    await next.value.complete('succeeded');
+  });
+
+  await check('admitted attempt expiring before transport cannot call provider', async () => {
+    const { scope } = await seed();
+    const permit = await new EnvelopeAuthorizer(databaseA, { leaseMs: 400, fetch: fakeFetch }).reserve({ scope, amounts });
+    await a`create function disposable_delay_attempt_start() returns trigger as $$ begin perform pg_sleep(0.6); return new; end $$ language plpgsql`;
+    await a`create trigger disposable_delay_attempt_start after insert on external_execution_event for each row when (new.event_type = 'attempt_started') execute function disposable_delay_attempt_start()`;
+    try {
+      expectFailure(await pending(permit.meteredFetch('https://provider.invalid')), 'execution_authority_expired');
+      assert.equal(calls, 0);
+      const events = await observer`select event_type from external_execution_event where reservation_id = ${permit.reservationId} order by created_at, id`;
+      assert.deepEqual(events.map((event) => event.event_type).sort(), ['attempt_failed', 'attempt_started', 'reserved'].sort());
+    } finally {
+      await a`drop trigger disposable_delay_attempt_start on external_execution_event`;
+      await a`drop function disposable_delay_attempt_start()`;
+    }
   });
 
   await check('grant revocation and attempt admission do not deadlock or dispatch stale authority', async () => {
@@ -246,9 +510,10 @@ try {
 
   await check('late attempt success after ownership expiry is rejected', async () => {
     const { scope } = await seed(); let clock = new Date();
-    const first = new EnvelopeAuthorizer(databaseA, { clock: () => clock, leaseMs: 10, fetch: fakeFetch });
+    const first = new EnvelopeAuthorizer(databaseA, { clock: () => clock, leaseMs: 400, fetch: fakeFetch });
     const late = await first.reserve({ scope, amounts }); const ordinal = await late.beginProviderAttempt();
-    clock = new Date(clock.getTime() + 11);
+    clock = await afterLeaseExpiry(late.reservationId);
+    await waitUntil(clock);
     await assert.rejects(late.finishProviderAttempt(ordinal, 'succeeded'), /execution_authority_expired/);
     await late.complete('ambiguous');
     const events = await observer`select event_type from external_execution_event where reservation_id = ${late.reservationId}`;
@@ -280,6 +545,23 @@ try {
     const permit = await first.reserve({ scope, amounts }); permitId = permit.reservationId;
     await permit.meteredFetch('https://provider.invalid'); await permit.complete('succeeded'); assert.equal(calls, 1);
   });
+  await check('account-grant revocation while admission waits denies the attempt without budget effects', async () => {
+    const { scope } = await seed();
+    const permit = await new EnvelopeAuthorizer(databaseA, { fetch: fakeFetch }).reserve({ scope, amounts });
+    const [before] = await observer`select count(*)::int as count from external_execution_event where reservation_id = ${permit.reservationId}`;
+    let admission!: ReturnType<typeof pending<number>>;
+    await b.begin(async (transaction) => {
+      await transaction`select id from execution_budget_grant where id = ${accountId} for update`;
+      admission = pending(permit.beginProviderAttempt());
+      await blocked(transaction, 'vigilo-envelope-a');
+      await transaction`insert into execution_budget_grant_revocation (id, grant_id, revoked_by, reason_code) values (${randomUUID()}, ${accountId}, 'disposable-test', 'test_revoked')`;
+    });
+    expectFailure(await admission, 'execution_authority_missing');
+    const [after] = await observer`select count(*)::int as count from external_execution_event where reservation_id = ${permit.reservationId}`;
+    assert.equal(before?.count, 1); assert.equal(after?.count, before?.count);
+    assert.equal(calls, 1, 'only the earlier legitimate stub transport was dispatched');
+    await permit.complete('failed', 'execution_authority_missing');
+  });
   stage = 'disposable_historical_migration_reconciliation';
   const reconciliation = JSON.parse(execFileSync(process.execPath,
     ['--import', 'tsx', join(dirname(migrationsFolder), 'integration-test/migration-reconciliation-postgres.ts')],
@@ -294,6 +576,7 @@ try {
 } catch (error) {
   // No URL, generated credential, SQL parameters, or provider response is logged.
   console.error(JSON.stringify({ result: 'failed', stage, errorType: error instanceof Error ? error.name : 'unknown',
+    ...(error instanceof Error && /^[a-z_]+$/.test(error.message) ? { errorCode: error.message } : {}),
     ...(error instanceof postgres.PostgresError ? { sqlState: error.code } : {}) }));
   process.exitCode = 1;
 } finally {

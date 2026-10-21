@@ -16,7 +16,7 @@ import { MIGRATION_MANIFEST, validateMigrationFiles } from '../lib/operations/mi
 const migrationsFolder = resolve(process.cwd(), 'drizzle');
 const now = new Date('2031-01-02T03:04:05.000Z');
 
-test('disposable 0024→0025 upgrade preserves repository, profile, eight runs, and fourteen baselines', async (t) => {
+test('disposable 0024→current upgrade preserves repository, profile, eight runs, and fourteen baselines', async (t) => {
   const folder = await mkdtemp(join(tmpdir(), 'vigilo-selection-upgrade-'));
   const client = new PGlite();
   t.after(async () => { await client.close(); await rm(folder, { recursive: true, force: true }); });
@@ -24,7 +24,7 @@ test('disposable 0024→0025 upgrade preserves repository, profile, eight runs, 
   const journal = JSON.parse(await readFile(join(migrationsFolder, 'meta', '_journal.json'), 'utf8')) as {
     entries: Array<{ idx: number; tag: string }>;
   };
-  assert.equal(journal.entries.length, 26);
+  assert.equal(journal.entries.length, 27);
   await writeFile(join(folder, 'meta', '_journal.json'), JSON.stringify({ ...journal, entries: journal.entries.slice(0, 25) }));
   for (const entry of journal.entries.slice(0, 25)) {
     await copyFile(join(migrationsFolder, `${entry.tag}.sql`), join(folder, `${entry.tag}.sql`));
@@ -85,7 +85,7 @@ test('disposable 0024→0025 upgrade preserves repository, profile, eight runs, 
   await validateMigrationFiles(process.cwd());
   const ledger = (await client.query<{ hash: string; created_at: string }>(
     'select hash, created_at from drizzle.__drizzle_migrations order by id')).rows;
-  assert.equal(ledger.length, 26);
+  assert.equal(ledger.length, 27);
   assert.deepEqual(ledger.slice(0, 25), historicalLedger);
   assert.deepEqual(ledger.map((row) => row.hash), MIGRATION_MANIFEST.map((entry) => entry.hash));
   assert.equal(ledger[25]?.hash, createHash('sha256').update(await readFile(join(migrationsFolder,

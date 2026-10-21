@@ -59,7 +59,7 @@ export interface ModelTurn {
 }
 
 export interface InvestigationModelSession {
-  next(input: { toolOutputs?: Array<{ callId: string; output: string }>; finalization?: boolean; signal: AbortSignal }): Promise<ModelTurn>;
+  next(input: { toolOutputs?: Array<{ callId: string; output: string }>; finalization?: boolean; operationKey?: string; signal: AbortSignal }): Promise<ModelTurn>;
 }
 
 export interface InvestigationModelProvider {

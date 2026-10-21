@@ -16,7 +16,7 @@ import { processRepairJob } from '../lib/repair-runs/worker.ts';
 import { startRepairLoop } from '../lib/repair-loops/flow.ts';
 import { processRepairLoopJob } from '../lib/repair-loops/worker.ts';
 import { stageReviewedRepairRun } from '../lib/external-execution/reviewed-staging.ts';
-import type { AiCandidateGenerationJobPayload, CandidateVerificationJobPayload, RepairJobPayload, RepairLoopJobPayload, TransactionalRepairQueue, VigiloTransaction } from '../lib/repair-runs/queue.ts';
+import type { AiCandidateGenerationJobPayload, CandidateVerificationJobPayload, RepairJobPayload, RepairLoopJobPayload, TransactionalReviewedBaselineQueue, VigiloTransaction } from '../lib/repair-runs/queue.ts';
 import { createTestContext, saveGithubUser } from './support.ts';
 
 const SHA = 'a'.repeat(40);
@@ -27,9 +27,9 @@ const LOCK = '{"lockfileVersion":3,"packages":{"":{"name":"app"}}}';
 const sha256 = (value: string) => createHash('sha256').update(value).digest('hex');
 const stageOptions = (input: ReviewedStagingInput) => ({ runtimeReleaseSha: RELEASE, configuredProviderAccounts: input.providerAccounts });
 
-class MemoryQueue implements TransactionalRepairQueue {
+class MemoryQueue implements TransactionalReviewedBaselineQueue {
   readonly jobs: RepairJobPayload[] = [];
-  async enqueue(_transaction: Parameters<TransactionalRepairQueue['enqueue']>[0], payload: RepairJobPayload) {
+  async enqueueReviewedBaseline(_transaction: Parameters<TransactionalReviewedBaselineQueue['enqueueReviewedBaseline']>[0], payload: RepairJobPayload) {
     this.jobs.push(payload);
     return payload.repairRunId;
   }
@@ -50,7 +50,7 @@ class InertLoopQueues {
   }
 }
 
-async function setup() {
+async function setup(expiryMs = 60 * 60_000) {
   const context = await createTestContext();
   const user = await saveGithubUser(context, 'reviewed-staging');
   const login = await context.testAuth.login({ userId: user.id });
@@ -81,15 +81,15 @@ async function setup() {
     kind: 'm77b_repair_v1', repairRunId: randomUUID(), idempotencyKey: randomUUID(), githubRepositoryId: repositoryId,
     installationId, profileIdentity, baseCommitSha: SHA, authorizedReleaseSha: RELEASE,
     objective: 'Investigate the controlled failing test.', expectedSourceIdentity: HASH,
-    expiresAt: new Date(Date.now() + 60 * 60_000).toISOString(),
+    expiresAt: new Date(Date.now() + expiryMs).toISOString(),
     providerAccounts: { googleProjectId: 'gen-lang-client-0469095642', vercelTeamId: 'team_dQVJwtsj7JcMXmVUYyFgrCzA', vercelProjectId: 'prj_i6HNc531erDzTtCZZJZqIy7vJ3oM' },
   };
   const queue = new MemoryQueue();
   return { context, actor, input, queue };
 }
 
-async function setupReviewedLoopReplay() {
-  const staged = await setup();
+async function setupReviewedLoopReplay(expiryMs?: number) {
+  const staged = await setup(expiryMs);
   const { context, actor, input, queue } = staged;
   const now = new Date();
   const plan = buildReviewedStagingPlan({ workspaceId: actor.workspace.id, reviewerUserId: actor.user.id }, input, now);
@@ -224,7 +224,7 @@ test('reviewed staging rolls back every row when queue handoff fails', async (t)
   const { context, actor, input } = await setup();
   t.after(() => context.client.close());
   const plan = buildReviewedStagingPlan({ workspaceId: actor.workspace.id, reviewerUserId: actor.user.id }, input);
-  const badQueue: TransactionalRepairQueue = { enqueue: async () => { throw new Error('injected_job_failure'); } };
+  const badQueue: TransactionalReviewedBaselineQueue = { enqueueReviewedBaseline: async () => { throw new Error('injected_job_failure'); } };
   await assert.rejects(stageReviewedRepairRun(context.database, actor, input, plan.planIdentity, badQueue, stageOptions(input)), /injected_job_failure/);
   for (const table of [repairRun, repairIntent, repairRunSourceCheckpoint, executionBudgetGrant] as const)
     assert.equal((await context.database.select().from(table)).length, 0);
@@ -296,13 +296,20 @@ test('supplemental durable grant blocks reservation before any provider transpor
   assert.equal(transports, 0);
   assert.equal((await context.database.select().from(externalExecutionReservation)).length, 0);
   let baselineCalls = 0;
-  const outcome = await processRepairJob({ id: input.repairRunId, name: 'repair-baseline-v1',
+  const job = { id: input.repairRunId, name: 'repair-baseline-v1',
     data: { version: 1, repairRunId: input.repairRunId }, signal: new AbortController().signal,
-    expireInSeconds: 720, heartbeatSeconds: 60 } as never, {
+    expireInSeconds: 720, heartbeatSeconds: 60 } as never;
+  const dependencies = {
     database: context.database, configuration: { appId: 991, appSlug: 'test', clientId: 'Iv1.test', baseUrl: 'http://localhost:3000' },
     gateway: {} as never, logger: { write: () => {} }, runtimeReleaseSha: RELEASE,
     baselineExecutor: (async () => { baselineCalls += 1; throw new Error('must_not_execute'); }) as never,
-  });
+  };
+  const broadOutcome = await processRepairJob(job, dependencies);
+  assert.equal(broadOutcome.status, 'deadletter');
+  assert.equal(baselineCalls, 0);
+  assert.equal((await context.database.select().from(repairRunAttempt)).length, 0);
+  const outcome = await processRepairJob(job, { ...dependencies,
+    reviewedOneShot: { repairRunId: input.repairRunId, planIdentity: plan.planIdentity } });
   assert.equal(outcome.status, 'completed');
   assert.equal(baselineCalls, 0);
   const [failedRun] = await context.database.select().from(repairRun).where(eq(repairRun.id, input.repairRunId));
@@ -395,7 +402,7 @@ test('repair-loop replay rejects a changed runtime release before scheduling dow
 
 test('repair-loop replay still rejects revoked reviewed grants and expired authority', async (t) => {
   for (const defect of ['revoked', 'expired'] as const) {
-    const { context, actor, input, loop, loopQueues, wake } = await setupReviewedLoopReplay();
+    const { context, actor, input, loop, loopQueues, wake } = await setupReviewedLoopReplay(defect === 'expired' ? 20_000 : undefined);
     t.after(() => context.client.close());
     if (defect === 'revoked') {
       const [grant] = await context.database.select().from(executionBudgetGrant)
@@ -404,8 +411,8 @@ test('repair-loop replay still rejects revoked reviewed grants and expired autho
       await context.database.insert(executionBudgetGrantRevocation).values({ id: randomUUID(), grantId: grant.id,
         reasonCode: 'operator_revoked', revokedBy: actor.user.id });
     }
-    const at = defect === 'expired' ? new Date(input.expiresAt) : undefined;
-    assert.equal((await wake(RELEASE, at)).status, 'completed');
+    if (defect === 'expired') await new Promise<void>((resolve) => setTimeout(resolve, Math.max(0, Date.parse(input.expiresAt) - Date.now() + 25)));
+    assert.equal((await wake(RELEASE)).status, 'completed');
     const [stored] = await context.database.select().from(repairLoop).where(eq(repairLoop.id, loop.id));
     assert.equal(stored?.state, 'failed', defect);
     assert.equal(loopQueues.wakes.length, 2, defect);

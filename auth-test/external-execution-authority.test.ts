@@ -22,7 +22,7 @@ import { MODEL_INSTRUCTIONS, MODEL_TOOLS, CONCLUSION_SCHEMA, buildInitialInput }
 import { AI_CANDIDATE_PROPOSAL_INSTRUCTIONS, AI_CANDIDATE_PROPOSAL_TOOLS, AI_CANDIDATE_PROPOSAL_PROVIDER_SCHEMA, buildAiCandidateProposalInput } from '../lib/ai-candidate-generations/protocol.ts';
 import { computeExecutionGrantIdentity, computeExecutionReservationIdentity } from '../lib/external-execution/identity.ts';
 import { googleProjectIdentity, vercelTeamProjectIdentity } from '../lib/external-execution/provider-account.ts';
-import { ExternalExecutionAuthorityError, type ExternalExecutionAmounts, type ExternalExecutionReservationRequest, type ExternalExecutionScope } from '../lib/external-execution/types.ts';
+import { ExternalExecutionAuthorityError, type ExternalExecutionAmounts, type ExternalExecutionAuthorizer, type ExternalExecutionReservationRequest, type ExternalExecutionScope } from '../lib/external-execution/types.ts';
 import { createTestContext } from './support.ts';
 import { hasRepositorySwitchConflict } from '../lib/github-repositories/switch-guard.ts';
 
@@ -62,8 +62,32 @@ const amount = (overrides: Partial<ExternalExecutionAmounts> = {}): ExternalExec
   ...overrides,
 });
 
+test('Gemini transport rechecks a permit after durable admission and never calls provider after expiry', async () => {
+  let providerCalls = 0; let ownershipChecks = 0; let attemptStarted = false;
+  let finished = false; let completed = false;
+  const authority: ExternalExecutionAuthorizer = { reserve: async () => ({
+    reservationId: randomUUID(), ownershipToken: randomUUID(), fence: 1, sandboxResourceClass: null,
+    assertOwnership: async () => { ownershipChecks += 1; assert.equal(attemptStarted, true); throw new ExternalExecutionAuthorityError('execution_authority_expired'); },
+    beginProviderAttempt: async () => { attemptStarted = true; return 1; },
+    finishProviderAttempt: async (_ordinal, outcome) => { assert.equal(outcome, 'failed'); finished = true; },
+    renew: async () => undefined, complete: async (outcome) => { assert.equal(outcome, 'failed'); completed = true; },
+    meteredFetch: async () => { throw new Error('unexpected transport'); },
+  }) };
+  const provider = new GeminiInvestigationProvider('test-only-not-real-gemini-key', 'gemini-3.1-flash-lite', {
+    create: async () => { providerCalls += 1; throw new Error('provider transport must not start'); },
+  }, authority);
+  const session = provider.createSession({
+    instructions: 'test', initialInput: 'test', tools: [], conclusionSchema: { type: 'object' },
+    maxOutputTokens: 100, externalExecutionScope: { workspaceId: randomUUID(), operationCategory: 'gemini_investigation', providerId: 'google' },
+  });
+  await assert.rejects(session.next({ signal: new AbortController().signal }), /execution_authority_expired/);
+  assert.equal(ownershipChecks, 1); assert.equal(providerCalls, 0);
+  assert.equal(finished, true); assert.equal(completed, true);
+});
+
 async function addOperationGrant(value: Awaited<ReturnType<typeof seeded>>, scope: ExternalExecutionScope, overrides: Partial<typeof scopeLimits>) {
   const limits = { ...scopeLimits, ...overrides };
+  const expiresAt = new Date(value.now.getTime() + 24 * 60 * 60_000);
   await value.context.database.insert(executionBudgetGrant).values({
     id: randomUUID(), version: 2, scope: 'operation', workspaceId: scope.workspaceId,
     repairRunId: scope.repairRunId, githubRepositoryId: scope.githubRepositoryId, baseCommitSha: scope.baseCommitSha,
@@ -74,11 +98,11 @@ async function addOperationGrant(value: Awaited<ReturnType<typeof seeded>>, scop
     maxSandboxRuntimeMs: limits.sandboxRuntimeMs, sandboxResourceClass: limits.sandboxResourceClass,
     maxVerificationAttempts: limits.verificationAttempts,
     maxRepairLoopIterations: limits.repairLoopIterations, maxConcurrentExternalOperations: 0,
-    expiresAt: new Date('2026-09-24T10:00:00.000Z'), authorizedBy: 'test-operator', createdAt: value.now,
+    expiresAt, authorizedBy: 'test-operator', createdAt: value.now,
     grantIdentity: computeExecutionGrantIdentity({ version: 2, scope: 'operation', workspaceId: scope.workspaceId,
       repairRunId: scope.repairRunId ?? null, githubRepositoryId: scope.githubRepositoryId ?? null, baseCommitSha: scope.baseCommitSha ?? null,
       operationCategory: scope.operationCategory, providerId: scope.providerId, modelId: scope.modelId ?? null,
-      acceptancePurpose: null, limits, expiresAt: '2026-09-24T10:00:00.000Z', authorizedBy: 'test-operator',
+      acceptancePurpose: null, limits, expiresAt: expiresAt.toISOString(), authorizedBy: 'test-operator',
       authorizedReleaseSha: TEST_RELEASE_SHA, authorizedProviderAccountIdentity: testProviderAccount(scope.providerId) }),
   });
 }
@@ -221,7 +245,13 @@ for (const loss of ['expiry', 'revocation', 'terminated'] as const) test(`M7.7 l
   const permit = await authority.reserve({ scope: value.scope, amounts: amount() });
   const ordinal = await permit.beginProviderAttempt();
   await permit.finishProviderAttempt(ordinal, 'succeeded');
-  if (loss === 'expiry') value.now = new Date(value.now.getTime() + 1_001);
+  if (loss === 'expiry') {
+    const [lease] = await value.context.database.select().from(externalExecutionLease)
+      .where(eq(externalExecutionLease.reservationId, permit.reservationId));
+    assert.ok(lease);
+    value.now = new Date(lease.leaseExpiresAt.getTime() + 1);
+    await new Promise((resolve) => setTimeout(resolve, Math.max(0, lease.leaseExpiresAt.getTime() - Date.now() + 20)));
+  }
   else if (loss === 'revocation') await value.context.database.insert(executionBudgetGrantRevocation).values({
     id: randomUUID(), grantId: value.grantId, reasonCode: 'operator_revoked', revokedBy: 'test-operator', createdAt: value.now,
   });
@@ -240,7 +270,13 @@ for (const state of ['expired', 'terminated'] as const) test(`M7.7: unmatched at
   const value = await seeded({ runBound: true }); t.after(() => value.context.client.close());
   const authority = new DurableExternalExecutionAuthorizer(value.context.database, { clock: () => value.now, leaseMs: 1_000 });
   const permit = await authority.reserve({ scope: value.scope, amounts: amount() }); await permit.beginProviderAttempt();
-  if (state === 'expired') value.now = new Date(value.now.getTime() + 1_001);
+  if (state === 'expired') {
+    const [lease] = await value.context.database.select().from(externalExecutionLease)
+      .where(eq(externalExecutionLease.reservationId, permit.reservationId));
+    assert.ok(lease);
+    value.now = new Date(lease.leaseExpiresAt.getTime() + 1);
+    await new Promise((resolve) => setTimeout(resolve, Math.max(0, lease.leaseExpiresAt.getTime() - Date.now() + 20)));
+  }
   else await permit.complete('failed');
   const restarted = new DurableExternalExecutionAuthorizer(value.context.database, { clock: () => value.now });
   await assert.rejects(restarted.reserve({ scope: value.scope, amounts: amount() }), /provider_attempt_ambiguous/);
@@ -692,11 +728,12 @@ test('installed Sandbox retries cannot dispatch after revocation, cancellation, 
     try {
       const controller = new AbortController(); let calls = 0;
       t.mock.method(globalThis, 'fetch', async () => { throw new Error('unmetered transport'); });
-      const authority = new DurableExternalExecutionAuthorizer(value.context.database, { clock: () => value.now, fetch: async () => {
+      const authority = new DurableExternalExecutionAuthorizer(value.context.database, { clock: () => value.now,
+        ...(stop === 'expiry' ? { leaseMs: 1_000 } : {}), fetch: async () => {
         calls += 1;
         if (stop === 'revocation') await value.context.database.insert(executionBudgetGrantRevocation).values({ id: randomUUID(), grantId: value.grantId, revokedBy: 'test-operator', reasonCode: 'test', createdAt: value.now });
         if (stop === 'cancellation') controller.abort();
-        if (stop === 'expiry') value.now = new Date(value.now.getTime() + 16 * 60_000);
+        if (stop === 'expiry') await new Promise((resolve) => setTimeout(resolve, 1_100));
         return new Response('{}', { status: 503 });
       } });
       const permit = await authority.reserve({ scope: value.scope, amounts: amount({ providerAttempts: 3 }), sandbox: sandboxContext });
@@ -709,7 +746,7 @@ test('installed Sandbox retries cannot dispatch after revocation, cancellation, 
 
 async function seeded(options: { scope?: Partial<ExternalExecutionScope>; runBound?: boolean; concurrency?: number; expiresAt?: Date; limits?: Partial<typeof scopeLimits>; accountLimits?: Partial<typeof scopeLimits>; malformedOperationIdentity?: boolean } = {}) {
   const context = await createTestContext();
-  const now = new Date('2026-09-23T10:00:00.000Z');
+  const now = new Date();
   const userId = randomUUID();
   const workspaceId = randomUUID();
   await context.database.insert(user).values({ id: userId, name: 'operator', email: `${userId}@example.test`, emailVerified: true, createdAt: now, updatedAt: now });
@@ -722,7 +759,7 @@ async function seeded(options: { scope?: Partial<ExternalExecutionScope>; runBou
     profileIdentity: 'b'.repeat(64), baseCommitSha: scope.baseCommitSha, idempotencyKey: randomUUID(), state: 'created',
     stateChangedAt: now, updatedAt: now,
   });
-  const expiresAt = options.expiresAt ?? new Date('2026-09-24T10:00:00.000Z');
+  const expiresAt = options.expiresAt ?? new Date(now.getTime() + 24 * 60 * 60_000);
   const limits = { ...scopeLimits, ...options.limits };
   const accountId = randomUUID();
   const accountLimits = { ...scopeLimits, ...options.accountLimits, maxConcurrentExternalOperations: options.concurrency ?? 1 };
@@ -863,11 +900,13 @@ test('revocation or expiry after reservation prevents the next external attempt'
   await revokedPermit.complete('failed', 'execution_authority_missing');
   await revoked.context.client.close();
 
-  let current = new Date('2026-09-23T10:00:00.000Z');
-  const expired = await seeded({ expiresAt: new Date('2026-09-23T10:00:01.000Z') });
-  const expiredAuthority = new DurableExternalExecutionAuthorizer(expired.context.database, { clock: () => current });
+  const expired = await seeded({ expiresAt: new Date(Date.now() + 2_000) });
+  const expiredAuthority = new DurableExternalExecutionAuthorizer(expired.context.database, { clock: () => expired.now });
   const expiredPermit = await expiredAuthority.reserve({ scope: expired.scope, amounts: amount() });
-  current = new Date('2026-09-23T10:00:02.000Z');
+  const [expiredGrant] = await expired.context.database.select({ expiresAt: executionBudgetGrant.expiresAt })
+    .from(executionBudgetGrant).where(eq(executionBudgetGrant.id, expired.grantId));
+  assert.ok(expiredGrant);
+  await new Promise((resolve) => setTimeout(resolve, Math.max(0, expiredGrant.expiresAt.getTime() - Date.now() + 20)));
   await assert.rejects(expiredPermit.beginProviderAttempt(),
     (error: unknown) => error instanceof ExternalExecutionAuthorityError && error.code === 'execution_authority_expired');
   await expiredPermit.complete('failed', 'execution_authority_expired');
@@ -885,7 +924,7 @@ test('grant mismatch, revocation, expiry, and aggregate exhaustion fail closed',
   await assert.rejects(authority.reserve({ scope: wrong.scope, amounts: amount() }), (error: unknown) => error instanceof ExternalExecutionAuthorityError && error.code === 'execution_authority_missing');
   await wrong.context.client.close();
 
-  const expired = await seeded({ expiresAt: new Date('2026-09-23T09:00:00.000Z') });
+  const expired = await seeded({ expiresAt: new Date(Date.now() - 60_000) });
   await assert.rejects(new DurableExternalExecutionAuthorizer(expired.context.database, { clock: () => expired.now }).reserve({ scope: expired.scope, amounts: amount() }),
     (error: unknown) => error instanceof ExternalExecutionAuthorityError && error.code === 'execution_authority_expired');
   await expired.context.client.close();
@@ -930,6 +969,7 @@ test('one-shot live-acceptance authority binds one run, revision, purpose, and f
   const runId = seededValue.scope.repairRunId!; const baseCommitSha = seededValue.scope.baseCommitSha!; const repositoryId = seededValue.scope.githubRepositoryId!;
   const limits = { ...scopeLimits, logicalRequests: 1, providerAttempts: 0 };
   const grantId = randomUUID(); const purpose = 'task_4_3_live_acceptance';
+  const expiresAt = new Date(seededValue.now.getTime() + 24 * 60 * 60_000);
   await seededValue.context.database.insert(executionBudgetGrant).values({
     id: grantId, version: 2, scope: 'one_shot', workspaceId: seededValue.scope.workspaceId, repairRunId: runId,
     githubRepositoryId: repositoryId, baseCommitSha, operationCategory: 'release_acceptance_one_shot',
@@ -938,8 +978,8 @@ test('one-shot live-acceptance authority binds one run, revision, purpose, and f
     maxInputTokens: limits.inputTokens, maxOutputTokens: limits.outputTokens,
     maxSandboxIdentities: limits.sandboxIdentities, maxSandboxRuntimeMs: limits.sandboxRuntimeMs,
     maxVerificationAttempts: limits.verificationAttempts, maxRepairLoopIterations: limits.repairLoopIterations,
-    maxConcurrentExternalOperations: 0, expiresAt: new Date('2026-09-24T10:00:00.000Z'), authorizedBy: 'release-operator',
-    grantIdentity: computeExecutionGrantIdentity({ version: 2, scope: 'one_shot', workspaceId: seededValue.scope.workspaceId, repairRunId: runId, githubRepositoryId: repositoryId, baseCommitSha, operationCategory: 'release_acceptance_one_shot', providerId: 'vigilo', modelId: null, acceptancePurpose: purpose, limits, expiresAt: '2026-09-24T10:00:00.000Z', authorizedBy: 'release-operator', authorizedReleaseSha: TEST_RELEASE_SHA, authorizedProviderAccountIdentity: null }),
+    maxConcurrentExternalOperations: 0, expiresAt, authorizedBy: 'release-operator',
+    grantIdentity: computeExecutionGrantIdentity({ version: 2, scope: 'one_shot', workspaceId: seededValue.scope.workspaceId, repairRunId: runId, githubRepositoryId: repositoryId, baseCommitSha, operationCategory: 'release_acceptance_one_shot', providerId: 'vigilo', modelId: null, acceptancePurpose: purpose, limits, expiresAt: expiresAt.toISOString(), authorizedBy: 'release-operator', authorizedReleaseSha: TEST_RELEASE_SHA, authorizedProviderAccountIdentity: null }),
     createdAt: seededValue.now,
   });
   const authority = new DurableExternalExecutionAuthorizer(seededValue.context.database, { clock: () => seededValue.now });
@@ -965,12 +1005,16 @@ test('a rejected reservation transaction leaves no partial authority records or 
 });
 
 test('global semaphore fences concurrent queues and stale owners', async () => {
-  let now = new Date('2026-09-23T10:00:00.000Z');
   const seededValue = await seeded({ concurrency: 1 });
+  let now = seededValue.now;
   const authority = new DurableExternalExecutionAuthorizer(seededValue.context.database, { clock: () => now, leaseMs: 1_000 });
   const first = await authority.reserve({ scope: seededValue.scope, amounts: amount() });
   await assert.rejects(authority.reserve({ scope: seededValue.scope, amounts: amount() }), (error: unknown) => error instanceof ExternalExecutionAuthorityError && error.code === 'external_concurrency_unavailable');
-  now = new Date(now.getTime() + 2_000);
+  const [firstLease] = await seededValue.context.database.select().from(externalExecutionLease)
+    .where(eq(externalExecutionLease.reservationId, first.reservationId));
+  assert.ok(firstLease);
+  now = new Date(firstLease.leaseExpiresAt.getTime() + 1);
+  await new Promise((resolve) => setTimeout(resolve, Math.max(0, firstLease.leaseExpiresAt.getTime() - Date.now() + 20)));
   const successor = await authority.reserve({ scope: seededValue.scope, amounts: amount() });
   assert.ok(successor.fence > first.fence);
   const firstEvents = await seededValue.context.database.select({ type: externalExecutionEvent.eventType })
@@ -1021,13 +1065,12 @@ test('post-response token overage is reported as a stable exhausted-authority fa
 });
 
 test('a provider response arriving after lease expiry cannot become a successful outcome', async () => {
-  let current = new Date('2026-09-23T10:00:00.000Z');
   const seededValue = await seeded();
   const authority = new DurableExternalExecutionAuthorizer(seededValue.context.database, {
-    clock: () => current,
-    leaseMs: 1_000,
+    clock: () => seededValue.now,
+    leaseMs: 400,
     fetch: async () => {
-      current = new Date(current.getTime() + 2_000);
+      await new Promise((resolve) => setTimeout(resolve, 500));
       return new Response('{}', { status: 200 });
     },
   });

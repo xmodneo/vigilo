@@ -67,14 +67,18 @@ function hasValidAiAudit(input: AiAudit): input is Required<AiAudit> {
 async function assertActiveAiAttempt(database: VigiloDatabase, value: typeof investigation.$inferSelect, input: AiAudit) {
   if (!hasValidAiAudit(input)) return;
   if (input.aiCandidateGenerationId && input.aiCandidateGenerationAttemptId) {
-    const [generation] = await database.select({ id: aiCandidateGeneration.id }).from(aiCandidateGeneration).innerJoin(aiInvestigation, eq(aiInvestigation.id, aiCandidateGeneration.aiInvestigationId)).where(and(
+    const [generation] = await database.select({ id: aiCandidateGeneration.id }).from(aiCandidateGeneration).where(and(
       eq(aiCandidateGeneration.id, input.aiCandidateGenerationId), eq(aiCandidateGeneration.investigationId, value.id), eq(aiCandidateGeneration.workspaceId, value.workspaceId), eq(aiCandidateGeneration.state, 'generating'),
-      eq(aiInvestigation.state, 'completed'), eq(aiInvestigation.conclusionStatus, 'diagnosis_found'),
-    )).limit(1);
+    )).for('update').limit(1);
     if (!generation) throw new InvestigationContextError('invalid_context_request');
+    const [diagnosis] = await database.select({ id: aiInvestigation.id }).from(aiInvestigation)
+      .innerJoin(aiCandidateGeneration, eq(aiCandidateGeneration.aiInvestigationId, aiInvestigation.id))
+      .where(and(eq(aiCandidateGeneration.id, input.aiCandidateGenerationId), eq(aiInvestigation.state, 'completed'),
+        eq(aiInvestigation.conclusionStatus, 'diagnosis_found'))).limit(1);
+    if (!diagnosis) throw new InvestigationContextError('invalid_context_request');
     const [attempt] = await database.select({ id: aiCandidateGenerationAttempt.id }).from(aiCandidateGenerationAttempt).where(and(
       eq(aiCandidateGenerationAttempt.id, input.aiCandidateGenerationAttemptId), eq(aiCandidateGenerationAttempt.generationId, input.aiCandidateGenerationId),
-      eq(aiCandidateGenerationAttempt.ownershipToken, input.ownershipToken!), eq(aiCandidateGenerationAttempt.state, 'active'), gt(aiCandidateGenerationAttempt.leaseExpiresAt, new Date()),
+      eq(aiCandidateGenerationAttempt.ownershipToken, input.ownershipToken!), eq(aiCandidateGenerationAttempt.state, 'active'), gt(aiCandidateGenerationAttempt.leaseExpiresAt, sql`clock_timestamp()`),
     )).for('update').limit(1);
     if (!attempt) throw new InvestigationContextError('invalid_context_request');
     return;
@@ -82,14 +86,14 @@ async function assertActiveAiAttempt(database: VigiloDatabase, value: typeof inv
   const [modelRun] = await database.select({ id: aiInvestigation.id }).from(aiInvestigation).where(and(
     eq(aiInvestigation.id, input.aiInvestigationId), eq(aiInvestigation.investigationId, value.id),
     eq(aiInvestigation.workspaceId, value.workspaceId), eq(aiInvestigation.state, 'investigating'),
-  )).limit(1);
+  )).for('update').limit(1);
   if (!modelRun) throw new InvestigationContextError('invalid_context_request');
   const [attempt] = await database.select({ id: aiInvestigationAttempt.id }).from(aiInvestigationAttempt).where(and(
     eq(aiInvestigationAttempt.id, input.aiInvestigationAttemptId),
     eq(aiInvestigationAttempt.aiInvestigationId, input.aiInvestigationId),
     eq(aiInvestigationAttempt.ownershipToken, input.ownershipToken),
     eq(aiInvestigationAttempt.state, 'active'),
-    gt(aiInvestigationAttempt.leaseExpiresAt, new Date()),
+    gt(aiInvestigationAttempt.leaseExpiresAt, sql`clock_timestamp()`),
   )).for('update').limit(1);
   if (!attempt) throw new InvestigationContextError('invalid_context_request');
 }

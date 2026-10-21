@@ -45,8 +45,9 @@ export function verifyReviewedAuthoritySet(facts: {
   // An active global account grant could supplement the reviewed aggregate.
   // Historical expired/revoked accounts from other plans are not applicable.
   const applicableAccounts = accountGrants.filter((grant) =>
-    (!revokedGrantIds.has(grant.id) && grant.expiresAt > now) ||
-    (grant.authorizedBy === checkpoint.reviewedBy && grant.expiresAt.getTime() === expiry.getTime()));
+    !revokedGrantIds.has(grant.id) &&
+    (grant.expiresAt > now ||
+      (grant.authorizedBy === checkpoint.reviewedBy && grant.expiresAt.getTime() === expiry.getTime())));
   if (applicableAccounts.length !== 1) deny();
   const account = validAccount(applicableAccounts[0], now, revokedGrantIds);
   if (account.expiresAt.getTime() !== expiry.getTime() || account.authorizedBy !== checkpoint.reviewedBy) deny();

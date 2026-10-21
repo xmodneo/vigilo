@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 
-import { and, desc, eq, lte } from 'drizzle-orm';
+import { and, desc, eq, gt, lte, sql } from 'drizzle-orm';
 import type { JobResult } from 'pg-boss';
 
 import {
@@ -8,6 +8,7 @@ import {
   repairRun,
   repairRunAttempt,
   repairRunEvent,
+  repairRunSourceCheckpoint,
   repositoryBaseline,
   user,
   workspace,
@@ -17,7 +18,9 @@ import type { AuthenticatedWorkspace } from '../auth/protected-context.ts';
 import type { VigiloDatabase } from '../db/types.ts';
 import { DurableExternalExecutionAuthorizer } from '../external-execution/authority.ts';
 import { assertReviewedPlanIntegrity } from '../external-execution/reviewed-plan-integrity.ts';
+import { isReviewedStagingPlanIdentity } from '../external-execution/reviewed-plan.ts';
 import { assertRunBusinessAllowed, lockExternalExecution } from '../external-execution/business-fence.ts';
+import { freshDatabaseTime } from '../external-execution/database-clock.ts';
 import { ExternalExecutionAuthorityError, type ExternalExecutionAuthorizer } from '../external-execution/types.ts';
 import type { GitHubAppConfiguration } from '../github-app/types.ts';
 import { assertPublicRepositoryAuthority } from '../github-repositories/policy.ts';
@@ -68,6 +71,7 @@ export interface RepairWorkerDependencies {
   baselineExecutor?: BaselineExecutor;
   clock?: () => Date;
   randomId?: () => string;
+  reviewedOneShot?: { repairRunId: string; planIdentity: string };
   recover?: Recovery;
   executionAuthority?: ExternalExecutionAuthorizer;
   runtimeReleaseSha?: string;
@@ -80,7 +84,6 @@ type Claim =
   | { kind: 'exhausted'; attempt: StoredAttempt | null; run: StoredRun }
   | { kind: 'terminal'; run: StoredRun };
 
-const leaseEnd = (now: Date) => new Date(now.getTime() + LEASE_MS);
 
 function safeFailureCode(error: unknown): string {
   if (error && typeof error === 'object' && 'code' in error && typeof error.code === 'string' && /^[a-z_]{1,64}$/.test(error.code)) return error.code;
@@ -126,11 +129,11 @@ async function claimAttempt(
   database: VigiloDatabase,
   runId: string,
   queueJobId: string,
-  now: Date,
   randomId: () => string,
 ): Promise<Claim> {
   return database.transaction(async (transaction) => {
     await lockExternalExecution(transaction);
+    const now = await freshDatabaseTime(transaction);
     const [run] = await transaction.select().from(repairRun).where(eq(repairRun.id, runId)).limit(1);
     if (!run) throw new Error('run_not_found');
     if (!['created', 'baseline_running'].includes(run.state)) return { kind: 'terminal', run };
@@ -144,15 +147,15 @@ async function claimAttempt(
       const ownershipToken = randomId();
       const [recovered] = await transaction.update(repairRunAttempt).set({
         ownershipToken,
-        heartbeatAt: now,
-        leaseExpiresAt: leaseEnd(now),
+        heartbeatAt: sql`clock_timestamp()`,
+        leaseExpiresAt: sql`clock_timestamp() + interval '90 seconds'`,
         failureClassification: 'process_loss',
         failureCode: 'stale_worker_recovery',
       }).where(and(
         eq(repairRunAttempt.id, active.id),
         eq(repairRunAttempt.ownershipToken, active.ownershipToken),
         eq(repairRunAttempt.state, 'active'),
-        lte(repairRunAttempt.leaseExpiresAt, now),
+        lte(repairRunAttempt.leaseExpiresAt, sql`clock_timestamp()`),
       )).returning();
       return recovered ? { kind: 'attempt', attempt: recovered, recovered: true, run } : { kind: 'busy', run };
     }
@@ -194,28 +197,30 @@ async function claimAttempt(
       expectedBaselineId: randomId(),
       ownershipToken,
       state: 'active',
-      claimedAt: now,
-      heartbeatAt: now,
-      leaseExpiresAt: leaseEnd(now),
+      claimedAt: sql`clock_timestamp()`,
+      heartbeatAt: sql`clock_timestamp()`,
+      leaseExpiresAt: sql`clock_timestamp() + interval '90 seconds'`,
     }).onConflictDoNothing().returning();
     return attempt ? { kind: 'attempt', attempt, recovered: false, run } : { kind: 'busy', run };
   });
 }
 
-async function renewAttempt(database: VigiloDatabase, attempt: StoredAttempt, now: Date): Promise<void> {
-  const [updated] = await database.update(repairRunAttempt).set({ heartbeatAt: now, leaseExpiresAt: leaseEnd(now) }).where(and(
+async function renewAttempt(database: VigiloDatabase, attempt: StoredAttempt, _now: Date): Promise<void> {
+  const [updated] = await database.update(repairRunAttempt).set({ heartbeatAt: sql`clock_timestamp()`, leaseExpiresAt: sql`clock_timestamp() + ${LEASE_MS} * interval '1 millisecond'` }).where(and(
     eq(repairRunAttempt.id, attempt.id),
     eq(repairRunAttempt.ownershipToken, attempt.ownershipToken),
     eq(repairRunAttempt.state, 'active'),
+    gt(repairRunAttempt.leaseExpiresAt, sql`clock_timestamp()`),
   )).returning({ id: repairRunAttempt.id });
   if (!updated) throw Object.assign(new Error('attempt_ownership_lost'), { code: 'attempt_ownership_lost' });
 }
 
-async function updateSandboxFacts(database: VigiloDatabase, attempt: StoredAttempt, values: Partial<typeof repairRunAttempt.$inferInsert>, now: Date): Promise<void> {
-  const [updated] = await database.update(repairRunAttempt).set({ ...values, heartbeatAt: now, leaseExpiresAt: leaseEnd(now) }).where(and(
+async function updateSandboxFacts(database: VigiloDatabase, attempt: StoredAttempt, values: Partial<typeof repairRunAttempt.$inferInsert>, _now: Date): Promise<void> {
+  const [updated] = await database.update(repairRunAttempt).set({ ...values, heartbeatAt: sql`clock_timestamp()`, leaseExpiresAt: sql`clock_timestamp() + ${LEASE_MS} * interval '1 millisecond'` }).where(and(
     eq(repairRunAttempt.id, attempt.id),
     eq(repairRunAttempt.ownershipToken, attempt.ownershipToken),
     eq(repairRunAttempt.state, 'active'),
+    gt(repairRunAttempt.leaseExpiresAt, sql`clock_timestamp()`),
   )).returning({ id: repairRunAttempt.id });
   if (!updated) throw Object.assign(new Error('attempt_ownership_lost'), { code: 'attempt_ownership_lost' });
 }
@@ -247,6 +252,7 @@ async function finishAttempt(
     eq(repairRunAttempt.id, attempt.id),
     eq(repairRunAttempt.ownershipToken, attempt.ownershipToken),
     eq(repairRunAttempt.state, 'active'),
+    gt(repairRunAttempt.leaseExpiresAt, sql`clock_timestamp()`),
   )).returning({ id: repairRunAttempt.id });
   return Boolean(updated);
 }
@@ -291,7 +297,7 @@ async function finalizeFromEvidence(
   }
 
   const code = evidence.errorCode && TERMINAL_EXECUTION_CODES.has(evidence.errorCode) ? evidence.errorCode : evidence.overallOutcome === 'cancelled' ? 'worker_interrupted' : evidence.overallOutcome;
-  const exhausted = attempt.attemptNumber >= REPAIR_JOB_MAX_ATTEMPTS || TERMINAL_EXECUTION_CODES.has(code);
+  const exhausted = dependencies.reviewedOneShot !== undefined || attempt.attemptNumber >= REPAIR_JOB_MAX_ATTEMPTS || TERMINAL_EXECUTION_CODES.has(code);
   const state = exhausted ? 'exhausted' : 'retryable_failed';
   const owned = await finishAttempt(dependencies.database, attempt, now, {
     state,
@@ -477,7 +483,7 @@ async function executeAttempt(dependencies: RepairWorkerDependencies, run: Store
     const now = (dependencies.clock ?? (() => new Date()))();
     const safeCode = safeFailureCode(error);
     const code = TERMINAL_EXECUTION_CODES.has(safeCode) ? safeCode : controller.signal.aborted ? 'worker_interrupted' : safeCode;
-    const exhausted = attempt.attemptNumber >= REPAIR_JOB_MAX_ATTEMPTS || code === 'attempt_ownership_lost' || TERMINAL_EXECUTION_CODES.has(code);
+    const exhausted = dependencies.reviewedOneShot !== undefined || attempt.attemptNumber >= REPAIR_JOB_MAX_ATTEMPTS || code === 'attempt_ownership_lost' || TERMINAL_EXECUTION_CODES.has(code);
     const owned = await finishAttempt(dependencies.database, attempt, now, {
       state: exhausted ? 'exhausted' : 'retryable_failed',
       failureClassification: 'infrastructure_failure',
@@ -515,9 +521,20 @@ export async function processRepairJob(job: RepairQueueJob, dependencies: Repair
     dependencies.logger.write({ event: 'job_rejected', runId: payload.repairRunId, code: 'run_not_found' });
     return { id: job.id, status: 'deadletter', output: { code: 'run_not_found' } };
   }
+  const [checkpoint] = await dependencies.database.select({ planIdentity: repairRunSourceCheckpoint.planIdentity })
+    .from(repairRunSourceCheckpoint).where(eq(repairRunSourceCheckpoint.repairRunId, existing.id)).limit(1);
+  if (checkpoint && isReviewedStagingPlanIdentity(checkpoint.planIdentity) &&
+      (dependencies.reviewedOneShot?.repairRunId !== existing.id || dependencies.reviewedOneShot.planIdentity !== checkpoint.planIdentity)) {
+    dependencies.logger.write({ event: 'job_rejected', runId: existing.id, code: 'reviewed_one_shot_required' });
+    return { id: job.id, status: 'deadletter', output: { code: 'reviewed_one_shot_required' } };
+  }
+  if (dependencies.reviewedOneShot && (!checkpoint || dependencies.reviewedOneShot.repairRunId !== existing.id ||
+      dependencies.reviewedOneShot.planIdentity !== checkpoint.planIdentity)) {
+    return { id: job.id, status: 'deadletter', output: { code: 'reviewed_plan_mismatch' } };
+  }
   try { await assertPublicRepositoryAuthority(dependencies.database, existing.workspaceId, existing.githubRepositoryId); }
   catch { return { id: job.id, status: 'deadletter', output: { code: 'private_repository_not_supported' } }; }
-  const claim = await claimAttempt(dependencies.database, existing.id, job.id, (dependencies.clock ?? (() => new Date()))(), dependencies.randomId ?? randomUUID);
+  const claim = await claimAttempt(dependencies.database, existing.id, job.id, dependencies.randomId ?? randomUUID);
   if (claim.kind === 'terminal') return { id: job.id, status: 'completed' };
   if (claim.kind === 'busy') return { id: job.id, status: 'failed', output: { code: 'active_attempt' } };
   if (claim.kind === 'exhausted') {

@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 
-import { and, desc, eq, lte } from 'drizzle-orm';
+import { and, desc, eq, gt, lte, sql } from 'drizzle-orm';
 import type { JobResult } from 'pg-boss';
 
 import {
@@ -16,6 +16,7 @@ import { recoverSandbox, type SandboxLifecycleObserver } from '../../src/sandbox
 import type { VigiloDatabase } from '../db/types.ts';
 import { DurableExternalExecutionAuthorizer } from '../external-execution/authority.ts';
 import { assertRunBusinessAllowed, lockExternalExecution } from '../external-execution/business-fence.ts';
+import { freshDatabaseTime } from '../external-execution/database-clock.ts';
 import { executionGrantIdentityMatches } from '../external-execution/identity.ts';
 import { ExternalExecutionAuthorityError, type ExternalExecutionAuthorizer } from '../external-execution/types.ts';
 import type { GitHubAppConfiguration } from '../github-app/types.ts';
@@ -57,7 +58,6 @@ type Claim =
   | { kind: 'terminal'; verification: VerificationRow }
   | { kind: 'exhausted'; verification: VerificationRow; attempt: AttemptRow | null };
 
-const leaseEnd = (now: Date) => new Date(now.getTime() + LEASE_MS);
 
 function safeCode(error: unknown, aborted = false): string {
   if (error instanceof ExternalExecutionAuthorityError) return error.code;
@@ -104,9 +104,10 @@ async function assertVerificationClaimAllowed(database: VigiloDatabase, verifica
   }
 }
 
-async function claimAttempt(database: VigiloDatabase, verificationId: string, queueJobId: string, now: Date, randomId: () => string): Promise<Claim> {
+async function claimAttempt(database: VigiloDatabase, verificationId: string, queueJobId: string, randomId: () => string): Promise<Claim> {
   return database.transaction(async (transaction) => {
     await lockExternalExecution(transaction);
+    const now = await freshDatabaseTime(transaction);
     const [verification] = await transaction.select().from(candidateVerification).where(eq(candidateVerification.id, verificationId)).limit(1);
     if (!verification) throw new Error('verification_not_found');
     if (['completed', 'infrastructure_failed', 'cancelled'].includes(verification.state)) return { kind: 'terminal', verification };
@@ -120,16 +121,20 @@ async function claimAttempt(database: VigiloDatabase, verificationId: string, qu
         try { await assertRunBusinessAllowed(transaction, { workspaceId: verification.workspaceId, repairRunId: verification.repairRunId }, now); }
         catch (error) {
           if (!(error instanceof ExternalExecutionAuthorityError)) throw error;
-          await transaction.update(candidateVerificationAttempt).set({ state: 'exhausted', failureCode: error.code, leaseExpiresAt: null, finishedAt: now }).where(eq(candidateVerificationAttempt.id, active.id));
+          const [exhausted] = await transaction.update(candidateVerificationAttempt).set({ state: 'exhausted', failureCode: error.code, leaseExpiresAt: null, finishedAt: now }).where(and(
+            eq(candidateVerificationAttempt.id, active.id), eq(candidateVerificationAttempt.ownershipToken, active.ownershipToken),
+            eq(candidateVerificationAttempt.state, 'active'), lte(candidateVerificationAttempt.leaseExpiresAt, sql`clock_timestamp()`),
+          )).returning({ id: candidateVerificationAttempt.id });
+          if (!exhausted) return { kind: 'busy', verification };
           await transaction.update(candidateVerification).set({ state: 'infrastructure_failed', verificationContract: 'infrastructure_failed', baselineComparison: 'not_comparable', failureCode: error.code, completedAt: now, updatedAt: now }).where(eq(candidateVerification.id, verification.id));
           await transaction.insert(candidateVerificationEvent).values({ id: randomId(), verificationId: verification.id, workspaceId: verification.workspaceId, fromState: 'verifying', toState: 'infrastructure_failed', verificationContract: 'infrastructure_failed', baselineComparison: 'not_comparable', failureCode: error.code, createdAt: now });
           return { kind: 'terminal', verification };
         }
       }
       const ownershipToken = randomId();
-      const [recovered] = await transaction.update(candidateVerificationAttempt).set({ ownershipToken, heartbeatAt: now, leaseExpiresAt: leaseEnd(now), failureCode: 'stale_worker_recovery' }).where(and(
+      const [recovered] = await transaction.update(candidateVerificationAttempt).set({ ownershipToken, heartbeatAt: sql`clock_timestamp()`, leaseExpiresAt: sql`clock_timestamp() + interval '90 seconds'`, failureCode: 'stale_worker_recovery' }).where(and(
         eq(candidateVerificationAttempt.id, active.id), eq(candidateVerificationAttempt.ownershipToken, active.ownershipToken),
-        eq(candidateVerificationAttempt.state, 'active'), lte(candidateVerificationAttempt.leaseExpiresAt, now),
+        eq(candidateVerificationAttempt.state, 'active'), lte(candidateVerificationAttempt.leaseExpiresAt, sql`clock_timestamp()`),
       )).returning();
       if (!recovered) return { kind: 'busy', verification };
       return existingEvidence ? { kind: 'reconcile', verification, attempt: recovered } : { kind: 'attempt', verification, attempt: recovered, recovered: true };
@@ -155,23 +160,23 @@ async function claimAttempt(database: VigiloDatabase, verificationId: string, qu
     }
     const [attempt] = await transaction.insert(candidateVerificationAttempt).values({
       id: randomId(), verificationId: verification.id, queueJobId, attemptNumber: (latest?.attemptNumber ?? 0) + 1,
-      expectedEvidenceId: randomId(), ownershipToken: randomId(), state: 'active', claimedAt: now,
-      heartbeatAt: now, leaseExpiresAt: leaseEnd(now),
+      expectedEvidenceId: randomId(), ownershipToken: randomId(), state: 'active', claimedAt: sql`clock_timestamp()`,
+      heartbeatAt: sql`clock_timestamp()`, leaseExpiresAt: sql`clock_timestamp() + interval '90 seconds'`,
     }).onConflictDoNothing().returning();
     return attempt ? { kind: 'attempt', verification, attempt, recovered: false } : { kind: 'busy', verification };
   });
 }
 
-async function renew(database: VigiloDatabase, attempt: AttemptRow, now: Date): Promise<void> {
-  const [updated] = await database.update(candidateVerificationAttempt).set({ heartbeatAt: now, leaseExpiresAt: leaseEnd(now) }).where(and(
-    eq(candidateVerificationAttempt.id, attempt.id), eq(candidateVerificationAttempt.ownershipToken, attempt.ownershipToken), eq(candidateVerificationAttempt.state, 'active'),
+async function renew(database: VigiloDatabase, attempt: AttemptRow, _now: Date): Promise<void> {
+  const [updated] = await database.update(candidateVerificationAttempt).set({ heartbeatAt: sql`clock_timestamp()`, leaseExpiresAt: sql`clock_timestamp() + ${LEASE_MS} * interval '1 millisecond'` }).where(and(
+    eq(candidateVerificationAttempt.id, attempt.id), eq(candidateVerificationAttempt.ownershipToken, attempt.ownershipToken), eq(candidateVerificationAttempt.state, 'active'), gt(candidateVerificationAttempt.leaseExpiresAt, sql`clock_timestamp()`),
   )).returning({ id: candidateVerificationAttempt.id });
   if (!updated) throw Object.assign(new Error('verification_ownership_lost'), { code: 'verification_ownership_lost' });
 }
 
-async function updateSandbox(database: VigiloDatabase, attempt: AttemptRow, values: Partial<typeof candidateVerificationAttempt.$inferInsert>, now: Date): Promise<void> {
-  const [updated] = await database.update(candidateVerificationAttempt).set({ ...values, heartbeatAt: now, leaseExpiresAt: leaseEnd(now) }).where(and(
-    eq(candidateVerificationAttempt.id, attempt.id), eq(candidateVerificationAttempt.ownershipToken, attempt.ownershipToken), eq(candidateVerificationAttempt.state, 'active'),
+async function updateSandbox(database: VigiloDatabase, attempt: AttemptRow, values: Partial<typeof candidateVerificationAttempt.$inferInsert>, _now: Date): Promise<void> {
+  const [updated] = await database.update(candidateVerificationAttempt).set({ ...values, heartbeatAt: sql`clock_timestamp()`, leaseExpiresAt: sql`clock_timestamp() + ${LEASE_MS} * interval '1 millisecond'` }).where(and(
+    eq(candidateVerificationAttempt.id, attempt.id), eq(candidateVerificationAttempt.ownershipToken, attempt.ownershipToken), eq(candidateVerificationAttempt.state, 'active'), gt(candidateVerificationAttempt.leaseExpiresAt, sql`clock_timestamp()`),
   )).returning({ id: candidateVerificationAttempt.id });
   if (!updated) throw Object.assign(new Error('verification_ownership_lost'), { code: 'verification_ownership_lost' });
 }
@@ -184,7 +189,7 @@ async function finishAttempt(database: VigiloDatabase, attempt: AttemptRow, now:
     state: values.state, evidenceId: values.evidenceId ?? null, failureCode: values.failureCode ?? null,
     cleanupStop: values.cleanup?.stop ?? null, cleanupDelete: values.cleanup?.delete ?? null, cleanupLookup: values.cleanup?.lookup ?? null,
     heartbeatAt: now, leaseExpiresAt: null, finishedAt: now,
-  }).where(and(eq(candidateVerificationAttempt.id, attempt.id), eq(candidateVerificationAttempt.ownershipToken, attempt.ownershipToken), eq(candidateVerificationAttempt.state, 'active'))).returning({ id: candidateVerificationAttempt.id });
+  }).where(and(eq(candidateVerificationAttempt.id, attempt.id), eq(candidateVerificationAttempt.ownershipToken, attempt.ownershipToken), eq(candidateVerificationAttempt.state, 'active'), gt(candidateVerificationAttempt.leaseExpiresAt, sql`clock_timestamp()`))).returning({ id: candidateVerificationAttempt.id });
   return Boolean(updated);
 }
 
@@ -281,7 +286,7 @@ export async function processCandidateVerificationJob(job: RepairQueueJob, depen
   catch { return { id: job.id, status: 'deadletter', output: { code: 'invalid_candidate_verification_job_payload' } }; }
   const now = (dependencies.clock ?? (() => new Date()))();
   let claim: Claim;
-  try { claim = await claimAttempt(dependencies.database, payload.verificationId, job.id, now, dependencies.randomId ?? randomUUID); }
+  try { claim = await claimAttempt(dependencies.database, payload.verificationId, job.id, dependencies.randomId ?? randomUUID); }
   catch { return { id: job.id, status: 'deadletter', output: { code: 'verification_not_found' } }; }
   if (claim.kind === 'terminal') return { id: job.id, status: 'completed' };
   if (claim.kind === 'busy') return { id: job.id, status: 'failed', output: { code: 'active_verification_attempt' } };

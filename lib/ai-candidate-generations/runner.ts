@@ -1,10 +1,11 @@
 import { randomUUID } from 'node:crypto';
 
-import { and, eq, gt } from 'drizzle-orm';
+import { and, eq, gt, sql } from 'drizzle-orm';
 
 import { aiCandidateGeneration, aiCandidateGenerationAttempt, aiInvestigation, candidateVerification, candidateVerificationEvidence, executionProfile, investigation, investigationContextEvent, repairCandidate, repairCandidateFile, repairIntent, repairLoopIteration, repositoryBaseline } from '../../db/schema.ts';
 import type { InvestigationModelProvider, ModelProviderFailureCode, ToolName } from '../ai-investigations/types.ts';
 import { ModelProviderError } from '../ai-investigations/types.ts';
+import { modelRequestKey } from '../ai-investigations/model-request-key.ts';
 import type { VigiloDatabase } from '../db/types.ts';
 import type { GitHubAppConfiguration } from '../github-app/types.ts';
 import { InvestigationContextError, listPaths, readBaselineSummary, readTextFile, searchText } from '../investigations/context.ts';
@@ -129,12 +130,16 @@ export async function runAiCandidateGeneration(database: VigiloDatabase, gateway
   let turns = authority.generation.modelTurnCount;
   const usage = () => ({ inputTokens, outputTokens, toolCallCount: calls, modelTurnCount: turns });
   const assertOwnership = async () => {
-    const [owned] = await database.select({ id: aiCandidateGenerationAttempt.id }).from(aiCandidateGenerationAttempt).innerJoin(aiCandidateGeneration, and(eq(aiCandidateGeneration.id, aiCandidateGenerationAttempt.generationId), eq(aiCandidateGeneration.state, 'generating'))).where(and(eq(aiCandidateGenerationAttempt.id, input.generationAttemptId), eq(aiCandidateGenerationAttempt.generationId, input.generationId), eq(aiCandidateGenerationAttempt.ownershipToken, input.ownershipToken), eq(aiCandidateGenerationAttempt.state, 'active'), gt(aiCandidateGenerationAttempt.leaseExpiresAt, new Date()))).limit(1);
+    const [owned] = await database.select({ id: aiCandidateGenerationAttempt.id }).from(aiCandidateGenerationAttempt).innerJoin(aiCandidateGeneration, and(eq(aiCandidateGeneration.id, aiCandidateGenerationAttempt.generationId), eq(aiCandidateGeneration.state, 'generating'))).where(and(eq(aiCandidateGenerationAttempt.id, input.generationAttemptId), eq(aiCandidateGenerationAttempt.generationId, input.generationId), eq(aiCandidateGenerationAttempt.ownershipToken, input.ownershipToken), eq(aiCandidateGenerationAttempt.state, 'active'), gt(aiCandidateGenerationAttempt.leaseExpiresAt, sql`clock_timestamp()`))).limit(1);
     if (!owned) throw new AiCandidateGenerationError('candidate_generation_ownership_lost');
   };
   const persistUsage = async () => {
     await database.transaction(async (transaction) => {
-      const [owned] = await transaction.select({ id: aiCandidateGenerationAttempt.id }).from(aiCandidateGenerationAttempt).innerJoin(aiCandidateGeneration, and(eq(aiCandidateGeneration.id, aiCandidateGenerationAttempt.generationId), eq(aiCandidateGeneration.state, 'generating'))).where(and(eq(aiCandidateGenerationAttempt.id, input.generationAttemptId), eq(aiCandidateGenerationAttempt.generationId, input.generationId), eq(aiCandidateGenerationAttempt.ownershipToken, input.ownershipToken), eq(aiCandidateGenerationAttempt.state, 'active'), gt(aiCandidateGenerationAttempt.leaseExpiresAt, new Date()))).for('update').limit(1);
+      const [parent] = await transaction.select({ id: aiCandidateGeneration.id }).from(aiCandidateGeneration)
+        .where(and(eq(aiCandidateGeneration.id, input.generationId), eq(aiCandidateGeneration.state, 'generating'))).for('update').limit(1);
+      if (!parent) throw new AiCandidateGenerationError('candidate_generation_ownership_lost');
+      const [owned] = await transaction.select({ id: aiCandidateGenerationAttempt.id }).from(aiCandidateGenerationAttempt)
+        .where(and(eq(aiCandidateGenerationAttempt.id, input.generationAttemptId), eq(aiCandidateGenerationAttempt.generationId, input.generationId), eq(aiCandidateGenerationAttempt.ownershipToken, input.ownershipToken), eq(aiCandidateGenerationAttempt.state, 'active'), gt(aiCandidateGenerationAttempt.leaseExpiresAt, sql`clock_timestamp()`))).for('update').limit(1);
       if (!owned) throw new AiCandidateGenerationError('candidate_generation_ownership_lost');
       const [updated] = await transaction.update(aiCandidateGeneration).set({ ...usage(), updatedAt: new Date() }).where(and(eq(aiCandidateGeneration.id, input.generationId), eq(aiCandidateGeneration.state, 'generating'))).returning({ id: aiCandidateGeneration.id });
       if (!updated) throw new AiCandidateGenerationError('candidate_generation_ownership_lost');
@@ -163,7 +168,7 @@ export async function runAiCandidateGeneration(database: VigiloDatabase, gateway
     turns += 1;
     await persistUsage();
     let turn;
-    try { turn = await session.next({ ...(outputs ? { toolOutputs: outputs } : {}), ...(finalization ? { finalization: true } : {}), signal: controller.signal }); }
+    try { turn = await session.next({ ...(outputs ? { toolOutputs: outputs } : {}), ...(finalization ? { finalization: true } : {}), operationKey: modelRequestKey(input.generationAttemptId, turns), signal: controller.signal }); }
     catch (error) {
       if (error instanceof ExternalExecutionAuthorityError) throw error;
       if (controller.signal.aborted) throw new AiCandidateGenerationError('model_timeout');

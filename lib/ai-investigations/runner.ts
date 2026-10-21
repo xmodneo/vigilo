@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 
-import { and, eq, gt } from 'drizzle-orm';
+import { and, eq, gt, sql } from 'drizzle-orm';
 
 import { aiInvestigation, aiInvestigationAttempt, executionProfile, investigation, repairIntent, repositoryBaseline } from '../../db/schema.ts';
 import type { VigiloDatabase } from '../db/types.ts';
@@ -10,6 +10,7 @@ import type { InvestigationSourceGateway } from '../investigations/types.ts';
 import { buildInitialInput, CONCLUSION_SCHEMA, encodeToolOutput, MODEL_INSTRUCTIONS, MODEL_TOOLS, parseConclusion, parseToolArguments } from './protocol.ts';
 import { AI_LIMITS, ModelProviderError, type InvestigationConclusion, type InvestigationModelProvider, type ModelProviderFailureCode, type ToolName } from './types.ts';
 import { ExternalExecutionAuthorityError, type ExternalExecutionFailureCode } from '../external-execution/types.ts';
+import { modelRequestKey } from './model-request-key.ts';
 
 export type AiAgentErrorCode =
   | 'private_repository_not_supported'
@@ -112,7 +113,7 @@ export async function runAiInvestigation(
       eq(aiInvestigationAttempt.aiInvestigationId, input.aiInvestigationId),
       eq(aiInvestigationAttempt.ownershipToken, input.ownershipToken),
       eq(aiInvestigationAttempt.state, 'active'),
-      gt(aiInvestigationAttempt.leaseExpiresAt, new Date()),
+      gt(aiInvestigationAttempt.leaseExpiresAt, sql`clock_timestamp()`),
     )).limit(1);
     if (!owned) throw new AiAgentError('ai_investigation_ownership_lost');
   };
@@ -133,7 +134,7 @@ export async function runAiInvestigation(
     if (controller.signal.aborted) throw new AiAgentError('model_timeout');
     await assertOwnership();
     let turn;
-    try { turn = await session.next({ ...(outputs ? { toolOutputs: outputs } : {}), ...(finalization ? { finalization: true } : {}), signal: controller.signal }); }
+    try { turn = await session.next({ ...(outputs ? { toolOutputs: outputs } : {}), ...(finalization ? { finalization: true } : {}), operationKey: modelRequestKey(input.aiInvestigationAttemptId, turns + 1), signal: controller.signal }); }
     catch (error) {
       if (error instanceof ExternalExecutionAuthorityError) throw error;
       if (controller.signal.aborted) throw new AiAgentError('model_timeout');

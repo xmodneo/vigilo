@@ -42,7 +42,8 @@ import type { RepairQueueJob } from '../lib/repair-runs/queue.ts';
 import type { SourceManifest } from '../lib/repository-baselines/runner.ts';
 import { createTestContext, saveGithubUser } from './support.ts';
 
-const NOW = new Date('2026-09-10T12:00:00.000Z');
+// Keep synthetic grants live against PostgreSQL's real authority clock.
+const NOW = new Date();
 const COMMIT = 'a'.repeat(40);
 const REPOSITORY_ID = 81_001;
 const INSTALLATION_ID = 91_001;
@@ -330,8 +331,8 @@ test('expired unmatched provider start blocks stale verification restart without
   await context.database.update(candidateVerification).set({ state: 'verifying', verificationStartedAt: NOW }).where(eq(candidateVerification.id, verification.id));
   await context.database.insert(candidateVerificationAttempt).values({ id: randomUUID(), verificationId: verification.id, queueJobId: verification.id,
     attemptNumber: 1, expectedEvidenceId: randomUUID(), ownershipToken: randomUUID(), state: 'active', claimedAt: NOW, heartbeatAt: NOW,
-    leaseExpiresAt: new Date(NOW.getTime() + 90_000) });
-  const permit = await new DurableExternalExecutionAuthorizer(context.database, { clock: () => NOW, runtimeReleaseSha: 'd'.repeat(40) }).reserve({
+    leaseExpiresAt: new Date(Date.now() - 1_000) });
+  const permit = await new DurableExternalExecutionAuthorizer(context.database, { clock: () => NOW, leaseMs: 10, runtimeReleaseSha: 'd'.repeat(40) }).reserve({
     scope: { workspaceId: owner.workspace.id, repairRunId: seeded.runId, githubRepositoryId: REPOSITORY_ID, baseCommitSha: COMMIT,
       operationCategory: 'sandbox_verification', providerId: 'vercel' },
     amounts: { logicalRequests: 1, providerAttempts: 1, inputTokens: 0, outputTokens: 0, sandboxIdentities: 0, sandboxRuntimeMs: 0,
@@ -339,6 +340,7 @@ test('expired unmatched provider start blocks stale verification restart without
     sandbox: { name: 'unresolved-verifier', projectId: 'project_test', teamId: 'team_test' },
     providerAccountIdentity: vercelTeamProjectIdentity('team_test', 'project_test') });
   await permit.beginProviderAttempt(); // Lost ownership before any trustworthy outcome was persisted.
+  await new Promise((resolve) => setTimeout(resolve, 20));
   let executions = 0;
   const result = await processCandidateVerificationJob(job(verification.id), { configuration: CONFIGURATION, database: context.database, gateway: new Gateway(), logger,
     executor: (async () => { executions++; throw new Error('must not execute'); }) as never, clock: () => new Date(NOW.getTime() + 16 * 60_000) });
@@ -389,6 +391,29 @@ test('duplicate delivery has one owner and a stale worker cannot persist evidenc
   await started; const duplicate = await processCandidateVerificationJob(job(verification.id), { configuration: CONFIGURATION, database: context.database, gateway: new Gateway(), logger, executor: executor as never, clock: () => NOW });
   assert.deepEqual(duplicate.output, { code: 'active_verification_attempt' }); const [attempt] = await context.database.select().from(candidateVerificationAttempt); await context.database.update(candidateVerificationAttempt).set({ ownershipToken: randomUUID() }).where(eq(candidateVerificationAttempt.id, attempt!.id)); release();
   assert.deepEqual((await first).output, { code: 'verification_ownership_lost' }); assert.equal((await context.database.select().from(candidateVerificationEvidence)).length, 0);
+});
+
+test('an expired verification lease cannot be renewed or finalized after execution', async (t) => {
+  const context = await createTestContext(); t.after(() => context.client.close());
+  const owner = await authenticated(context); const seeded = await seed(context, owner);
+  const verification = await startCandidateVerification(context.database, owner, seeded.candidateId, new MemoryQueue());
+  let entered!: () => void; let release!: () => void;
+  const started = new Promise<void>((resolve) => { entered = resolve; });
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  let calls = 0;
+  const executor = async () => { calls += 1; entered(); await gate; throw new Error('controlled_failure'); };
+  const running = processCandidateVerificationJob(job(verification.id), { configuration: CONFIGURATION, database: context.database,
+    gateway: new Gateway(), logger, executor: executor as never, clock: () => NOW });
+  await started;
+  const [attempt] = await context.database.select().from(candidateVerificationAttempt).where(eq(candidateVerificationAttempt.verificationId, verification.id));
+  assert.ok(attempt);
+  await context.database.update(candidateVerificationAttempt).set({ leaseExpiresAt: new Date(Date.now() - 1_000) })
+    .where(eq(candidateVerificationAttempt.id, attempt.id));
+  release();
+  assert.deepEqual((await running).output, { code: 'verification_ownership_lost' });
+  assert.equal(calls, 1);
+  assert.equal((await context.database.select().from(candidateVerificationAttempt)).length, 1);
+  assert.equal((await getCandidateVerification(context.database, owner, verification.id))?.state, 'verifying');
 });
 
 test('transient infrastructure failure retries at most three times while check failures do not', async (t) => {

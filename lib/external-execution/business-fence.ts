@@ -2,6 +2,7 @@ import { and, eq, inArray } from 'drizzle-orm';
 
 import { aiCandidateGeneration, aiInvestigation, externalExecutionEvent, externalExecutionLease, externalExecutionReservation, externalExecutionSemaphore } from '../../db/schema.ts';
 import type { VigiloDatabase } from '../db/types.ts';
+import { freshDatabaseTime } from './database-clock.ts';
 import { ExternalExecutionAuthorityError } from './types.ts';
 
 // All admission/outcome transactions take this first. No network I/O belongs in
@@ -12,7 +13,7 @@ export async function lockExternalExecution(database: VigiloDatabase): Promise<v
   if (!row) throw new ExternalExecutionAuthorityError('execution_authority_missing');
 }
 
-export async function assertRunBusinessAllowed(database: VigiloDatabase, scope: { workspaceId: string; repairRunId?: string | null }, now = new Date()): Promise<void> {
+export async function assertRunBusinessAllowed(database: VigiloDatabase, scope: { workspaceId: string; repairRunId?: string | null }, _callerTime?: Date): Promise<void> {
   if (!scope.repairRunId) return;
   const reservations = await database.select({ id: externalExecutionReservation.id }).from(externalExecutionReservation)
     .where(and(eq(externalExecutionReservation.workspaceId, scope.workspaceId), eq(externalExecutionReservation.repairRunId, scope.repairRunId)));
@@ -20,6 +21,9 @@ export async function assertRunBusinessAllowed(database: VigiloDatabase, scope: 
   if (ids.length) {
     const leases = await database.select().from(externalExecutionLease).where(inArray(externalExecutionLease.reservationId, ids));
     const events = await database.select().from(externalExecutionEvent).where(inArray(externalExecutionEvent.reservationId, ids));
+    // The caller may have waited on the global fence or durable rows. Never use
+    // its pre-lock clock to classify an in-flight provider attempt.
+    const now = await freshDatabaseTime(database);
     const uncertain = leases.some((lease) => lease.state === 'ambiguous') || events.some((event) => event.eventType === 'attempt_ambiguous')
       || events.some((event) => event.eventType === 'attempt_started'
         && !events.some((outcome) => outcome.reservationId === event.reservationId && outcome.attemptOrdinal === event.attemptOrdinal

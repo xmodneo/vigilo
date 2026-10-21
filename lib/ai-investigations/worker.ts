@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 
-import { and, desc, eq, gt } from 'drizzle-orm';
+import { and, desc, eq, gt, lte, sql } from 'drizzle-orm';
 
 import { aiInvestigation, aiInvestigationAttempt, aiInvestigationEvent } from '../../db/schema.ts';
 import type { VigiloDatabase } from '../db/types.ts';
@@ -11,13 +11,15 @@ import { AiAgentError, runAiInvestigation, type AiAgentErrorCode, type AiAgentEx
 import { ModelProviderError, type InvestigationModelProvider } from './types.ts';
 import { ExternalExecutionAuthorityError } from '../external-execution/types.ts';
 import { assertRunBusinessAllowed, lockExternalExecution } from '../external-execution/business-fence.ts';
+import { freshDatabaseTime } from '../external-execution/database-clock.ts';
 import { assertPublicRepositoryAuthority, RepositoryPolicyError } from '../github-repositories/policy.ts';
+import { priorModelTransportUnresolved } from './model-request-key.ts';
 
-const LEASE_MS = 4 * 60_000;
 const HEARTBEAT_MS = 30_000;
 type Attempt = typeof aiInvestigationAttempt.$inferSelect;
 type Row = typeof aiInvestigation.$inferSelect;
 type JobResult = { id: string; status: 'completed' | 'failed' | 'deadletter'; output?: { code: string } };
+class MissingAiInvestigation extends Error {}
 const NON_RETRYABLE_FAILURES = new Set<AiAgentErrorCode>([
   'private_repository_not_supported',
   'ai_authority_mismatch',
@@ -37,9 +39,10 @@ const NON_RETRYABLE_FAILURES = new Set<AiAgentErrorCode>([
   'sandbox_creation_failed',
   'unobserved_suspected_file',
 ]);
+const RESULT_PERSISTENCE_FAILURE = 'provider_result_unpersisted';
 
 function nonRetryableFailureCode(code: string | null): code is AiAgentErrorCode {
-  return code !== null && NON_RETRYABLE_FAILURES.has(code as AiAgentErrorCode);
+  return code !== null && (code === RESULT_PERSISTENCE_FAILURE || NON_RETRYABLE_FAILURES.has(code as AiAgentErrorCode));
 }
 
 function retryableFailure(error: unknown, code: AiAgentErrorCode): boolean {
@@ -65,19 +68,32 @@ export interface AiInvestigationWorkerDependencies {
 
 type Claim = { kind: 'attempt'; row: Row; attempt: Attempt } | { kind: 'busy' | 'terminal' };
 
-async function claim(database: VigiloDatabase, id: string, queueJobId: string, now: Date, randomId: () => string): Promise<Claim> {
+async function claim(database: VigiloDatabase, id: string, queueJobId: string, randomId: () => string): Promise<Claim> {
   return database.transaction(async (transaction) => {
     await lockExternalExecution(transaction);
     const [row] = await transaction.select().from(aiInvestigation).where(eq(aiInvestigation.id, id)).for('update').limit(1);
-    if (!row) throw new Error('ai_investigation_not_found');
+    if (!row) throw new MissingAiInvestigation();
+    const now = await freshDatabaseTime(transaction);
     if (['completed', 'failed', 'cancelled'].includes(row.state)) return { kind: 'terminal' };
     const [active] = await transaction.select().from(aiInvestigationAttempt).where(and(eq(aiInvestigationAttempt.aiInvestigationId, id), eq(aiInvestigationAttempt.state, 'active'))).limit(1);
     if (active && active.leaseExpiresAt && active.leaseExpiresAt > now) return { kind: 'busy' };
-    if (active) await transaction.update(aiInvestigationAttempt).set({ state: 'abandoned', leaseExpiresAt: null, finishedAt: now, failureCode: 'process_loss' }).where(and(eq(aiInvestigationAttempt.id, active.id), eq(aiInvestigationAttempt.ownershipToken, active.ownershipToken), eq(aiInvestigationAttempt.state, 'active')));
+    if (active) {
+      const [abandoned] = await transaction.update(aiInvestigationAttempt).set({ state: 'abandoned', leaseExpiresAt: null, finishedAt: now, failureCode: 'process_loss' }).where(and(eq(aiInvestigationAttempt.id, active.id), eq(aiInvestigationAttempt.ownershipToken, active.ownershipToken), eq(aiInvestigationAttempt.state, 'active'), lte(aiInvestigationAttempt.leaseExpiresAt, sql`clock_timestamp()`))).returning({ id: aiInvestigationAttempt.id });
+      if (!abandoned) return { kind: 'busy' };
+    }
     const [latest] = await transaction.select({ attemptNumber: aiInvestigationAttempt.attemptNumber, state: aiInvestigationAttempt.state, failureCode: aiInvestigationAttempt.failureCode }).from(aiInvestigationAttempt).where(eq(aiInvestigationAttempt.aiInvestigationId, id)).orderBy(desc(aiInvestigationAttempt.attemptNumber)).limit(1);
     if (row.state === 'investigating' && latest?.state === 'retryable_failed' && nonRetryableFailureCode(latest.failureCode)) {
       const [failed] = await transaction.update(aiInvestigation).set({ state: 'failed', failureCode: latest.failureCode, completedAt: now, updatedAt: now }).where(and(eq(aiInvestigation.id, id), eq(aiInvestigation.state, 'investigating'))).returning();
       if (failed) await transaction.insert(aiInvestigationEvent).values({ id: randomId(), aiInvestigationId: id, workspaceId: failed.workspaceId, fromState: 'investigating', toState: 'failed', failureCode: latest.failureCode, createdAt: now });
+      return { kind: 'terminal' };
+    }
+    const priorAttempts = await transaction.select({ id: aiInvestigationAttempt.id }).from(aiInvestigationAttempt)
+      .where(eq(aiInvestigationAttempt.aiInvestigationId, id));
+    if (await priorModelTransportUnresolved(transaction, priorAttempts.map((attempt) => attempt.id))) {
+      await transaction.update(aiInvestigation).set({ state: 'failed', failureCode: RESULT_PERSISTENCE_FAILURE,
+        completedAt: now, updatedAt: now }).where(and(eq(aiInvestigation.id, id), eq(aiInvestigation.state, 'investigating')));
+      await transaction.insert(aiInvestigationEvent).values({ id: randomId(), aiInvestigationId: id,
+        workspaceId: row.workspaceId, fromState: 'investigating', toState: 'failed', failureCode: RESULT_PERSISTENCE_FAILURE, createdAt: now });
       return { kind: 'terminal' };
     }
     const attemptNumber = (latest?.attemptNumber ?? 0) + 1;
@@ -101,24 +117,28 @@ async function claim(database: VigiloDatabase, id: string, queueJobId: string, n
       await transaction.insert(aiInvestigationEvent).values({ id: randomId(), aiInvestigationId: id, workspaceId: row.workspaceId, fromState: 'investigating', toState: 'failed', failureCode: error.code, createdAt: now });
       return { kind: 'terminal' };
     }
-    const [attempt] = await transaction.insert(aiInvestigationAttempt).values({ id: randomId(), aiInvestigationId: id, queueJobId, attemptNumber, ownershipToken: randomId(), state: 'active', claimedAt: now, heartbeatAt: now, leaseExpiresAt: new Date(now.getTime() + LEASE_MS) }).returning();
+    const [attempt] = await transaction.insert(aiInvestigationAttempt).values({ id: randomId(), aiInvestigationId: id, queueJobId, attemptNumber, ownershipToken: randomId(), state: 'active', claimedAt: sql`clock_timestamp()`, heartbeatAt: sql`clock_timestamp()`, leaseExpiresAt: sql`clock_timestamp() + interval '4 minutes'` }).returning();
     if (!attempt) throw new Error('ai_investigation_claim_failed');
     return { kind: 'attempt', row: current, attempt };
   });
 }
 
-async function heartbeat(database: VigiloDatabase, attempt: Attempt, now: Date): Promise<boolean> {
-  const [updated] = await database.update(aiInvestigationAttempt).set({ heartbeatAt: now, leaseExpiresAt: new Date(now.getTime() + LEASE_MS) }).where(and(eq(aiInvestigationAttempt.id, attempt.id), eq(aiInvestigationAttempt.ownershipToken, attempt.ownershipToken), eq(aiInvestigationAttempt.state, 'active'), gt(aiInvestigationAttempt.leaseExpiresAt, now))).returning({ id: aiInvestigationAttempt.id });
+async function heartbeat(database: VigiloDatabase, attempt: Attempt): Promise<boolean> {
+  const [updated] = await database.update(aiInvestigationAttempt).set({ heartbeatAt: sql`clock_timestamp()`, leaseExpiresAt: sql`clock_timestamp() + interval '4 minutes'` }).where(and(eq(aiInvestigationAttempt.id, attempt.id), eq(aiInvestigationAttempt.ownershipToken, attempt.ownershipToken), eq(aiInvestigationAttempt.state, 'active'), gt(aiInvestigationAttempt.leaseExpiresAt, sql`clock_timestamp()`))).returning({ id: aiInvestigationAttempt.id });
   return !!updated;
 }
 
 async function complete(database: VigiloDatabase, row: Row, attempt: Attempt, execution: AiAgentExecution, now: Date, randomId: () => string): Promise<boolean> {
   return database.transaction(async (transaction) => {
-    const [owned] = await transaction.select().from(aiInvestigationAttempt).where(and(eq(aiInvestigationAttempt.id, attempt.id), eq(aiInvestigationAttempt.ownershipToken, attempt.ownershipToken), eq(aiInvestigationAttempt.state, 'active'), gt(aiInvestigationAttempt.leaseExpiresAt, now))).for('update').limit(1);
+    const [parent] = await transaction.select({ state: aiInvestigation.state }).from(aiInvestigation)
+      .where(eq(aiInvestigation.id, row.id)).for('update').limit(1);
+    if (parent?.state !== 'investigating') return false;
+    const [owned] = await transaction.select().from(aiInvestigationAttempt).where(and(eq(aiInvestigationAttempt.id, attempt.id), eq(aiInvestigationAttempt.ownershipToken, attempt.ownershipToken), eq(aiInvestigationAttempt.state, 'active'), gt(aiInvestigationAttempt.leaseExpiresAt, sql`clock_timestamp()`))).for('update').limit(1);
     if (!owned) return false;
     const [updated] = await transaction.update(aiInvestigation).set({ state: 'completed', completionReason: execution.completionReason, conclusionStatus: execution.conclusion.status, summary: execution.conclusion.summary, suspectedFiles: execution.conclusion.suspectedFiles, evidenceReferences: execution.conclusion.evidence, proposedApproach: execution.conclusion.proposedApproach, confidence: execution.conclusion.confidence, inputTokens: execution.usage.inputTokens, outputTokens: execution.usage.outputTokens, toolCallCount: execution.usage.toolCallCount, modelTurnCount: execution.usage.modelTurnCount, completedAt: now, updatedAt: now }).where(and(eq(aiInvestigation.id, row.id), eq(aiInvestigation.state, 'investigating'))).returning();
     if (!updated) return false;
-    await transaction.update(aiInvestigationAttempt).set({ state: 'succeeded', leaseExpiresAt: null, finishedAt: now }).where(and(eq(aiInvestigationAttempt.id, attempt.id), eq(aiInvestigationAttempt.ownershipToken, attempt.ownershipToken), eq(aiInvestigationAttempt.state, 'active')));
+    const [finished] = await transaction.update(aiInvestigationAttempt).set({ state: 'succeeded', leaseExpiresAt: null, finishedAt: now }).where(and(eq(aiInvestigationAttempt.id, attempt.id), eq(aiInvestigationAttempt.ownershipToken, attempt.ownershipToken), eq(aiInvestigationAttempt.state, 'active'), gt(aiInvestigationAttempt.leaseExpiresAt, sql`clock_timestamp()`))).returning({ id: aiInvestigationAttempt.id });
+    if (!finished) throw new Error('ai_investigation_ownership_lost');
     await transaction.insert(aiInvestigationEvent).values({ id: randomId(), aiInvestigationId: row.id, workspaceId: row.workspaceId, fromState: 'investigating', toState: 'completed', createdAt: now });
     return true;
   });
@@ -126,8 +146,11 @@ async function complete(database: VigiloDatabase, row: Row, attempt: Attempt, ex
 
 async function failAttempt(database: VigiloDatabase, row: Row, attempt: Attempt, code: string, retryable: boolean, now: Date, randomId: () => string): Promise<'retry' | 'failed' | 'lost'> {
   return database.transaction(async (transaction) => {
+    const [parent] = await transaction.select({ state: aiInvestigation.state }).from(aiInvestigation)
+      .where(eq(aiInvestigation.id, row.id)).for('update').limit(1);
+    if (parent?.state !== 'investigating') return 'lost';
     const exhausted = !retryable || attempt.attemptNumber >= REPAIR_JOB_MAX_ATTEMPTS;
-    const [finished] = await transaction.update(aiInvestigationAttempt).set({ state: exhausted ? 'exhausted' : 'retryable_failed', leaseExpiresAt: null, finishedAt: now, failureCode: code }).where(and(eq(aiInvestigationAttempt.id, attempt.id), eq(aiInvestigationAttempt.ownershipToken, attempt.ownershipToken), eq(aiInvestigationAttempt.state, 'active'), gt(aiInvestigationAttempt.leaseExpiresAt, now))).returning();
+    const [finished] = await transaction.update(aiInvestigationAttempt).set({ state: exhausted ? 'exhausted' : 'retryable_failed', leaseExpiresAt: null, finishedAt: now, failureCode: code }).where(and(eq(aiInvestigationAttempt.id, attempt.id), eq(aiInvestigationAttempt.ownershipToken, attempt.ownershipToken), eq(aiInvestigationAttempt.state, 'active'), gt(aiInvestigationAttempt.leaseExpiresAt, sql`clock_timestamp()`))).returning();
     if (!finished) return 'lost';
     if (!exhausted) return 'retry';
     const [updated] = await transaction.update(aiInvestigation).set({ state: 'failed', failureCode: code, completedAt: now, updatedAt: now }).where(and(eq(aiInvestigation.id, row.id), eq(aiInvestigation.state, 'investigating'))).returning();
@@ -142,7 +165,10 @@ export async function processAiInvestigationJob(job: RepairQueueJob, dependencie
   try { payload = parseAiInvestigationJobPayload(job.data); } catch { return { id: job.id, status: 'deadletter', output: { code: 'invalid_ai_investigation_job_payload' } }; }
   const randomId = dependencies.randomId ?? randomUUID; const clock = dependencies.clock ?? (() => new Date());
   let claimed;
-  try { claimed = await claim(dependencies.database, payload.aiInvestigationId, job.id, clock(), randomId); } catch { return { id: job.id, status: 'deadletter', output: { code: 'ai_investigation_not_found' } }; }
+  try { claimed = await claim(dependencies.database, payload.aiInvestigationId, job.id, randomId); }
+  catch (error) { return error instanceof MissingAiInvestigation
+    ? { id: job.id, status: 'deadletter', output: { code: 'ai_investigation_not_found' } }
+    : { id: job.id, status: 'failed', output: { code: 'ai_investigation_claim_failed' } }; }
   if (claimed.kind === 'terminal') return { id: job.id, status: 'completed' };
   if (claimed.kind === 'busy') return { id: job.id, status: 'failed', output: { code: 'active_ai_investigation_attempt' } };
   if (claimed.kind !== 'attempt') return { id: job.id, status: 'failed', output: { code: 'ai_investigation_claim_failed' } };
@@ -150,18 +176,22 @@ export async function processAiInvestigationJob(job: RepairQueueJob, dependencie
   const controller = new AbortController();
   const abort = () => controller.abort();
   job.signal?.addEventListener('abort', abort, { once: true }); dependencies.shutdownSignal?.addEventListener('abort', abort, { once: true });
-  const interval = setInterval(() => { void heartbeat(dependencies.database, attempt, clock()).then((owned) => { if (!owned) controller.abort(); }).catch(() => controller.abort()); }, HEARTBEAT_MS);
+  const interval = setInterval(() => { void heartbeat(dependencies.database, attempt).then((owned) => { if (!owned) controller.abort(); }).catch(() => controller.abort()); }, HEARTBEAT_MS);
+  let modelResultReceived = false;
   try {
     await assertPublicRepositoryAuthority(dependencies.database, row.workspaceId, row.githubRepositoryId);
     const provider = dependencies.createProvider();
     if (provider.providerId !== row.providerId || provider.modelId !== row.modelId) throw new AiAgentError('model_provider_mismatch');
     const execution = await (dependencies.executor ?? runAiInvestigation)(dependencies.database, dependencies.gateway, dependencies.configuration, provider, { aiInvestigationId: row.id, aiInvestigationAttemptId: attempt.id, ownershipToken: attempt.ownershipToken, investigationId: row.investigationId, workspaceId: row.workspaceId, baseCommitSha: row.baseCommitSha, profileIdentity: row.profileIdentity, baselineId: row.baselineId }, { signal: controller.signal, randomId });
+    modelResultReceived = true;
     await dependencies.afterExecution?.();
     return await complete(dependencies.database, row, attempt, execution, clock(), randomId) ? { id: job.id, status: 'completed' } : { id: job.id, status: 'failed', output: { code: 'ai_investigation_ownership_lost' } };
   } catch (error) {
-    const code: AiAgentErrorCode = error instanceof RepositoryPolicyError ? 'private_repository_not_supported' : error instanceof AiAgentError ? error.code : error instanceof ModelProviderError ? error.code : error instanceof ExternalExecutionAuthorityError ? error.code : controller.signal.aborted ? 'model_timeout' : 'model_provider_failed';
+    const code = modelResultReceived ? RESULT_PERSISTENCE_FAILURE : error instanceof RepositoryPolicyError ? 'private_repository_not_supported' : error instanceof AiAgentError ? error.code : error instanceof ModelProviderError ? error.code : error instanceof ExternalExecutionAuthorityError ? error.code : controller.signal.aborted ? 'model_timeout' : 'model_provider_failed';
     const normalized = error instanceof ModelProviderError ? new AiAgentError(error.code, error.retryAfterMs) : error;
-    const outcome = await failAttempt(dependencies.database, row, attempt, code, retryableFailure(normalized, code), clock(), randomId);
+    let outcome: 'retry' | 'failed' | 'lost';
+    try { outcome = await failAttempt(dependencies.database, row, attempt, code, !modelResultReceived && retryableFailure(normalized, code as AiAgentErrorCode), clock(), randomId); }
+    catch { return { id: job.id, status: 'failed', output: { code: modelResultReceived ? RESULT_PERSISTENCE_FAILURE : code } }; }
     if (outcome === 'failed') return { id: job.id, status: 'completed' };
     return { id: job.id, status: 'failed', output: { code: outcome === 'lost' ? 'ai_investigation_ownership_lost' : code } };
   } finally {

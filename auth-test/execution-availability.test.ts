@@ -48,7 +48,7 @@ const GOOGLE_ACCOUNT = googleProjectIdentity('test-project');
 async function seedAuthority(options: { expiresAt?: Date; operationLogicalRequests?: number; concurrency?: number; includeOperation?: boolean; invalidOperationIdentity?: boolean } = {}) {
   const context = await createTestContext();
   const now = new Date('2026-09-29T10:00:00.000Z');
-  const expiresAt = options.expiresAt ?? new Date('2026-09-30T10:00:00.000Z');
+  const expiresAt = options.expiresAt ?? new Date(Date.now() + 24 * 60 * 60_000);
   const userId = randomUUID(); const workspaceId = randomUUID();
   await context.database.insert(user).values({ id: userId, name: 'operator', email: `${userId}@example.test`, emailVerified: true, createdAt: now, updatedAt: now });
   await context.database.insert(workspace).values({ id: workspaceId, ownerUserId: userId, createdAt: now, updatedAt: now });

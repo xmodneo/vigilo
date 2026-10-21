@@ -311,7 +311,7 @@ async function seedPublicationAcceptances(context: Awaited<ReturnType<typeof cre
   });
   const sandboxBinding = { name: 'verification-review', teamId: 'team_test', projectId: 'project_test' };
   let sandboxCreateDispatches = 0;
-  const authorizer = new DurableExternalExecutionAuthorizer(context.database, { clock: () => NOW, runtimeReleaseSha: RELEASE_SHA, fetch: async (input, init) => {
+  const authorizer = new DurableExternalExecutionAuthorizer(context.database, { clock: () => new Date(), runtimeReleaseSha: RELEASE_SHA, fetch: async (input, init) => {
     const url = new URL(String(input));
     assert.equal(url.origin, 'https://vercel.com'); assert.equal(url.pathname, '/api/v3/sandboxes');
     assert.equal(init?.method, 'POST'); assert.equal(JSON.parse(String(init.body)).name, sandboxBinding.name);
@@ -538,16 +538,16 @@ test('acceptance-publication bootstrap is exact, expiring, revocable, and one-sh
   const outcomes = await Promise.allSettled([seeded.authorizer.reserve(request), seeded.authorizer.reserve(request)]);
   assert.equal(outcomes.filter((outcome) => outcome.status === 'fulfilled').length, 1);
   const permit = outcomes.find((outcome): outcome is PromiseFulfilledResult<Awaited<ReturnType<typeof seeded.authorizer.reserve>>> => outcome.status === 'fulfilled')!.value;
-  const active = await resolvePublicationReleaseAuthority(context.database, seeded.authority, RELEASE_SHA, { clock: () => NOW, operationKey: seeded.publication.id });
+  const active = await resolvePublicationReleaseAuthority(context.database, seeded.authority, RELEASE_SHA, { clock: () => new Date(), operationKey: seeded.publication.id });
   assert.equal(active.releaseAuthorization.mode, 'acceptance_bootstrap');
   if (active.releaseAuthorization.mode === 'acceptance_bootstrap') assert.equal(active.releaseAuthorization.reservationId, permit.reservationId);
   await assert.rejects(resolvePublicationReleaseAuthority(context.database, seeded.authority, RELEASE_SHA, { clock: () => NOW }));
   await permit.complete('ambiguous', 'provider_attempt_ambiguous');
-  await assert.rejects(resolvePublicationReleaseAuthority(context.database, seeded.authority, RELEASE_SHA, { clock: () => NOW, operationKey: seeded.publication.id }));
+  await assert.rejects(resolvePublicationReleaseAuthority(context.database, seeded.authority, RELEASE_SHA, { clock: () => new Date(), operationKey: seeded.publication.id }));
 
   const expiredContext = await createTestContext(); t.after(() => expiredContext.client.close());
   const expired = await seedPublicationAcceptances(expiredContext);
-  await insertBootstrapGrant(expiredContext, expired, { expiresAt: new Date(NOW.getTime() - 1_000) });
+  await insertBootstrapGrant(expiredContext, expired, { expiresAt: new Date(Date.now() - 1_000) });
   await assert.rejects(resolvePublicationReleaseAuthority(expiredContext.database, expired.authority, RELEASE_SHA, { clock: () => NOW }));
 
   const revokedContext = await createTestContext(); t.after(() => revokedContext.client.close());
@@ -603,7 +603,11 @@ test('a late branch response cannot revive an expired publication attempt or cre
   const seeded = await approvedPublication(context);
   const gateway = new FakePublicationGateway(seeded.row, seeded.prepared);
   let now = NOW;
-  gateway.afterBranchCreate = async () => { now = new Date(NOW.getTime() + 91_000); };
+  gateway.afterBranchCreate = async () => {
+    now = new Date(NOW.getTime() + 91_000);
+    await context.database.update(repairPublicationAttempt).set({ leaseExpiresAt: new Date(Date.now() - 1_000) })
+      .where(and(eq(repairPublicationAttempt.publicationId, seeded.publication.id), eq(repairPublicationAttempt.state, 'active')));
+  };
   const result = await processRepairPublicationJobForTest(
     { id: seeded.publication.id, data: { version: 1, publicationId: seeded.publication.id } } as never,
     { database: context.database, configuration: { appId: 1, clientId: 'client', appSlug: 'vigilo', baseUrl: 'https://github.com' },
@@ -638,7 +642,7 @@ test('the complete exact acceptance set opens only normal publication and revoca
   const seeded = await seedPublicationAcceptances(context);
   const bootstrap = await insertBootstrapGrant(context, seeded);
   const gateway = new FakePublicationGateway(seeded.row, seeded.prepared);
-  const resolver = (database: typeof context.database) => resolvePublicationReleaseAuthority(database, seeded.authority, RELEASE_SHA, { clock: () => NOW, operationKey: seeded.publication.id });
+  const resolver = (database: typeof context.database) => resolvePublicationReleaseAuthority(database, seeded.authority, RELEASE_SHA, { clock: () => new Date(), operationKey: seeded.publication.id });
   const published = await processRepairPublicationJobForTest(
     { id: seeded.publication.id, data: { version: 1, publicationId: seeded.publication.id } } as never,
     { database: context.database, configuration: { appId: 1, clientId: 'client', appSlug: 'vigilo', baseUrl: 'https://github.com' },
@@ -698,7 +702,7 @@ test('bootstrap worker consumes ambiguity and post-response revocation fences fu
     };
     const resolver = async (database: typeof context.database) => {
       try {
-        return await resolvePublicationReleaseAuthority(database, seeded.authority, RELEASE_SHA, { clock: () => NOW, operationKey: seeded.publication.id });
+        return await resolvePublicationReleaseAuthority(database, seeded.authority, RELEASE_SHA, { clock: () => new Date(), operationKey: seeded.publication.id });
       } catch {
         throw new HumanReviewError('live_acceptance_pending');
       }

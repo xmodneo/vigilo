@@ -44,7 +44,7 @@ test('readiness returns ready only for exact schema, queues, worker release, and
       workerPresent: true,
       workerFresh: true,
       workerReleaseSha: releaseSha,
-      workerSchemaVersion: '0025',
+      workerSchemaVersion: '0026',
       executionAuthoritySchema: true,
       publicationSchema: true,
     }),

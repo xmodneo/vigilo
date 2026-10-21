@@ -13,6 +13,15 @@ publication remains hard-blocked. Normal publication resolves the complete
 immutable four-kind acceptance set for the exact `VIGILO_RELEASE_SHA`; a later
 commit therefore invalidates that release acceptance.
 
+An operational heartbeat in `stopped` means the worker's execution ownership,
+queue consumers, pg-boss supervision, and work-capable database client have
+settled. It does **not** certify that the status-only heartbeat connection
+closed or that the OS process exited successfully. That final reporter cleanup
+has a bounded deadline; failure produces a nonzero process exit and sanitized
+diagnostic. Unresolved work-capable cleanup leaves the heartbeat non-terminal.
+Readiness counts only a fresh `ready` general-worker heartbeat, never a stopped
+or stale heartbeat or the separate baseline one-shot service.
+
 The first separately authorized live draft-publication acceptance may use a
 server-only one-shot bootstrap. That path remains unavailable unless the exact
 repair-loop, human-review, and security/cost acceptances already resolve and an
