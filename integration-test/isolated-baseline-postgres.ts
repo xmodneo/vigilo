@@ -18,6 +18,7 @@ import { computeExecutionProfileIdentity, gitBlobSha } from '../lib/execution-pr
 import { buildReviewedStagingPlan, type ReviewedStagingInput } from '../lib/external-execution/reviewed-plan.ts';
 import { assertReviewedPlanIntegrity } from '../lib/external-execution/reviewed-plan-integrity.ts';
 import { retireReviewedStagedRun } from '../lib/external-execution/reviewed-retirement.ts';
+import { readHistoricalRetirement, retireExactHistoricalRun } from '../lib/external-execution/local-retirement.ts';
 import { stageReviewedRepairRun } from '../lib/external-execution/reviewed-staging.ts';
 import { DurableExternalExecutionAuthorizer } from '../lib/external-execution/authority.ts';
 import { claimExactReviewedBaselineJob, type ExactBaselineRequest } from '../lib/repair-runs/exact-baseline-job.ts';
@@ -57,7 +58,7 @@ async function waitForDatabaseExpiry(expiresAt: string): Promise<void> {
   assert.fail('database authority clock did not cross grant expiry');
 }
 
-async function scenario(kind: 'claim' | 'signal_blocked_claim' | 'signal_after_claim' | 'authority_denied' | 'expiry_before_claim' | 'expiry_while_waiting' | 'expiry_before_transition' | 'unreviewed_checkpoint' | 'queue_policy' | 'retire' | 'retire_attempt' | 'retire_reservation' | 'historical_retire' | 'malformed_normal' | 'race' | 'general_race' | 'supervision_characterization' | 'supervision' | 'supervision_blocked' | 'supervision_recovery' | 'execute' | 'execute_failure') {
+async function scenario(kind: 'claim' | 'signal_blocked_claim' | 'signal_after_claim' | 'authority_denied' | 'expiry_before_claim' | 'expiry_while_waiting' | 'expiry_before_transition' | 'unreviewed_checkpoint' | 'queue_policy' | 'retire' | 'retire_attempt' | 'retire_reservation' | 'historical_retire' | 'local_retire' | 'malformed_normal' | 'race' | 'general_race' | 'supervision_characterization' | 'supervision' | 'supervision_blocked' | 'supervision_recovery' | 'execute' | 'execute_failure') {
   const name = `vigilo_one_shot_${randomUUID().replaceAll('-', '')}`;
   const url = new URL(configured); url.pathname = `/${name}`;
   let first: ReturnType<typeof postgres> | undefined;
@@ -105,7 +106,7 @@ async function scenario(kind: 'claim' | 'signal_blocked_claim' | 'signal_after_c
     const shortExpiry = kind.startsWith('expiry_');
     const input: ReviewedStagingInput = { kind: 'm77b_repair_v1', repairRunId: randomUUID(), idempotencyKey: randomUUID(),
       githubRepositoryId: repositoryId, installationId, profileIdentity, baseCommitSha: COMMIT,
-      authorizedReleaseSha: kind === 'historical_retire' ? HISTORICAL_RELEASE : RELEASE,
+      authorizedReleaseSha: ['historical_retire', 'local_retire'].includes(kind) ? HISTORICAL_RELEASE : RELEASE,
       objective: 'Investigate the controlled failing test.', expectedSourceIdentity: HASH,
       expiresAt: new Date(Date.now() + (shortExpiry ? 6_000 : 3_600_000)).toISOString(), providerAccounts: {
         googleProjectId: 'gen-lang-client-0469095642', vercelTeamId: 'team_dQVJwtsj7JcMXmVUYyFgrCzA',
@@ -114,7 +115,7 @@ async function scenario(kind: 'claim' | 'signal_blocked_claim' | 'signal_after_c
     const plan = buildReviewedStagingPlan({ workspaceId, reviewerUserId: ownerId }, input);
     const reviewedQueue = new PgBossReviewedBaselineQueue(boss);
     const oldQueue = new PgBossRepairQueue(boss);
-    const stagingQueue = kind === 'historical_retire'
+    const stagingQueue = ['historical_retire', 'local_retire'].includes(kind)
       ? { enqueueReviewedBaseline: oldQueue.enqueue.bind(oldQueue) } : reviewedQueue;
     const staged = await stageReviewedRepairRun(db, actor, input, plan.planIdentity, stagingQueue,
       { runtimeReleaseSha: input.authorizedReleaseSha, configuredProviderAccounts: input.providerAccounts });
@@ -483,6 +484,33 @@ async function scenario(kind: 'claim' | 'signal_blocked_claim' | 'signal_after_c
       assert.equal((await db.select().from(schema.repairRun)).length, 2);
       assert.equal((await boss.getJobById(REVIEWED_BASELINE_QUEUE, fresh.repairRunId))?.state, 'created');
       assert.equal(await assertReviewedPlanIntegrity(db, fresh.repairRunId, fresh.authorizedReleaseSha), true);
+    } else if (kind === 'local_retire') {
+      const exact = { workspaceId, repairRunId: input.repairRunId, planIdentity: plan.planIdentity,
+        repositoryId, revision: COMMIT, authorizedReleaseSha: HISTORICAL_RELEASE };
+      const preview = await readHistoricalRetirement(db, actor, exact);
+      assert.equal(preview.preview.eligible, true);
+      assert.equal(preview.request.accountGrantIdentity, plan.accountGrant.grantIdentity);
+      await assert.rejects(readHistoricalRetirement(db, actor, { ...exact, planIdentity: 'd'.repeat(64) }));
+      await assert.rejects(retireExactHistoricalRun(db, actor, boss, { ...exact, repairRunId: randomUUID() }));
+      await first`update pgboss.job set state = 'active', started_on = clock_timestamp()
+        where id = ${input.repairRunId}::uuid and name = ${REPAIR_BASELINE_QUEUE}`;
+      assert.equal((await readHistoricalRetirement(db, actor, exact)).preview.eligible, false);
+      await assert.rejects(retireExactHistoricalRun(db, actor, boss, exact));
+      await first`update pgboss.job set state = 'created', started_on = null
+        where id = ${input.repairRunId}::uuid and name = ${REPAIR_BASELINE_QUEUE}`;
+      assert.equal((await db.select().from(schema.executionBudgetGrantRevocation)).length, 0);
+      const [firstRetirement, secondRetirement] = await Promise.all([
+        retireExactHistoricalRun(db, actor, boss, exact),
+        retireExactHistoricalRun(db2, actor, boss, exact),
+      ]);
+      assert.deepEqual(new Set([firstRetirement.result, secondRetirement.result]),
+        new Set(['retired', 'already_retired']));
+      assert.equal((await db.select().from(schema.executionBudgetGrantRevocation)).length, 6);
+      assert.equal((await db.select().from(schema.repairRunEvent)
+        .where(eq(schema.repairRunEvent.repairRunId, input.repairRunId))).filter((event) =>
+          event.failureCode === 'pre_execution_operator_retirement').length, 1);
+      assert.equal((await boss.getJobById(REPAIR_BASELINE_QUEUE, input.repairRunId))?.state, 'cancelled');
+      assert.equal((await readHistoricalRetirement(db, actor, exact)).preview.eligible, false);
     } else if (kind === 'historical_retire') {
       assert.equal((await boss.getJobById(REPAIR_BASELINE_QUEUE, input.repairRunId))?.state, 'created');
       assert.equal(await boss.getJobById(REVIEWED_BASELINE_QUEUE, input.repairRunId), null);
@@ -713,7 +741,7 @@ async function scenario(kind: 'claim' | 'signal_blocked_claim' | 'signal_after_c
 }
 
 try {
-  const kinds = ['claim', 'signal_blocked_claim', 'signal_after_claim', 'authority_denied', 'expiry_before_claim', 'expiry_while_waiting', 'expiry_before_transition', 'unreviewed_checkpoint', 'queue_policy', 'retire', 'retire_attempt', 'retire_reservation', 'historical_retire', 'malformed_normal', 'race', 'general_race', 'supervision_characterization', 'supervision', 'supervision_blocked', 'supervision_recovery', 'execute', 'execute_failure'] as const;
+  const kinds = ['claim', 'signal_blocked_claim', 'signal_after_claim', 'authority_denied', 'expiry_before_claim', 'expiry_while_waiting', 'expiry_before_transition', 'unreviewed_checkpoint', 'queue_policy', 'retire', 'retire_attempt', 'retire_reservation', 'historical_retire', 'local_retire', 'malformed_normal', 'race', 'general_race', 'supervision_characterization', 'supervision', 'supervision_blocked', 'supervision_recovery', 'execute', 'execute_failure'] as const;
   const selected = process.argv[2];
   if (selected && !kinds.includes(selected as typeof kinds[number])) throw new Error('unknown_isolated_baseline_scenario');
   for (const kind of selected ? [selected as typeof kinds[number]] : kinds) assert.equal(await scenario(kind), true);
