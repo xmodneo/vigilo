@@ -61,6 +61,10 @@ function html(value: string, status = 200): Response {
     { status, headers: { ...HEADERS, 'Content-Type': 'text/html; charset=utf-8' } });
 }
 
+function forbidden(code: 'post_origin_rejected' | 'post_site_rejected' | 'owner_mismatch'): Response {
+  return html(`<p>Forbidden.</p><p>Local rejection code: ${code}</p>`, 403);
+}
+
 function escape(value: string): string {
   return value.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;')
     .replaceAll('"', '&quot;').replaceAll("'", '&#39;');
@@ -101,15 +105,16 @@ export function createLocalRetirementHandler(dependencies: Dependencies) {
     if (request.method !== 'GET' && request.method !== 'POST') return html('<p>Method unavailable.</p>', 405);
     if (request.method === 'POST') {
       const site = request.headers.get('sec-fetch-site');
-      if (request.headers.get('origin') !== dependencies.configuration.operatorOrigin ||
-          (site !== null && site !== 'same-origin')) return html('<p>Forbidden.</p>', 403);
+      if (request.headers.get('origin') !== dependencies.configuration.operatorOrigin)
+        return forbidden('post_origin_rejected');
+      if (site !== null && site !== 'same-origin') return forbidden('post_site_rejected');
     }
     let context: AuthenticatedWorkspace | null;
     try { context = await dependencies.resolveContext(request.headers); }
     catch { return html('<p>Authentication unavailable.</p>', 503); }
     if (!context) return html('<p>Sign in to Vigilo first at <a href="http://localhost:3000/sign-in">localhost:3000/sign-in</a>, then return here.</p>', 401);
     if (context.workspace.id !== dependencies.target.workspaceId || context.workspace.ownerUserId !== context.user.id)
-      return html('<p>Forbidden.</p>', 403);
+      return forbidden('owner_mismatch');
 
     if (request.method === 'GET') {
       let preview: LocalRetirementPreview;

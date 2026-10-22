@@ -122,6 +122,42 @@ test('POST requires exact same-origin browser confirmation and a session-bound C
   assert.equal(counts().retirements, 1);
 });
 
+test('local Forbidden responses distinguish POST origin, fetch-site, and owner rejection without exposing request data', async () => {
+  const valid = harness();
+  const csrf = await token(valid.handler);
+  const missingOrigin = post(csrf);
+  missingOrigin.headers.delete('origin');
+  for (const [request, code] of [
+    [post(csrf, {}, { origin: 'https://attacker.example' }), 'post_origin_rejected'],
+    [post(csrf, {}, { origin: '' }), 'post_origin_rejected'],
+    [missingOrigin, 'post_origin_rejected'],
+    [post(csrf, {}, { 'sec-fetch-site': 'cross-site' }), 'post_site_rejected'],
+  ] as const) {
+    const response = await valid.handler(request, '::1');
+    assert.equal(response.status, 403);
+    const body = await response.text();
+    assert.match(body, new RegExp(`Local rejection code: ${code}`));
+    assert.doesNotMatch(body, /attacker\.example|opaque-test-cookie|session-one|[0-9a-f]{64}/);
+  }
+  assert.equal(valid.counts().retirements, 0);
+
+  const nonOwner = harness({ context: { ...owner, workspace: { ...owner.workspace, ownerUserId: 'other' } } });
+  for (const request of [get(), post(csrf)]) {
+    const response = await nonOwner.handler(request, '::1');
+    assert.equal(response.status, 403);
+    assert.match(await response.text(), /Local rejection code: owner_mismatch/);
+  }
+  assert.equal(nonOwner.counts().retirements, 0);
+
+  const anonymous = harness({ context: null });
+  assert.equal((await anonymous.handler(post(csrf), '::1')).status, 401);
+  assert.equal(anonymous.counts().retirements, 0);
+  const invalidCsrf = await valid.handler(post('0'.repeat(64)), '::1');
+  assert.equal(invalidCsrf.status, 403);
+  assert.match(await invalidCsrf.text(), /Confirmation invalid\. No action was taken\./);
+  assert.equal(valid.counts().retirements, 0);
+});
+
 test('POST fails closed on missing session, changed session, and non-owner', async () => {
   const { handler } = harness();
   const csrf = await token(handler);
