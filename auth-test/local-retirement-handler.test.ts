@@ -122,6 +122,25 @@ test('POST requires exact same-origin browser confirmation and a session-bound C
   assert.equal(counts().retirements, 1);
 });
 
+test('HTML form policy preserves a same-origin POST Origin without allowing mismatched origins', async () => {
+  const { handler, counts } = harness();
+  const preview = await handler(get(), '::1');
+  assert.equal(preview.status, 200);
+  assert.equal(preview.headers.get('referrer-policy'), 'same-origin');
+  const body = await preview.text();
+  assert.match(body, /<form method="post" action="\/">/);
+  const csrf = body.match(/name="csrf" value="([0-9a-f]{64})"/)?.[1];
+  assert.ok(csrf);
+  for (const origin of ['null', 'http://localhost:3000', 'https://attacker.example']) {
+    const response = await handler(post(csrf, {}, { origin }), '::1');
+    assert.equal(response.status, 403);
+    assert.match(await response.text(), /Local rejection code: post_origin_rejected/);
+  }
+  assert.equal(counts().retirements, 0);
+  assert.equal((await handler(post(csrf), '::1')).status, 200);
+  assert.equal(counts().retirements, 1);
+});
+
 test('local Forbidden responses distinguish POST origin, fetch-site, and owner rejection without exposing request data', async () => {
   const valid = harness();
   const csrf = await token(valid.handler);

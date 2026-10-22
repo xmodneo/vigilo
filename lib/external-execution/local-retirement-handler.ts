@@ -12,7 +12,7 @@ const HEADERS = {
   'Content-Security-Policy': "default-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
   'X-Content-Type-Options': 'nosniff',
   'X-Frame-Options': 'DENY',
-  'Referrer-Policy': 'no-referrer',
+  'Referrer-Policy': 'same-origin',
 };
 
 export interface LocalRetirementPreview {
