@@ -115,6 +115,21 @@ shape is defined in `lib/external-execution/reviewed-plan.ts`; arbitrary grant
 rows are not accepted. Do not invoke `--apply` for the real acceptance fixture
 without separate authorization. No worker or provider is started by staging.
 
+For the public M7.7B fixture, a separate default-disabled loopback browser
+handoff (`npm run ops:stage-reviewed-repair-run-web`) can use the owner's normal
+Vigilo session without exposing its HttpOnly cookie to a terminal. It binds to
+`http://localhost:3002/` only when explicitly enabled for local development,
+and reads a single non-secret, mode-0600 `.vigilo/m77b-approved-plan.json`
+containing exactly `actor`, `plan`, and `approvedPlanIdentity`. The fixed file
+must be prepared only after a fresh production `--dry-run` and separate review;
+an old-release, altered, or expired plan is rejected. The authenticated GET
+shows the complete plan but never stages it. The owner-confirmed same-origin
+POST invokes the same transactional staging service with no browser-controlled
+repository, grant, queue, budget, or provider identity. A POST attempt requires
+durable-state inspection before any retry. The historical retirement operator
+does not authorize staging. Releasing this handoff changes the release SHA, so
+no plan should be generated until the new release is published and locally bound.
+
 The development and live acceptance model is Google Gemini
 `gemini-3.1-flash-lite`; this is not the final production model. The Gemini Free
 Tier is used only for development and live acceptance against the public Vigilo

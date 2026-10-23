@@ -13,7 +13,8 @@
   "include": [
     "auth-test/**/*.ts",
     "db/**/*.ts",
-    "lib/**/*.ts"
+    "lib/**/*.ts",
+    "operations/stage-reviewed-repair-run-web.ts"
   ],
   "exclude": [
     "node_modules",

@@ -31,6 +31,7 @@
     "worker:baseline-once": "node --env-file-if-exists=.env.local .worker-dist/worker/baseline-once.js",
     "ops:retire-reviewed-stage": "node --env-file-if-exists=.env.local --import tsx operations/retire-reviewed-stage.ts",
     "ops:retire-reviewed-stage-web": "node --env-file-if-exists=.env.local --import tsx operations/retire-reviewed-stage-web.ts",
+    "ops:stage-reviewed-repair-run-web": "node --env-file-if-exists=.env.local --import tsx operations/stage-reviewed-repair-run-web.ts",
     "worker:typecheck": "tsc --noEmit -p tsconfig.worker.json",
     "db:migrate": "node --env-file-if-exists=.env.local --import tsx db/migrate.ts",
     "ops:snapshot": "node --env-file-if-exists=.env.local --import tsx operations/snapshot.ts",
