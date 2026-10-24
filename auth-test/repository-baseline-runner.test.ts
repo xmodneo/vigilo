@@ -5,6 +5,7 @@ import test from 'node:test';
 import { APIError, Sandbox } from '@vercel/sandbox';
 
 import { gitBlobSha } from '../lib/execution-profiles/detector.ts';
+import { ExternalExecutionAuthorityError } from '../lib/external-execution/types.ts';
 import { runFrozenRepositoryBaseline } from '../lib/repository-baselines/runner.ts';
 import type { FrozenBaselineInput } from '../lib/repository-baselines/types.ts';
 import { createTestExternalExecutionAuthorizer, configureSandboxTestCredentials, TEST_ACCESS_TOKEN } from './external-execution-support.ts';
@@ -123,6 +124,7 @@ test('failure, timeout, cancellation, source-integrity, and cleanup outcomes fai
   const scenarios = {
     install: 'installation_failed', typecheck: 'typecheck_failed', build: 'build_failed', test: 'test_failed',
     command_timeout: 'timed_out', overall_timeout: 'timed_out', cancelled: 'cancelled',
+    network_policy_authority: 'infrastructure_failed',
     credentials: 'infrastructure_failed', source_mismatch: 'infrastructure_failed', source_mutation: 'baseline_failed', source_addition: 'baseline_failed',
     cleanup: 'cleanup_failed',
   } as const;
@@ -133,6 +135,7 @@ test('failure, timeout, cancellation, source-integrity, and cleanup outcomes fai
       let deleted = false;
       let stopped = false;
       let manifestCalls = 0;
+      let fixtureCommandsAfterInstall = 0;
       const controller = new AbortController();
       const mutatedEntries = entries.map((entry, index) => index === 0 ? { ...entry, sha256: 'e'.repeat(64) } : entry);
       const mutatedManifest = { entries: mutatedEntries, identity: sha256(JSON.stringify(mutatedEntries)) };
@@ -158,6 +161,7 @@ test('failure, timeout, cancellation, source-integrity, and cleanup outcomes fai
           }
           const command = JSON.parse(params.args[2]!) as { args: string[] };
           const phase = command.args[0] === 'ci' ? 'install' : command.args.at(-1);
+          if (phase !== 'install') fixtureCommandsAfterInstall += 1;
           if (scenario === 'cancelled' && phase === 'install') { controller.abort(); throw new Error('cancelled provider command'); }
           const timedOut = scenario === 'command_timeout' && phase === 'test';
           const failed = scenario === phase;
@@ -166,7 +170,10 @@ test('failure, timeout, cancellation, source-integrity, and cleanup outcomes fai
             stdoutSha256: 'c'.repeat(64), stderrSha256: 'd'.repeat(64),
           }) };
         },
-        async update(params: { networkPolicy: string }) { policy = params.networkPolicy; },
+        async update(params: { networkPolicy: string }) {
+          if (scenario === 'network_policy_authority') throw new ExternalExecutionAuthorityError('execution_authority_mismatch');
+          policy = params.networkPolicy;
+        },
         async stop() { stopped = true; },
         async delete() { if (scenario === 'cleanup') throw new Error('delete failed'); deleted = true; },
       };
@@ -182,6 +189,13 @@ test('failure, timeout, cancellation, source-integrity, and cleanup outcomes fai
       assert.equal(stopped, true);
       if (scenario !== 'cleanup') assert.deepEqual(result.cleanup, { stop: 'confirmed', delete: 'confirmed', lookup: 'absent' });
       else assert.notEqual(result.cleanup.delete, 'confirmed');
+      if (scenario === 'network_policy_authority') {
+        assert.deepEqual(result.error, { phase: 'network_policy', code: 'execution_authority_mismatch' });
+        assert.equal(fixtureCommandsAfterInstall, 0);
+        assert.equal(result.typecheck?.status, 'not_run');
+        assert.equal(result.build?.status, 'not_run');
+        assert.equal(result.test.status, 'not_run');
+      }
       assert.ok(!JSON.stringify(result).includes(TEST_ACCESS_TOKEN));
       assert.doesNotMatch(JSON.stringify(result), /cancelled provider command|delete failed/);
     });

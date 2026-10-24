@@ -338,6 +338,30 @@ function sandboxMetadata() {
   return { session, sandbox: { name: 'test', persistent: false, createdAt: 1, updatedAt: 1, currentSessionId: session.id, status: session.status }, routes: [] };
 }
 
+test('M7.7 network-policy PATCH response cannot change the bound session or trigger an SDK retry', async (t) => {
+  const value = await sandboxIdentitySeed(); t.after(() => value.context.client.close());
+  const requests: string[] = [];
+  const authority = new DurableExternalExecutionAuthorizer(value.context.database, { clock: () => value.now, fetch: async (input, init) => {
+    const url = new URL(String(input)); requests.push(`${init?.method ?? 'GET'} ${url.pathname}`);
+    const metadata = sandboxMetadata();
+    if (init?.method === 'PATCH') {
+      assert.equal(url.searchParams.get('projectId'), sandboxContext.projectId);
+      assert.deepEqual(JSON.parse(String(init.body)), { networkPolicy: { mode: 'deny-all' } });
+      metadata.sandbox.currentSessionId = 'foreign-session';
+      return Response.json({ sandbox: { ...metadata.sandbox, networkPolicy: { mode: 'deny-all' } } });
+    }
+    return Response.json(metadata);
+  } });
+  const permit = await authority.reserve({ scope: value.scope, amounts: sandboxAmounts, sandbox: sandboxContext });
+  const sandbox = await Sandbox.create({ token: 'fake-opaque-access-token', ...sandboxContext,
+    image: 'vercel/sandbox/node:24', persistent: false, networkPolicy: 'allow-all',
+    resources: { vcpus: 1 }, timeout: 60_000, fetch: permit.meteredFetch });
+  await permit.resolveSandboxCreation?.({ name: sandbox.name, sessionId: sandbox.currentSession().sessionId });
+  await assert.rejects(sandbox.update({ networkPolicy: 'deny-all' }), /execution_authority_mismatch/);
+  assert.deepEqual(requests, ['POST /api/v3/sandboxes', 'PATCH /api/v2/sandboxes/test'],
+    'a changed session must fail before the SDK session update, readback, or any retry');
+});
+
 test('M7.7 late success: pending Sandbox create cannot confirm identity after a Gemini reservation becomes ambiguous', async (t) => {
   const value = await seeded({ runBound: true, concurrency: 2,
     accountLimits: { providerAttempts: 14, sandboxIdentities: 1, sandboxRuntimeMs: 60_000 } });

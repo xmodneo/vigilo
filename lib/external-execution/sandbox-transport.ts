@@ -31,6 +31,22 @@ export class SandboxTransportPolicy {
         || body.source !== undefined || body.env !== undefined || (body.ports !== undefined && (!Array.isArray(body.ports) || body.ports.length))) this.deny();
       return 'create';
     }
+    // SDK 3.2.1 Sandbox.update({ networkPolicy }) first PATCHes the named
+    // sandbox, then POSTs the policy to its current session. This is the only
+    // named-resource mutation admitted after the exact create is confirmed.
+    if (url.pathname === namePath && method === 'PATCH') {
+      if (this.recovery || !this.sessionId || url.searchParams.getAll('projectId').length !== 1
+        || url.searchParams.get('projectId') !== this.binding.projectId
+        || [...url.searchParams.keys()].some((key) => !['teamId', 'projectId'].includes(key))
+        || typeof init?.body !== 'string' || Buffer.byteLength(init.body) > 4096) this.deny();
+      let body: Record<string, unknown>;
+      try { body = JSON.parse(init.body) as Record<string, unknown>; } catch { return this.deny(); }
+      if (!body || typeof body !== 'object' || Array.isArray(body) || Object.keys(body).length !== 1) this.deny();
+      const networkPolicy = body.networkPolicy;
+      if (!networkPolicy || typeof networkPolicy !== 'object' || Array.isArray(networkPolicy)
+        || Object.keys(networkPolicy).length !== 1 || (networkPolicy as { mode?: unknown }).mode !== 'deny-all') this.deny();
+      return 'business';
+    }
     if (url.pathname === namePath && ['GET', 'DELETE'].includes(method)) {
       if (url.searchParams.getAll('projectId').length !== 1 || url.searchParams.get('projectId') !== this.binding.projectId
         || (method === 'GET' && (url.searchParams.getAll('resume').length !== 1 || url.searchParams.get('resume') !== 'false'))
@@ -64,9 +80,26 @@ export class SandboxTransportPolicy {
     this.sessionId = identity.sessionId;
   }
 
+  async observeNetworkPolicyUpdate(response: Response): Promise<void> {
+    if (!response.ok) return;
+    // SDK 3.2.1 treats networkPolicy as optional in PATCH metadata. The
+    // mandatory deny-all proof is the subsequent exact-session GET readback.
+    const value = await this.readMetadata(response) as { sandbox?: {
+      name?: string; currentSessionId?: string; persistent?: boolean;
+    } };
+    if (value.sandbox?.name !== this.binding.name || value.sandbox.currentSessionId !== this.sessionId
+      || value.sandbox.persistent !== false) this.deny();
+  }
+
   async observeLookup(response: Response): Promise<void> {
     if (!response.ok) return;
     // Only resource metadata is inspected; never commands, files or credentials.
+    const value = await this.readMetadata(response) as { sandbox?: { name?: string; currentSessionId?: string }; session?: { id?: string } };
+    if (value.sandbox?.name !== this.binding.name || value.sandbox.currentSessionId !== value.session?.id || !value.session?.id) this.deny();
+    this.confirm({ name: value.sandbox.name, sessionId: value.session.id });
+  }
+
+  private async readMetadata(response: Response): Promise<unknown> {
     const reader = response.clone().body?.getReader();
     if (!reader) this.deny();
     const chunks: Uint8Array[] = []; let bytes = 0;
@@ -75,9 +108,9 @@ export class SandboxTransportPolicy {
         const item = await reader.read(); if (item.done) break;
         bytes += item.value.byteLength; if (bytes > 128 * 1024) this.deny(); chunks.push(item.value);
       }
-      const value = JSON.parse(Buffer.concat(chunks).toString('utf8')) as { sandbox?: { name?: string; currentSessionId?: string }; session?: { id?: string } };
-      if (value.sandbox?.name !== this.binding.name || value.sandbox.currentSessionId !== value.session?.id || !value.session?.id) this.deny();
-      this.confirm({ name: value.sandbox.name, sessionId: value.session.id });
+      const value: unknown = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+      if (!value || typeof value !== 'object' || Array.isArray(value)) this.deny();
+      return value;
     } catch { this.deny(); } finally { void reader.cancel().catch(() => undefined); }
   }
 }

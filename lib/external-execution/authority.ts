@@ -524,6 +524,7 @@ export class DurableExternalExecutionAuthorizer implements ExternalExecutionAuth
             throw new ExternalExecutionAuthorityError('sandbox_creation_failed');
           }
           if (policy && kind === 'cleanup' && (init?.method ?? (input instanceof Request ? input.method : 'GET')).toUpperCase() === 'GET') await policy.observeLookup(response);
+          if (policy && (init?.method ?? (input instanceof Request ? input.method : 'GET')).toUpperCase() === 'PATCH') await policy.observeNetworkPolicyUpdate(response);
           return response;
         } catch (error) {
           // async-retry honors `bail` without replacing the stable domain error.
