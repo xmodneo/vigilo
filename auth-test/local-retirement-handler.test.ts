@@ -3,7 +3,8 @@ import test from 'node:test';
 
 import type { AuthenticatedWorkspace } from '../lib/auth/protected-context.ts';
 import { createLocalRetirementHandler } from '../lib/external-execution/local-retirement-handler.ts';
-import type { HistoricalRetirementTarget } from '../lib/external-execution/local-retirement.ts';
+import { EXPIRED_REVIEWED_RETIREMENT_TARGET, type HistoricalRetirementTarget } from '../lib/external-execution/local-retirement.ts';
+import { LOCAL_RETIREMENT_TARGET } from '../operations/retire-reviewed-stage-web.ts';
 
 const target: HistoricalRetirementTarget = {
   workspaceId: 'workspace-one',
@@ -98,8 +99,23 @@ test('GET requires the owner of the exact workspace and never retires', async ()
   const valid = harness();
   const response = await valid.handler(get(), '::1');
   assert.equal(response.status, 200);
-  assert.match(await response.text(), /irreversible/i);
+  const body = await response.text();
+  assert.match(body, /irreversible/i);
+  assert.match(body, /Exact reviewed RepairRun/);
+  assert.match(body, /Retire exact reviewed staged run/);
   assert.deepEqual(valid.counts(), { previews: 1, retirements: 0 });
+});
+
+test('operator target is the exact expired reviewed run, never a browser-selected run', () => {
+  assert.equal(LOCAL_RETIREMENT_TARGET, EXPIRED_REVIEWED_RETIREMENT_TARGET);
+  assert.deepEqual(EXPIRED_REVIEWED_RETIREMENT_TARGET, {
+    workspaceId: '3c9fb74c-ff50-495a-a01f-92646b85ba95',
+    repairRunId: '3d66fde8-d928-45f1-a3de-6c47baf9ab6b',
+    planIdentity: '77b000019b2c8f053ab51451ac2c5e2aed8dfe96f729042707af77b34099a8fd',
+    repositoryId: 1411517943,
+    revision: '3575b04ff48cf07f9f52b5b3f8cf529520619307',
+    authorizedReleaseSha: 'e0983be91e2ef45e16712d4115fe22e8dc8cecf2',
+  });
 });
 
 test('POST requires exact same-origin browser confirmation and a session-bound CSRF token', async () => {

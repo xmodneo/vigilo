@@ -14,7 +14,8 @@
     "auth-test/**/*.ts",
     "db/**/*.ts",
     "lib/**/*.ts",
-    "operations/stage-reviewed-repair-run-web.ts"
+    "operations/stage-reviewed-repair-run-web.ts",
+    "operations/retire-reviewed-stage-web.ts"
   ],
   "exclude": [
     "node_modules",

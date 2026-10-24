@@ -14,9 +14,10 @@ import { readServerEnvironment } from '../lib/auth/environment.ts';
 import { createAuthOptions } from '../lib/auth/factory.ts';
 import { AccessDeniedError, resolveAuthenticatedWorkspace } from '../lib/auth/protected-context.ts';
 import { createLocalRetirementHandler } from '../lib/external-execution/local-retirement-handler.ts';
-import { HISTORICAL_RETIREMENT_TARGET, readHistoricalRetirement, retireExactHistoricalRun } from '../lib/external-execution/local-retirement.ts';
+import { EXPIRED_REVIEWED_RETIREMENT_TARGET, readHistoricalRetirement, retireExactHistoricalRun } from '../lib/external-execution/local-retirement.ts';
 
 const ORIGIN = 'http://localhost:3001';
+export const LOCAL_RETIREMENT_TARGET = EXPIRED_REVIEWED_RETIREMENT_TARGET;
 const STOP_DEADLINE_MS = 8_000;
 const MAX_BODY_BYTES = 1_024;
 
@@ -65,9 +66,9 @@ async function respond(incoming: IncomingMessage, outgoing: ServerResponse,
   try { if (incoming.method === 'POST') body = await requestBody(incoming); }
   catch { outgoing.writeHead(413, { 'Cache-Control': 'no-store' }); outgoing.end(); return; }
   const request = new Request(`${ORIGIN}/`, {
-    method: incoming.method,
+    method: incoming.method ?? 'GET',
     headers: incoming.headers as HeadersInit,
-    body: body?.toString('utf8'),
+    body: body?.toString('utf8') ?? null,
   });
   const response = await handler(request, incoming.socket.remoteAddress);
   outgoing.writeHead(response.status, Object.fromEntries(response.headers.entries()));
@@ -82,7 +83,7 @@ async function main(): Promise<void> {
   if (!configuration.enabled || configuration.nodeEnv !== 'development' ||
       configuration.baseUrl !== 'http://localhost:3000' ||
       !/^[0-9a-f]{40}$/.test(configuration.releaseSha ?? '') ||
-      configuration.releaseSha === HISTORICAL_RETIREMENT_TARGET.authorizedReleaseSha ||
+      configuration.releaseSha === LOCAL_RETIREMENT_TARGET.authorizedReleaseSha ||
       !['postgres:', 'postgresql:'].includes(databaseUrl.protocol) ||
       databaseUrl.hostname !== '127.0.0.1' || databaseUrl.port !== '55432' || databaseUrl.pathname !== '/vigilo')
     throw new Error('local_retirement_unavailable');
@@ -91,7 +92,7 @@ async function main(): Promise<void> {
   const database = drizzle(client, { schema });
   const auth = betterAuth(createAuthOptions(database, environment));
   const handler = createLocalRetirementHandler({
-    configuration, target: HISTORICAL_RETIREMENT_TARGET, csrfSecret: randomBytes(32),
+    configuration, target: LOCAL_RETIREMENT_TARGET, csrfSecret: randomBytes(32),
     resolveContext: async (headers) => {
       try {
         return await resolveAuthenticatedWorkspace(
@@ -103,7 +104,7 @@ async function main(): Promise<void> {
         throw error;
       }
     },
-    preview: async (context) => (await readHistoricalRetirement(database, context)).preview,
+    preview: async (context) => (await readHistoricalRetirement(database, context, LOCAL_RETIREMENT_TARGET)).preview,
     retire: async (context) => {
       const boss = new PgBoss({ connectionString: environment.databaseUrl,
         application_name: 'vigilo-local-reviewed-retirement', max: 1,
@@ -114,7 +115,7 @@ async function main(): Promise<void> {
       try {
         startAttempted = true;
         await boss.start();
-        result = await retireExactHistoricalRun(database, context, boss);
+        result = await retireExactHistoricalRun(database, context, boss, LOCAL_RETIREMENT_TARGET);
       } catch (error) { failure = error; }
       if (startAttempted) {
         try { await withDeadline(() => boss.stop({ graceful: true, timeout: 5_000 })); }

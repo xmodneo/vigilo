@@ -119,19 +119,19 @@ export function createLocalRetirementHandler(dependencies: Dependencies) {
     if (request.method === 'GET') {
       let preview: LocalRetirementPreview;
       try { preview = await dependencies.preview(context); }
-      catch { return html('<p>Exact historical target unavailable. No action was taken.</p>', 409); }
-      const facts = `<p>Historical RepairRun: ${escape(dependencies.target.repairRunId)}</p>` +
+      catch { return html('<p>Exact reviewed target unavailable. No action was taken.</p>', 409); }
+      const facts = `<p>Exact reviewed RepairRun: ${escape(dependencies.target.repairRunId)}</p>` +
         `<p>Stored plan identity: ${escape(dependencies.target.planIdentity)}</p>` +
         `<p>Frozen repository: ${dependencies.target.repositoryId}; revision: ${escape(dependencies.target.revision)}</p>` +
-        `<p>Historical release: ${escape(dependencies.target.authorizedReleaseSha)}</p>` +
-        `<p>Run: ${escape(preview.runState)}; checkpoint: ${escape(preview.checkpointState)}; old job: ${escape(preview.jobState)}</p>`;
+        `<p>Original authorized release: ${escape(dependencies.target.authorizedReleaseSha)}</p>` +
+        `<p>Run: ${escape(preview.runState)}; checkpoint: ${escape(preview.checkpointState)}; job: ${escape(preview.jobState)}</p>`;
       if (!preview.eligible) return html(`${facts}<p>Retirement is unavailable or already complete. No action was taken.</p>`);
       const token = csrfToken(dependencies.csrfSecret, context.sessionId, dependencies.target);
-      return html(`${facts}<p><strong>Retirement is irreversible.</strong> Only the exact never-executed historical run will be cancelled. No baseline will run.</p>` +
+      return html(`${facts}<p><strong>Retirement is irreversible.</strong> Only the exact never-executed reviewed run will be cancelled. No baseline will run.</p>` +
         `<form method="post" action="/"><input type="hidden" name="csrf" value="${token}">` +
         '<label><input type="checkbox" name="confirmation" value="retire_exact_staged_run" required>' +
-        ' I confirm retirement of this exact historical run.</label>' +
-        '<button type="submit">Retire historical staged run</button></form>');
+        ' I confirm retirement of this exact reviewed run.</label>' +
+        '<button type="submit">Retire exact reviewed staged run</button></form>');
     }
 
     const form = await parseConfirmation(request);
@@ -145,8 +145,8 @@ export function createLocalRetirementHandler(dependencies: Dependencies) {
           receipt.baselineJobId !== dependencies.target.repairRunId || receipt.revokedGrantCount !== 6)
         return html('<p>Retirement outcome uncertain. Inspect durable state before any retry.</p>', 503);
       return html(receipt.result === 'already_retired'
-        ? '<p>This exact historical run was already retired. No additional change was made.</p>'
-        : '<p>The exact historical run was retired. Six grants were revoked.</p>');
+        ? '<p>This exact reviewed run was already retired. No additional change was made.</p>'
+        : '<p>The exact reviewed run was retired. Six grants were revoked.</p>');
     } catch {
       return html('<p>Retirement outcome uncertain. Inspect durable state before any retry.</p>', 503);
     }

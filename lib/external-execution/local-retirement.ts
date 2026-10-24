@@ -7,11 +7,10 @@ import {
 } from '../../db/schema.ts';
 import type { AuthenticatedWorkspace } from '../auth/protected-context.ts';
 import type { VigiloDatabase } from '../db/types.ts';
-import { REPAIR_BASELINE_QUEUE } from '../repair-runs/queue.ts';
 import { executionGrantIdentityMatches } from './identity.ts';
 import type { LocalRetirementPreview } from './local-retirement-handler.ts';
 import { buildReviewedStagingPlan, type ReviewedStagingInput } from './reviewed-plan.ts';
-import { retireReviewedStagedRun, type ReviewedRetirementRequest } from './reviewed-retirement.ts';
+import { retirementBaselineQueueForRelease, retireReviewedStagedRun, type ReviewedRetirementRequest } from './reviewed-retirement.ts';
 
 export interface HistoricalRetirementTarget {
   workspaceId: string;
@@ -30,6 +29,16 @@ export const HISTORICAL_RETIREMENT_TARGET: HistoricalRetirementTarget = Object.f
   repositoryId: 1411517943,
   revision: '3575b04ff48cf07f9f52b5b3f8cf529520619307',
   authorizedReleaseSha: 'fb373deb5a50f4bba38ea7d8c9af4b2fc581e24f',
+});
+
+/** The sole currently enabled local operator target; the older completed target stays immutable. */
+export const EXPIRED_REVIEWED_RETIREMENT_TARGET: HistoricalRetirementTarget = Object.freeze({
+  workspaceId: '3c9fb74c-ff50-495a-a01f-92646b85ba95',
+  repairRunId: '3d66fde8-d928-45f1-a3de-6c47baf9ab6b',
+  planIdentity: '77b000019b2c8f053ab51451ac2c5e2aed8dfe96f729042707af77b34099a8fd',
+  repositoryId: 1411517943,
+  revision: '3575b04ff48cf07f9f52b5b3f8cf529520619307',
+  authorizedReleaseSha: 'e0983be91e2ef45e16712d4115fe22e8dc8cecf2',
 });
 
 function conflict(): never { throw new Error('historical_retirement_conflict'); }
@@ -91,7 +100,7 @@ export async function readHistoricalRetirement(
   };
   const jobRows = records<{ state: string; started_on: Date | null }>(await database.execute(sql`
     select state::text as state, started_on from pgboss.job
-    where id = ${target.repairRunId}::uuid and name = ${REPAIR_BASELINE_QUEUE}
+    where id = ${target.repairRunId}::uuid and name = ${retirementBaselineQueueForRelease(target.authorizedReleaseSha)}
   `));
   if (jobRows.length !== 1) conflict();
   const [attempt] = await database.select({ id: repairRunAttempt.id }).from(repairRunAttempt)

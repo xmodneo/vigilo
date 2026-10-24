@@ -26,6 +26,10 @@ const RETIREMENT_CODE = 'pre_execution_operator_retirement';
 // Compatibility is for exact retirement only; exact execution never accepts it.
 const HISTORICAL_GENERAL_QUEUE_RELEASE = 'fb373deb5a50f4bba38ea7d8c9af4b2fc581e24f';
 
+export function retirementBaselineQueueForRelease(releaseSha: string): typeof REPAIR_BASELINE_QUEUE | typeof REVIEWED_BASELINE_QUEUE {
+  return releaseSha === HISTORICAL_GENERAL_QUEUE_RELEASE ? REPAIR_BASELINE_QUEUE : REVIEWED_BASELINE_QUEUE;
+}
+
 export interface ReviewedRetirementRequest {
   repairRunId: string;
   planIdentity: string;
@@ -113,8 +117,7 @@ export async function retireReviewedStagedRun(
         account.expiresAt.getTime() !== expiry.getTime() || !executionGrantIdentityMatches(account) ||
         operations.some((grant) => !executionGrantIdentityMatches(grant) ||
           !planned.operationGrants.some((expected) => expected.grantIdentity === grant.grantIdentity))) deny();
-    const baselineQueue = request.authorizedReleaseSha === HISTORICAL_GENERAL_QUEUE_RELEASE
-      ? REPAIR_BASELINE_QUEUE : REVIEWED_BASELINE_QUEUE;
+    const baselineQueue = retirementBaselineQueueForRelease(request.authorizedReleaseSha);
     const grantIds = [account.id, ...operations.map((grant) => grant.id)];
     const revocations = await transaction.select().from(executionBudgetGrantRevocation)
       .where(inArray(executionBudgetGrantRevocation.grantId, grantIds));
