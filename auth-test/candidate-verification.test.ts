@@ -11,6 +11,7 @@ import {
   candidateVerificationEvidence,
   candidateVerificationEvent,
   executionBudgetGrant,
+  externalExecutionLease,
   executionProfile,
   githubInstallation,
   investigation,
@@ -332,7 +333,7 @@ test('expired unmatched provider start blocks stale verification restart without
   await context.database.insert(candidateVerificationAttempt).values({ id: randomUUID(), verificationId: verification.id, queueJobId: verification.id,
     attemptNumber: 1, expectedEvidenceId: randomUUID(), ownershipToken: randomUUID(), state: 'active', claimedAt: NOW, heartbeatAt: NOW,
     leaseExpiresAt: new Date(Date.now() - 1_000) });
-  const permit = await new DurableExternalExecutionAuthorizer(context.database, { clock: () => NOW, leaseMs: 10, runtimeReleaseSha: 'd'.repeat(40) }).reserve({
+  const permit = await new DurableExternalExecutionAuthorizer(context.database, { clock: () => NOW, leaseMs: 1_000, runtimeReleaseSha: 'd'.repeat(40) }).reserve({
     scope: { workspaceId: owner.workspace.id, repairRunId: seeded.runId, githubRepositoryId: REPOSITORY_ID, baseCommitSha: COMMIT,
       operationCategory: 'sandbox_verification', providerId: 'vercel' },
     amounts: { logicalRequests: 1, providerAttempts: 1, inputTokens: 0, outputTokens: 0, sandboxIdentities: 0, sandboxRuntimeMs: 0,
@@ -340,7 +341,14 @@ test('expired unmatched provider start blocks stale verification restart without
     sandbox: { name: 'unresolved-verifier', projectId: 'project_test', teamId: 'team_test' },
     providerAccountIdentity: vercelTeamProjectIdentity('team_test', 'project_test') });
   await permit.beginProviderAttempt(); // Lost ownership before any trustworthy outcome was persisted.
-  await new Promise((resolve) => setTimeout(resolve, 20));
+  let expired = false;
+  for (let poll = 0; poll < 150; poll++) {
+    const [lease] = await context.database.select({ expired: sql<boolean>`clock_timestamp() >= ${externalExecutionLease.leaseExpiresAt}` })
+      .from(externalExecutionLease).where(eq(externalExecutionLease.reservationId, permit.reservationId));
+    if (lease?.expired) { expired = true; break; }
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  assert.equal(expired, true, 'the database authority clock must expire the controlled lease');
   let executions = 0;
   const result = await processCandidateVerificationJob(job(verification.id), { configuration: CONFIGURATION, database: context.database, gateway: new Gateway(), logger,
     executor: (async () => { executions++; throw new Error('must not execute'); }) as never, clock: () => new Date(NOW.getTime() + 16 * 60_000) });

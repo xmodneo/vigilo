@@ -22,7 +22,13 @@ import { readHistoricalRetirement, retireExactHistoricalRun } from '../lib/exter
 import { stageReviewedRepairRun } from '../lib/external-execution/reviewed-staging.ts';
 import { DurableExternalExecutionAuthorizer } from '../lib/external-execution/authority.ts';
 import { claimExactReviewedBaselineJob, type ExactBaselineRequest } from '../lib/repair-runs/exact-baseline-job.ts';
-import { AI_CANDIDATE_GENERATION_QUEUE, createRepairBoss, PgBossRepairQueue, PgBossReviewedBaselineQueue, REPAIR_BASELINE_QUEUE, REVIEWED_BASELINE_QUEUE, REPAIR_WORK_OPTIONS } from '../lib/repair-runs/queue.ts';
+import { claimExactPhaseJob, type ExactPhaseRequest } from '../lib/repair-runs/exact-phase-job.ts';
+import { assertSourceReadAuthority, executeExactPhaseOnce } from '../lib/repair-runs/exact-phase-service.ts';
+import { AI_CANDIDATE_GENERATION_QUEUE, createRepairBoss, PgBossAiInvestigationQueue, PgBossAiCandidateGenerationQueue, PgBossCandidateVerificationQueue, PgBossInvestigationQueue, PgBossRepairLoopQueue, PgBossRepairQueue, PgBossReviewedBaselineQueue, REPAIR_BASELINE_QUEUE, REVIEWED_BASELINE_QUEUE, REPAIR_WORK_OPTIONS } from '../lib/repair-runs/queue.ts';
+import { createInvestigation } from '../lib/investigations/flow.ts';
+import { processInvestigationJob } from '../lib/investigations/worker.ts';
+import { startAiInvestigation } from '../lib/ai-investigations/flow.ts';
+import { startRepairLoop } from '../lib/repair-loops/flow.ts';
 import { executeExactBaselineOnce } from '../lib/repair-runs/one-shot-service.ts';
 import { processRepairJob } from '../lib/repair-runs/worker.ts';
 import { getReadinessResult } from '../lib/operations/readiness.ts';
@@ -58,7 +64,7 @@ async function waitForDatabaseExpiry(expiresAt: string): Promise<void> {
   assert.fail('database authority clock did not cross grant expiry');
 }
 
-async function scenario(kind: 'claim' | 'signal_blocked_claim' | 'signal_after_claim' | 'authority_denied' | 'expiry_before_claim' | 'expiry_while_waiting' | 'expiry_before_transition' | 'unreviewed_checkpoint' | 'queue_policy' | 'retire' | 'retire_attempt' | 'retire_reservation' | 'historical_retire' | 'local_retire' | 'local_retire_reviewed' | 'malformed_normal' | 'race' | 'general_race' | 'supervision_characterization' | 'supervision' | 'supervision_blocked' | 'supervision_recovery' | 'execute' | 'execute_failure') {
+async function scenario(kind: 'claim' | 'signal_blocked_claim' | 'signal_after_claim' | 'authority_denied' | 'expiry_before_claim' | 'expiry_while_waiting' | 'expiry_before_transition' | 'unreviewed_checkpoint' | 'queue_policy' | 'retire' | 'retire_attempt' | 'retire_reservation' | 'historical_retire' | 'local_retire' | 'local_retire_reviewed' | 'malformed_normal' | 'race' | 'general_race' | 'supervision_characterization' | 'supervision' | 'supervision_blocked' | 'supervision_recovery' | 'execute' | 'execute_failure' | 'phase_context' | 'phase_context_race' | 'phase_context_revoked' | 'phase_context_late_revocation' | 'phase_context_expired' | 'phase_context_service' | 'phase_context_interrupted' | 'phase_ai' | 'phase_loop' | 'phase_generation' | 'phase_verification') {
   const name = `vigilo_one_shot_${randomUUID().replaceAll('-', '')}`;
   const url = new URL(configured); url.pathname = `/${name}`;
   let first: ReturnType<typeof postgres> | undefined;
@@ -103,7 +109,7 @@ async function scenario(kind: 'claim' | 'signal_blocked_claim' | 'signal_after_c
       buildScript: 'build', testScript: 'test', testRunner: 'node-test', status: 'ready',
       packageJsonBlobSha: profileInput.packageJsonBlobSha, packageJsonContentSha256: profileInput.packageJsonContentSha256,
       packageLockBlobSha: profileInput.packageLockBlobSha, packageLockContentSha256: profileInput.packageLockContentSha256 });
-    const shortExpiry = kind.startsWith('expiry_') || kind === 'local_retire_reviewed';
+    const shortExpiry = kind.startsWith('expiry_') || kind === 'local_retire_reviewed' || kind === 'phase_context_expired';
     const input: ReviewedStagingInput = { kind: 'm77b_repair_v1', repairRunId: randomUUID(), idempotencyKey: randomUUID(),
       githubRepositoryId: repositoryId, installationId, profileIdentity, baseCommitSha: COMMIT,
       authorizedReleaseSha: ['historical_retire', 'local_retire'].includes(kind) ? HISTORICAL_RELEASE : RELEASE,
@@ -352,7 +358,7 @@ async function scenario(kind: 'claim' | 'signal_blocked_claim' | 'signal_after_c
         reasonCode: 'operator_revoked', revokedBy: ownerId });
       await assert.rejects(claimExactReviewedBaselineJob(db, request, RELEASE));
       assert.equal((await boss.getJobById(REVIEWED_BASELINE_QUEUE, request.jobId))?.state, 'created');
-    } else if (kind === 'execute' || kind === 'execute_failure') {
+    } else if (kind === 'execute' || kind === 'execute_failure' || kind.startsWith('phase_')) {
       await db.insert(schema.account).values({ id: randomUUID(), issuer: 'github', accountId: 'native-test',
         providerId: 'github', userId: ownerId });
       const sentinels = new Map<string, string>();
@@ -400,16 +406,201 @@ async function scenario(kind: 'claim' | 'signal_blocked_claim' | 'signal_after_c
             error: { phase: 'test', code: 'npm_command_failed' }, startedAt: at, completedAt: at, durationMs: 1 };
         }) as never,
       }, new AbortController().signal);
-      assert.equal(receipt.result, kind === 'execute' ? 'completed' : 'failed');
-      assert.equal(receipt.repairRunState, kind === 'execute' ? 'ready_for_investigation' : 'infrastructure_failed');
+      assert.equal(receipt.result, kind === 'execute_failure' ? 'failed' : 'completed');
+      assert.equal(receipt.repairRunState, kind === 'execute_failure' ? 'infrastructure_failed' : 'ready_for_investigation');
       assert.equal(baselineCalls, 1);
       assert.equal((await boss.getJobById(REVIEWED_BASELINE_QUEUE, input.repairRunId))?.state,
-        kind === 'execute' ? 'completed' : 'failed');
+        kind === 'execute_failure' ? 'failed' : 'completed');
       for (const [queueName, id] of sentinels)
         assert.equal((await boss.getJobById(queueName, id))?.state, 'created');
       assert.equal((await db.select().from(schema.repairRunAttempt)).length, 1);
-      assert.equal((await db.select().from(schema.repositoryBaseline)).length, kind === 'execute' ? 1 : 0);
+      assert.equal((await db.select().from(schema.repositoryBaseline)).length, kind === 'execute_failure' ? 0 : 1);
       assert.equal((await db.select().from(schema.externalExecutionReservation)).length, 0);
+      if (kind.startsWith('phase_')) {
+        const context = await createInvestigation(db, actor, input.repairRunId, randomUUID(), new PgBossInvestigationQueue(boss));
+        const fakeGateway = {
+          getInstallation: async () => ({ id: installationId, appId: 991, appSlug: 'test', suspendedAt: null }),
+          createInstallationAccessToken: async () => ({ accessToken: 'disposable-test-token', repository: {
+            id: repositoryId, isPrivate: false, name: 'fixture', ownerLogin: 'octo',
+          } }),
+          getCommitTree: async () => ({ commitSha: COMMIT, treeSha: 'd'.repeat(40) }),
+          getTree: async () => ({ entries: [], truncated: false }),
+          getBlob: async () => ({ bytes: Buffer.alloc(0), sha: 'e'.repeat(40) }),
+          revokeInstallationAccessToken: async () => {},
+        };
+        if (['phase_ai', 'phase_loop', 'phase_generation', 'phase_verification'].includes(kind)) {
+          const result = await processInvestigationJob({
+            id: context.id, data: { version: 1, investigationId: context.id }, signal: new AbortController().signal,
+          } as never, { database: db, gateway: fakeGateway, configuration: {
+            appId: 991, appSlug: 'test', clientId: 'Iv1.test', baseUrl: 'http://localhost:3000',
+          }, logger: { write: () => {} } });
+          assert.equal(result.status, 'completed');
+          assert.equal((await db.select({ state: schema.investigation.state }).from(schema.investigation)
+            .where(eq(schema.investigation.id, context.id)))[0]?.state, 'ready');
+          const ai = await startAiInvestigation(db, actor, context.id, new PgBossAiInvestigationQueue(boss));
+          if (kind !== 'phase_ai') {
+            const completedAt = new Date();
+            await db.update(schema.aiInvestigation).set({ state: 'investigating',
+              investigationStartedAt: completedAt, updatedAt: completedAt,
+            }).where(eq(schema.aiInvestigation.id, ai.id));
+            await db.update(schema.aiInvestigation).set({ state: 'completed',
+              completedAt, updatedAt: completedAt,
+              completionReason: 'model_conclusion', conclusionStatus: 'diagnosis_found',
+              summary: 'Mocked diagnosis from the measured baseline.',
+              suspectedFiles: [{ path: 'src/fixture.ts', reason: 'Measured failure.' }],
+              evidenceReferences: [{ kind: 'baseline', reference: input.repairRunId }],
+              proposedApproach: 'Fix the underlying fixture defect.', confidence: 'medium',
+            }).where(eq(schema.aiInvestigation.id, ai.id));
+            const loop = await startRepairLoop(db, actor, input.repairRunId, {
+              enqueueRepairLoop: new PgBossRepairLoopQueue(boss).enqueueRepairLoop.bind(new PgBossRepairLoopQueue(boss)),
+              enqueueAiCandidateGeneration: new PgBossAiCandidateGenerationQueue(boss).enqueueAiCandidateGeneration.bind(new PgBossAiCandidateGenerationQueue(boss)),
+            });
+            const [generation] = await db.select().from(schema.aiCandidateGeneration)
+              .where(eq(schema.aiCandidateGeneration.repairRunId, input.repairRunId)).limit(1);
+            assert.ok(generation);
+            const phase = kind === 'phase_loop' ? 'loop' : kind === 'phase_generation' ? 'generation' : 'verification';
+            let targetJobId = kind === 'phase_loop' ? (await db.select().from(schema.repairLoop)
+              .where(eq(schema.repairLoop.id, loop.id)))[0]!.wakeJobId! : generation.id;
+            if (kind === 'phase_verification') {
+              const candidateId = randomUUID(); const verificationId = randomUUID(); const candidateIdentity = '4'.repeat(64);
+              const [currentRun] = await db.select({ baselineId: schema.repairRun.baselineId }).from(schema.repairRun)
+                .where(eq(schema.repairRun.id, input.repairRunId));
+              assert.ok(currentRun?.baselineId);
+              await db.insert(schema.repairCandidate).values({ id: candidateId, investigationId: context.id,
+                repairRunId: input.repairRunId, workspaceId, githubRepositoryId: repositoryId,
+                installationId, baseCommitSha: COMMIT, profileIdentity, formatVersion: 1,
+                ordinal: 1, proposalKey: generation.id, proposalIdentity: '5'.repeat(64),
+                candidateIdentity, state: 'frozen', changedFileCount: 1, totalResultBytes: 1,
+                freezingStartedAt: completedAt, completedAt, updatedAt: completedAt });
+              await db.insert(schema.candidateVerification).values({ id: verificationId, candidateId,
+                investigationId: context.id, repairRunId: input.repairRunId, baselineId: currentRun.baselineId,
+                workspaceId, githubRepositoryId: repositoryId, installationId,
+                baseCommitSha: COMMIT, profileIdentity, candidateIdentity, formatVersion: 1,
+                state: 'queued', queuedAt: completedAt, updatedAt: completedAt });
+              const queued = await new PgBossCandidateVerificationQueue(boss).enqueueVerification(db as never,
+                { version: 1, verificationId });
+              assert.equal(queued, verificationId);
+              targetJobId = verificationId;
+            }
+            const workerId = randomUUID();
+            const heartbeat = new WorkerHeartbeatLifecycle(new PostgresWorkerHeartbeatStore(first), {
+              id: workerId, releaseSha: RELEASE, kind: 'exact-phase-one-shot', phase,
+              targetRepairRunId: input.repairRunId, targetJobId,
+            });
+            await heartbeat.start(); await heartbeat.ready();
+            try {
+              const phaseRequest: ExactPhaseRequest = { phase, repairRunId: input.repairRunId,
+                jobId: targetJobId, planIdentity: plan.planIdentity, repositoryId, revision: COMMIT, releaseSha: RELEASE };
+              assert.equal((await claimExactPhaseJob(db, phaseRequest, RELEASE, workerId)).id, targetJobId);
+              await assert.rejects(claimExactPhaseJob(db, phaseRequest, RELEASE, workerId));
+              for (const [queueName, id] of sentinels)
+                assert.equal((await boss.getJobById(queueName, id))?.state, 'created');
+              if (kind === 'phase_loop') assert.equal((await boss.getJobById(AI_CANDIDATE_GENERATION_QUEUE, generation.id))?.state, 'created');
+              if (kind === 'phase_generation') assert.equal((await boss.getJobById('repair-loop-v1',
+                (await db.select().from(schema.repairLoop).where(eq(schema.repairLoop.id, loop.id)))[0]!.wakeJobId!))?.state, 'created');
+            } finally { await heartbeat.draining(); await heartbeat.stopped(); }
+            return true;
+          }
+          const workerId = randomUUID();
+          const heartbeat = new WorkerHeartbeatLifecycle(new PostgresWorkerHeartbeatStore(first), {
+            id: workerId, releaseSha: RELEASE, kind: 'exact-phase-one-shot', phase: 'investigation',
+            targetRepairRunId: input.repairRunId, targetJobId: ai.id,
+          });
+          await heartbeat.start(); await heartbeat.ready();
+          try {
+            const aiRequest: ExactPhaseRequest = { phase: 'investigation', repairRunId: input.repairRunId,
+              jobId: ai.id, planIdentity: plan.planIdentity, repositoryId, revision: COMMIT, releaseSha: RELEASE };
+            assert.equal((await claimExactPhaseJob(db, aiRequest, RELEASE, workerId)).id, ai.id);
+            await assert.rejects(claimExactPhaseJob(db, aiRequest, RELEASE, workerId));
+            assert.equal((await boss.getJobById('ai-investigation-v1', ai.id))?.state, 'active');
+            assert.equal((await boss.getJobById('investigation-context-v1', context.id))?.state, 'created');
+            for (const [queueName, id] of sentinels)
+              assert.equal((await boss.getJobById(queueName, id))?.state, 'created');
+          } finally { await heartbeat.draining(); await heartbeat.stopped(); }
+          return true;
+        }
+        const workerId = randomUUID();
+        const heartbeat = new WorkerHeartbeatLifecycle(new PostgresWorkerHeartbeatStore(first), {
+          id: workerId, releaseSha: RELEASE, kind: 'exact-phase-one-shot', phase: 'context',
+          targetRepairRunId: input.repairRunId, targetJobId: context.id,
+        });
+        await heartbeat.start(); await heartbeat.ready();
+        const phaseRequest: ExactPhaseRequest = { phase: 'context', repairRunId: input.repairRunId,
+          jobId: context.id, planIdentity: plan.planIdentity, repositoryId, revision: COMMIT, releaseSha: RELEASE };
+        try {
+          for (const changed of [
+            { jobId: randomUUID() }, { planIdentity: 'f'.repeat(64) }, { repositoryId: repositoryId + 1 },
+            { revision: 'f'.repeat(40) }, { releaseSha: 'e'.repeat(40) },
+          ]) await assert.rejects(claimExactPhaseJob(db, { ...phaseRequest, ...changed }, RELEASE, workerId));
+          assert.equal((await boss.getJobById('investigation-context-v1', context.id))?.state, 'created');
+          if (kind === 'phase_context_revoked') {
+            const [grant] = await db.select().from(schema.executionBudgetGrant).where(eq(schema.executionBudgetGrant.repairRunId, input.repairRunId)).limit(1);
+            assert.ok(grant);
+            await db.insert(schema.executionBudgetGrantRevocation).values({
+              id: randomUUID(), grantId: grant.id, reasonCode: 'operator_revoked', revokedBy: ownerId,
+            });
+            await assert.rejects(claimExactPhaseJob(db, phaseRequest, RELEASE, workerId));
+            assert.equal((await boss.getJobById('investigation-context-v1', context.id))?.state, 'created');
+          } else if (kind === 'phase_context_late_revocation') {
+            assert.equal((await claimExactPhaseJob(db, phaseRequest, RELEASE, workerId)).id, context.id);
+            const [grant] = await db.select().from(schema.executionBudgetGrant)
+              .where(eq(schema.executionBudgetGrant.repairRunId, input.repairRunId)).limit(1);
+            assert.ok(grant);
+            await db.insert(schema.executionBudgetGrantRevocation).values({
+              id: randomUUID(), grantId: grant.id, reasonCode: 'operator_revoked', revokedBy: ownerId,
+            });
+            await assert.rejects(assertSourceReadAuthority(db, phaseRequest, RELEASE,
+              new AbortController().signal));
+            assert.equal((await boss.getJobById('investigation-context-v1', context.id))?.state, 'active');
+          } else if (kind === 'phase_context_expired') {
+            await waitForDatabaseExpiry(input.expiresAt);
+            await assert.rejects(claimExactPhaseJob(db, phaseRequest, RELEASE, workerId));
+            assert.equal((await boss.getJobById('investigation-context-v1', context.id))?.state, 'created');
+          } else if (kind === 'phase_context_service') {
+            const outcome = await executeExactPhaseOnce(phaseRequest, {
+              database: db, boss, configuration: {
+                appId: 991, appSlug: 'test', clientId: 'Iv1.test', baseUrl: 'http://localhost:3000',
+              }, gateway: fakeGateway as never, workerHeartbeatId: workerId,
+              runtimeReleaseSha: RELEASE,
+              executionAuthority: new DurableExternalExecutionAuthorizer(db, { runtimeReleaseSha: RELEASE }),
+            }, new AbortController().signal);
+            assert.equal(outcome.result, 'completed');
+            assert.equal(outcome.subjectState, 'ready');
+            assert.equal((await boss.getJobById('investigation-context-v1', context.id))?.state, 'completed');
+          } else if (kind === 'phase_context_interrupted') {
+            const shutdown = new AbortController();
+            const outcome = await executeExactPhaseOnce(phaseRequest, {
+              database: db, boss, configuration: {
+                appId: 991, appSlug: 'test', clientId: 'Iv1.test', baseUrl: 'http://localhost:3000',
+              }, gateway: fakeGateway as never, workerHeartbeatId: workerId,
+              runtimeReleaseSha: RELEASE,
+              executionAuthority: new DurableExternalExecutionAuthorizer(db, { runtimeReleaseSha: RELEASE }),
+            }, shutdown.signal, { runJob: async () => {
+              shutdown.abort();
+              throw new Error('inert_interruption');
+            } });
+            assert.equal(outcome.result, 'failed');
+            assert.equal((await boss.getJobById('investigation-context-v1', context.id))?.state, 'failed');
+            assert.equal((await db.select({ state: schema.investigation.state }).from(schema.investigation)
+              .where(eq(schema.investigation.id, context.id)))[0]?.state, 'created');
+          } else if (kind === 'phase_context_race') {
+            const settled = await Promise.allSettled([
+              claimExactPhaseJob(db, phaseRequest, RELEASE, workerId),
+              claimExactPhaseJob(db2, phaseRequest, RELEASE, workerId),
+            ]);
+            assert.equal(settled.filter((value) => value.status === 'fulfilled').length, 1);
+            assert.equal(settled.filter((value) => value.status === 'rejected').length, 1);
+            assert.equal((await boss.getJobById('investigation-context-v1', context.id))?.state, 'active');
+          } else {
+            const claimed = await claimExactPhaseJob(db, phaseRequest, RELEASE, workerId);
+            assert.equal(claimed.id, context.id);
+            assert.equal((await boss.getJobById('investigation-context-v1', context.id))?.state, 'active');
+            await assert.rejects(claimExactPhaseJob(db, phaseRequest, RELEASE, workerId));
+          }
+          for (const [queueName, id] of sentinels)
+            assert.equal((await boss.getJobById(queueName, id))?.state, 'created');
+        } finally { await heartbeat.draining(); await heartbeat.stopped(); }
+      }
     } else if (kind === 'retire_attempt' || kind === 'retire_reservation') {
       if (kind === 'retire_attempt') {
         const at = new Date();
@@ -754,7 +945,7 @@ async function scenario(kind: 'claim' | 'signal_blocked_claim' | 'signal_after_c
 }
 
 try {
-  const kinds = ['claim', 'signal_blocked_claim', 'signal_after_claim', 'authority_denied', 'expiry_before_claim', 'expiry_while_waiting', 'expiry_before_transition', 'unreviewed_checkpoint', 'queue_policy', 'retire', 'retire_attempt', 'retire_reservation', 'historical_retire', 'local_retire', 'local_retire_reviewed', 'malformed_normal', 'race', 'general_race', 'supervision_characterization', 'supervision', 'supervision_blocked', 'supervision_recovery', 'execute', 'execute_failure'] as const;
+  const kinds = ['claim', 'signal_blocked_claim', 'signal_after_claim', 'authority_denied', 'expiry_before_claim', 'expiry_while_waiting', 'expiry_before_transition', 'unreviewed_checkpoint', 'queue_policy', 'retire', 'retire_attempt', 'retire_reservation', 'historical_retire', 'local_retire', 'local_retire_reviewed', 'malformed_normal', 'race', 'general_race', 'supervision_characterization', 'supervision', 'supervision_blocked', 'supervision_recovery', 'execute', 'execute_failure', 'phase_context', 'phase_context_race', 'phase_context_revoked', 'phase_context_late_revocation', 'phase_context_expired', 'phase_context_service', 'phase_context_interrupted', 'phase_ai', 'phase_loop', 'phase_generation', 'phase_verification'] as const;
   const selected = process.argv[2];
   if (selected && !kinds.includes(selected as typeof kinds[number])) throw new Error('unknown_isolated_baseline_scenario');
   for (const kind of selected ? [selected as typeof kinds[number]] : kinds) assert.equal(await scenario(kind), true);

@@ -3,11 +3,15 @@ import type postgres from 'postgres';
 import { canonicalRepairQueues } from './queues.ts';
 import { EXPECTED_SCHEMA_VERSION } from './migrations.ts';
 import { REVIEWED_BASELINE_QUEUE } from '../repair-runs/queue.ts';
+import { exactPhaseQueues, type ExactPhase } from '../repair-runs/exact-phase-job.ts';
 
 export type WorkerHeartbeatState = 'starting' | 'ready' | 'draining' | 'stopped';
 
 export type WorkerHeartbeatIdentity = { id: string; releaseSha: string; kind?: 'general' } | {
   id: string; releaseSha: string; kind: 'baseline-one-shot'; targetRepairRunId: string; targetJobId: string;
+} | {
+  id: string; releaseSha: string; kind: 'exact-phase-one-shot'; phase: ExactPhase;
+  targetRepairRunId: string; targetJobId: string;
 };
 
 export type WorkerHeartbeatValue = WorkerHeartbeatIdentity & {
@@ -26,11 +30,14 @@ export class PostgresWorkerHeartbeatStore implements WorkerHeartbeatStore {
 
   async create(value: WorkerHeartbeatValue): Promise<void> {
     const oneShot = value.kind === 'baseline-one-shot';
+    const exact = value.kind === 'exact-phase-one-shot';
+    const targeted = oneShot || exact;
     await this.client`
       insert into operational_worker_heartbeat
-        (id, service, release_sha, expected_schema_version, registered_queues, target_repair_run_id, target_job_id, state, started_at, last_heartbeat_at)
-      values (${value.id}, ${oneShot ? 'vigilo-baseline-one-shot' : 'vigilo-worker'}, ${value.releaseSha}, ${EXPECTED_SCHEMA_VERSION}, ${JSON.stringify(value.registeredQueues)}::text::jsonb,
-        ${oneShot ? value.targetRepairRunId : null}, ${oneShot ? value.targetJobId : null}, 'starting', statement_timestamp(), statement_timestamp())
+        (id, service, release_sha, expected_schema_version, registered_queues, target_repair_run_id, target_job_id, target_queue_name, state, started_at, last_heartbeat_at)
+      values (${value.id}, ${oneShot ? 'vigilo-baseline-one-shot' : exact ? 'vigilo-exact-one-shot' : 'vigilo-worker'}, ${value.releaseSha}, ${EXPECTED_SCHEMA_VERSION}, ${JSON.stringify(value.registeredQueues)}::text::jsonb,
+        ${targeted ? value.targetRepairRunId : null}, ${targeted ? value.targetJobId : null},
+        ${exact ? exactPhaseQueues[value.phase] : null}, 'starting', statement_timestamp(), statement_timestamp())
     `;
   }
 
@@ -71,10 +78,12 @@ export class WorkerHeartbeatLifecycle {
 
   async start(): Promise<void> {
     if (this.state !== 'new') throw new Error('worker_heartbeat_transition_invalid');
-    await this.store.create({ ...this.identity, state: 'starting', registeredQueues: this.identity.kind === 'baseline-one-shot' ? [REVIEWED_BASELINE_QUEUE] : canonicalRepairQueues });
+    await this.store.create({ ...this.identity, state: 'starting', registeredQueues: this.identity.kind === 'baseline-one-shot'
+      ? [REVIEWED_BASELINE_QUEUE] : this.identity.kind === 'exact-phase-one-shot'
+        ? [exactPhaseQueues[this.identity.phase]] : canonicalRepairQueues });
     this.state = 'starting';
     // The exact-job process has no authority to prune unrelated worker rows.
-    if (this.identity.kind !== 'baseline-one-shot') await this.store.cleanup();
+    if (this.identity.kind !== 'baseline-one-shot' && this.identity.kind !== 'exact-phase-one-shot') await this.store.cleanup();
   }
 
   async ready(): Promise<void> {

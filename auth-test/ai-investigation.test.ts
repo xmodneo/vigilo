@@ -76,7 +76,8 @@ function job(id: string) { return { id, name: 'ai-investigation-v1', data: { ver
 async function activateAiInvestigation(context: Awaited<ReturnType<typeof createTestContext>>, aiInvestigationId: string) {
   const attemptId = randomUUID(); const ownershipToken = randomUUID();
   await context.database.update(aiInvestigation).set({ state: 'investigating', investigationStartedAt: NOW, updatedAt: NOW }).where(eq(aiInvestigation.id, aiInvestigationId));
-  await context.database.insert(aiInvestigationAttempt).values({ id: attemptId, aiInvestigationId, queueJobId: aiInvestigationId, attemptNumber: 1, ownershipToken, state: 'active', claimedAt: NOW, heartbeatAt: NOW, leaseExpiresAt: new Date(NOW.getTime() + 60_000) });
+  const leaseExpiresAt = new Date(Date.now() + 60_000);
+  await context.database.insert(aiInvestigationAttempt).values({ id: attemptId, aiInvestigationId, queueJobId: aiInvestigationId, attemptNumber: 1, ownershipToken, state: 'active', claimedAt: NOW, heartbeatAt: NOW, leaseExpiresAt });
   return { aiInvestigationId, aiInvestigationAttemptId: attemptId, ownershipToken };
 }
 

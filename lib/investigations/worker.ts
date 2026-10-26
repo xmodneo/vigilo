@@ -27,6 +27,7 @@ export interface InvestigationWorkerDependencies {
   shutdownSignal?: AbortSignal;
   clock?: () => Date;
   randomId?: () => string;
+  beforeExternalSourceRead?: () => Promise<void>;
 }
 
 type Claim = { kind: 'owned'; investigation: StoredInvestigation } | { kind: 'busy' | 'terminal' | 'exhausted'; investigation: StoredInvestigation };
@@ -157,6 +158,7 @@ export async function processInvestigationJob(job: InvestigationQueueJob, depend
     controller.signal.throwIfAborted();
     await assertPublicRepositoryAuthority(dependencies.database, owned.workspaceId, owned.githubRepositoryId);
     await validateBinding(dependencies.database, owned);
+    await dependencies.beforeExternalSourceRead?.();
     const context = await withScopedRepositoryToken(dependencies.gateway, dependencies.configuration, owned, async ({ accessToken, owner, repository }) => {
       controller.signal.throwIfAborted();
       const commit = await dependencies.gateway.getCommitTree({ accessToken, owner, repository, commitSha: owned.baseCommitSha });
