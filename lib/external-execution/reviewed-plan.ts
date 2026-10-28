@@ -1,4 +1,7 @@
 import { executionBudgetGrant } from '../../db/schema.ts';
+import { AI_LIMITS } from '../ai-investigations/types.ts';
+import { MAX_GEMINI_SERIALIZED_REQUEST_BYTES } from '../ai-investigations/request-budget.ts';
+import { AI_CANDIDATE_GENERATION_LIMITS } from '../ai-candidate-generations/types.ts';
 import { normalizeRepairObjective } from '../repair-runs/intent.ts';
 import { canonicalRecord } from '../repair-loops/canonical.ts';
 import { computeExecutionGrantIdentity } from './identity.ts';
@@ -49,21 +52,58 @@ const ZERO: Limits = {
   repairLoopIterations: 0, maxConcurrentExternalOperations: 0,
 };
 
+// Reviewed authority is pinned. Changes to protocol limits require a new
+// explicit review; they must not silently enlarge grants at plan construction.
+const INVESTIGATION_REQUESTS = 7;
+const GENERATION_REQUESTS = 6;
+const REVIEWED_REQUEST_BYTES = 256 * 1024;
+const INVESTIGATION_INPUT_BYTES = INVESTIGATION_REQUESTS * REVIEWED_REQUEST_BYTES;
+const GENERATION_INPUT_BYTES = GENERATION_REQUESTS * REVIEWED_REQUEST_BYTES;
+const INVESTIGATION_OUTPUT_TOKENS = 17_500;
+const GENERATION_OUTPUT_TOKENS = 36_000;
+
 export const REVIEWED_ACCOUNT_LIMITS: Limits = Object.freeze({
-  ...ZERO, logicalRequests: 8, providerAttempts: 197, inputTokens: 32_768,
-  outputTokens: 23_000, sandboxIdentities: 2, sandboxRuntimeMs: 1_200_000,
+  ...ZERO, logicalRequests: 16, providerAttempts: 205,
+  inputTokens: INVESTIGATION_INPUT_BYTES + GENERATION_INPUT_BYTES,
+  outputTokens: INVESTIGATION_OUTPUT_TOKENS + GENERATION_OUTPUT_TOKENS,
+  sandboxIdentities: 2, sandboxRuntimeMs: 1_200_000,
   verificationAttempts: 1, repairLoopIterations: 1, maxConcurrentExternalOperations: 1,
 });
 
 const OPERATION_SPECS = Object.freeze([
-  { category: 'gemini_investigation', providerId: 'google', modelId: 'gemini-3.1-flash-lite', limits: { ...ZERO, logicalRequests: 2, providerAttempts: 2, inputTokens: 12_288, outputTokens: 5_000 } },
-  { category: 'gemini_candidate_generation', providerId: 'google', modelId: 'gemini-3.1-flash-lite', limits: { ...ZERO, logicalRequests: 3, providerAttempts: 3, inputTokens: 20_480, outputTokens: 18_000 } },
+  { category: 'gemini_investigation', providerId: 'google', modelId: 'gemini-3.1-flash-lite', limits: { ...ZERO, logicalRequests: INVESTIGATION_REQUESTS, providerAttempts: INVESTIGATION_REQUESTS, inputTokens: INVESTIGATION_INPUT_BYTES, outputTokens: INVESTIGATION_OUTPUT_TOKENS } },
+  { category: 'gemini_candidate_generation', providerId: 'google', modelId: 'gemini-3.1-flash-lite', limits: { ...ZERO, logicalRequests: GENERATION_REQUESTS, providerAttempts: GENERATION_REQUESTS, inputTokens: GENERATION_INPUT_BYTES, outputTokens: GENERATION_OUTPUT_TOKENS } },
   { category: 'sandbox_baseline', providerId: 'vercel', modelId: null, limits: { ...ZERO, logicalRequests: 1, providerAttempts: 96, sandboxIdentities: 1, sandboxRuntimeMs: 600_000, sandboxResourceClass: 'vcpu_1' as const } },
   { category: 'sandbox_verification', providerId: 'vercel', modelId: null, limits: { ...ZERO, logicalRequests: 1, providerAttempts: 96, sandboxIdentities: 1, sandboxRuntimeMs: 600_000, sandboxResourceClass: 'vcpu_1' as const, verificationAttempts: 1 } },
   { category: 'repair_loop_iteration', providerId: 'vigilo', modelId: null, limits: { ...ZERO, logicalRequests: 1, repairLoopIterations: 1 } },
 ] as const);
 
 export const REVIEWED_OPERATION_CATEGORIES = Object.freeze(OPERATION_SPECS.map((spec) => spec.category));
+
+/** Fail closed if a protocol or grant constant changes without the other. */
+export function assertReviewedBudgetCompatibility(): void {
+  const investigation = OPERATION_SPECS[0].limits;
+  const generation = OPERATION_SPECS[1].limits;
+  if (AI_LIMITS.maxToolBearingTurns + AI_LIMITS.reservedFinalizationTurns !== INVESTIGATION_REQUESTS ||
+      AI_CANDIDATE_GENERATION_LIMITS.maxToolBearingTurns + AI_CANDIDATE_GENERATION_LIMITS.reservedFinalizationTurns !== GENERATION_REQUESTS ||
+      AI_LIMITS.maxModelTurns !== INVESTIGATION_REQUESTS ||
+      AI_CANDIDATE_GENERATION_LIMITS.maxModelTurns !== GENERATION_REQUESTS ||
+      MAX_GEMINI_SERIALIZED_REQUEST_BYTES !== REVIEWED_REQUEST_BYTES ||
+      INVESTIGATION_REQUESTS * AI_LIMITS.maxOutputTokens !== INVESTIGATION_OUTPUT_TOKENS ||
+      GENERATION_REQUESTS * AI_CANDIDATE_GENERATION_LIMITS.maxOutputTokens !== GENERATION_OUTPUT_TOKENS ||
+      investigation.logicalRequests !== INVESTIGATION_REQUESTS || investigation.providerAttempts !== INVESTIGATION_REQUESTS ||
+      investigation.inputTokens !== INVESTIGATION_INPUT_BYTES || investigation.outputTokens !== INVESTIGATION_OUTPUT_TOKENS ||
+      generation.logicalRequests !== GENERATION_REQUESTS || generation.providerAttempts !== GENERATION_REQUESTS ||
+      generation.inputTokens !== GENERATION_INPUT_BYTES || generation.outputTokens !== GENERATION_OUTPUT_TOKENS) {
+    throw new Error('reviewed_plan_budget_invalid');
+  }
+  for (const field of ['logicalRequests', 'providerAttempts', 'inputTokens', 'outputTokens',
+    'sandboxIdentities', 'sandboxRuntimeMs', 'verificationAttempts', 'repairLoopIterations'] as const) {
+    const total = OPERATION_SPECS.reduce((sum, spec) => sum + spec.limits[field], 0);
+    if (REVIEWED_ACCOUNT_LIMITS[field] !== total) throw new Error('reviewed_plan_budget_invalid');
+  }
+  if (REVIEWED_ACCOUNT_LIMITS.maxConcurrentExternalOperations !== 1) throw new Error('reviewed_plan_budget_invalid');
+}
 
 function exactKeys(value: unknown, keys: readonly string[]): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value) &&
@@ -141,6 +181,7 @@ export function computeReviewedPlanIdentity(facts: ReviewedPlanIdentityFacts): s
 }
 
 export function buildReviewedStagingPlan(actor: ReviewedStagingActor, input: ReviewedStagingInput, now = new Date()) {
+  assertReviewedBudgetCompatibility();
   const expiry = validateInput(input, now);
   if (!actor.workspaceId || !actor.reviewerUserId) throw new Error('reviewed_plan_invalid');
   const objective = normalizeRepairObjective(input.objective);

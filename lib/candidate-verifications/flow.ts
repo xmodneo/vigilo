@@ -19,6 +19,7 @@ import type { VigiloDatabase } from '../db/types.ts';
 import { assertRunBusinessAllowed, lockExternalExecution } from '../external-execution/business-fence.ts';
 import { ExternalExecutionAuthorityError } from '../external-execution/types.ts';
 import { assertMatchedSourceCheckpoint } from '../external-execution/source-checkpoint.ts';
+import { assertReviewedHandoffAuthority } from '../external-execution/reviewed-handoff-authority.ts';
 import { RepositoryPolicyError, assertPublicRepositoryAuthority } from '../github-repositories/policy.ts';
 import { selfCheckRepairCandidate } from '../repair-candidates/flow.ts';
 import { frozenBaselineProfile } from '../repository-baselines/authority.ts';
@@ -110,7 +111,7 @@ export async function startCandidateVerification(
   context: AuthenticatedWorkspace,
   candidateId: string,
   queue: TransactionalCandidateVerificationQueue,
-  options: { clock?: () => Date; randomId?: () => string; reverify?: boolean } = {},
+  options: { clock?: () => Date; randomId?: () => string; reverify?: boolean; runtimeReleaseSha?: string } = {},
 ): Promise<CandidateVerificationResult> {
   const clock = options.clock ?? (() => new Date());
   const randomId = options.randomId ?? randomUUID;
@@ -150,6 +151,7 @@ export async function startCandidateVerification(
       catch (error) { if (error instanceof RepositoryPolicyError) throw new CandidateVerificationError(error.code); throw error; }
       const [lockedRun] = await transaction.select({ id: repairRun.id }).from(repairRun).where(and(eq(repairRun.id, candidate.repairRunId), eq(repairRun.workspaceId, context.workspace.id))).for('update').limit(1);
       if (!lockedRun) throw new CandidateVerificationError('verification_authority_mismatch');
+      await assertReviewedHandoffAuthority(transaction, context, lockedRun.id, options.runtimeReleaseSha);
       await assertMatchedSourceCheckpoint(transaction, lockedRun.id);
       const [review] = await transaction.select({ id: humanReviewDecision.id }).from(humanReviewDecision).where(eq(humanReviewDecision.repairRunId, candidate.repairRunId)).limit(1);
       if (review) throw new CandidateVerificationError('repair_run_reviewed');

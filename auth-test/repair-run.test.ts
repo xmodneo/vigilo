@@ -8,6 +8,7 @@ import { eq } from 'drizzle-orm';
 import {
   executionProfile,
   githubInstallation,
+  repairIntent,
   repairRun,
   repairRunAttempt,
   repairRunEvent,
@@ -238,7 +239,7 @@ test('Repair Run state and baseline classification remain fail-closed', () => {
   for (const value of ['installation_failed', 'timed_out', 'infrastructure_failed', 'cleanup_failed'] as const) assert.equal(classifyBaselineOutcome(value), 'infrastructure_failed');
 });
 
-test('web start atomically creates immutable run, event, and minimal durable responsibility without inline execution', async (t) => {
+test('legacy internal fixture atomically creates immutable run, event, and minimal durable responsibility without inline execution', async (t) => {
   const context = await createTestContext(); t.after(() => context.client.close());
   const owner = await authenticated(context); await seed(context, owner);
   const queue = new MemoryQueue();
@@ -251,7 +252,7 @@ test('web start atomically creates immutable run, event, and minimal durable res
   assert.doesNotMatch(JSON.stringify(queue.payloads), /workspace|repository|installation|commit|profile|token|secret|command/i);
 });
 
-test('failed handoff rolls back the Repair Run and its event', async (t) => {
+test('legacy internal fixture rolls back the Repair Run and event on failed queue handoff', async (t) => {
   const context = await createTestContext(); t.after(() => context.client.close());
   const owner = await authenticated(context); await seed(context, owner);
   const queue = new MemoryQueue(); queue.fail = true;
@@ -260,7 +261,7 @@ test('failed handoff rolls back the Repair Run and its event', async (t) => {
   assert.equal((await context.database.select().from(repairRunEvent)).length, 0);
 });
 
-test('repeated and concurrent starts reuse one queued run', async (t) => {
+test('legacy internal fixture reuses one queued run under repeated and concurrent calls', async (t) => {
   const context = await createTestContext(); t.after(() => context.client.close());
   const owner = await authenticated(context); await seed(context, owner);
   const queue = new MemoryQueue();
@@ -589,22 +590,40 @@ test('database constraints reject duplicate ownership and fabricated success', a
   await assert.rejects(context.database.insert(repairRun).values({ id: randomUUID(), workspaceId: owner.workspace.id, githubRepositoryId: REPOSITORY_ID, installationId: INSTALLATION_ID, profileIdentity: run.identity.profileIdentity, baseCommitSha: COMMIT, idempotencyKey: randomUUID(), state: 'ready_for_investigation', baselineStartedAt: NOW, completedAt: NOW, createdAt: NOW, stateChangedAt: NOW, updatedAt: NOW }));
 });
 
-test('protected async API accepts only idempotent intent and remains workspace scoped', async (t) => {
+test('legacy Start Repair POST is authenticated, same-origin, and cannot create operational work', async (t) => {
   const context = await createTestContext(); t.after(() => context.client.close());
   const owner = await authenticated(context, 'api-owner'); await seed(context, owner);
   const outsider = await authenticated(context, 'api-outsider');
   const queue = new MemoryQueue();
   const handlers = createRepairRunHandlers({ configuration: CONFIGURATION, database: context.database, queue, resolveContext: async () => owner });
   const key = randomUUID();
-  const response = await handlers.start(new Request('http://localhost:3000/api/repair-runs', { method: 'POST', headers: { origin: CONFIGURATION.baseUrl }, body: new URLSearchParams({ idempotencyKey: key, objective: OBJECTIVE }) }));
-  assert.equal(response.status, 303); assert.equal(queue.payloads.length, 1);
-  const runId = queue.payloads[0]?.repairRunId; assert.ok(runId);
+  const request = () => new Request('http://localhost:3000/api/repair-runs', { method: 'POST', headers: { origin: CONFIGURATION.baseUrl }, body: new URLSearchParams({ idempotencyKey: key, objective: OBJECTIVE }) });
+  const responses = await Promise.all([handlers.start(request()), handlers.start(request()), handlers.start(request())]);
+  for (const response of responses) {
+    assert.equal(response.status, 410);
+    assert.deepEqual(await response.json(), { error: 'reviewed_start_required' });
+  }
+  const repeated = await handlers.start(request());
+  assert.equal(repeated.status, 410);
+  assert.equal((await context.database.select().from(repairRun)).length, 0);
+  assert.equal((await context.database.select().from(repairIntent)).length, 0);
+  assert.equal((await context.database.select().from(repairRunEvent)).length, 0);
+  assert.equal(queue.payloads.length, 0);
+  assert.equal((await handlers.start(new Request('http://localhost:3000/api/repair-runs', { method: 'POST', headers: { origin: 'https://attacker.example' } }))).status, 403);
+  const runId = randomUUID();
+  await context.database.insert(repairRun).values({ id: runId, workspaceId: owner.workspace.id, githubRepositoryId: REPOSITORY_ID,
+    installationId: INSTALLATION_ID, profileIdentity: profileValues(owner.workspace.id).profileIdentity,
+    baseCommitSha: COMMIT, idempotencyKey: randomUUID(), state: 'created' });
   const read = await handlers.read(new Request(`http://localhost:3000/api/repair-runs/${runId}`), runId);
   assert.equal(read.status, 200); assert.equal((await read.json()).repairRun.state, 'created');
   const outsiderHandlers = createRepairRunHandlers({ configuration: CONFIGURATION, database: context.database, queue, resolveContext: async () => outsider });
   assert.equal((await outsiderHandlers.read(new Request(`http://localhost:3000/api/repair-runs/${runId}`), runId)).status, 404);
-  const forged = await handlers.start(new Request('http://localhost:3000/api/repair-runs', { method: 'POST', headers: { origin: CONFIGURATION.baseUrl }, body: new URLSearchParams({ idempotencyKey: randomUUID(), objective: OBJECTIVE, repositoryId: '999', state: 'ready_for_investigation' }) }));
-  assert.match(forged.headers.get('location') ?? '', /invalid_idempotency_key/);
+});
+
+test('public repair creation route does not initialize the job publisher', async () => {
+  const route = await readFile('app/api/repair-runs/route.ts', 'utf8');
+  assert.match(route, /rejectLegacyRepairStart/);
+  assert.doesNotMatch(route, /getRepairRunHandlers|getJobPublisherInfrastructure|startRepairRun|PgBossRepairQueue/);
 });
 
 test('queued cancellation is authenticated, same-origin, durable, and later delivery is harmless', async (t) => {

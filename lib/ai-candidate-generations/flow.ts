@@ -7,6 +7,7 @@ import type { AuthenticatedWorkspace } from '../auth/protected-context.ts';
 import type { VigiloDatabase } from '../db/types.ts';
 import { assertRunBusinessAllowed, lockExternalExecution } from '../external-execution/business-fence.ts';
 import { assertMatchedSourceCheckpoint } from '../external-execution/source-checkpoint.ts';
+import { assertReviewedHandoffAuthority } from '../external-execution/reviewed-handoff-authority.ts';
 import { RepositoryPolicyError, assertPublicRepositoryAuthority } from '../github-repositories/policy.ts';
 import { AI_MODEL_ID, AI_PROVIDER_ID } from '../ai-investigations/types.ts';
 import type { TransactionalAiCandidateGenerationQueue } from '../repair-runs/queue.ts';
@@ -22,7 +23,7 @@ function result(row: typeof aiCandidateGeneration.$inferSelect): AiCandidateGene
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
-export async function startAiCandidateGeneration(database: VigiloDatabase, context: AuthenticatedWorkspace, aiInvestigationId: string, queue: TransactionalAiCandidateGenerationQueue, options: { idempotencyKey?: string; randomId?: () => string; clock?: () => Date } = {}): Promise<AiCandidateGenerationResult> {
+export async function startAiCandidateGeneration(database: VigiloDatabase, context: AuthenticatedWorkspace, aiInvestigationId: string, queue: TransactionalAiCandidateGenerationQueue, options: { idempotencyKey?: string; randomId?: () => string; clock?: () => Date; runtimeReleaseSha?: string } = {}): Promise<AiCandidateGenerationResult> {
   const randomId = options.randomId ?? randomUUID; const now = (options.clock ?? (() => new Date()))(); const idempotencyKey = options.idempotencyKey ?? randomUUID();
   if (!UUID.test(aiInvestigationId) || !UUID.test(idempotencyKey)) throw new AiCandidateGenerationFlowError('candidate_generation_not_eligible');
   const created = await database.transaction(async (transaction) => {
@@ -31,6 +32,7 @@ export async function startAiCandidateGeneration(database: VigiloDatabase, conte
       .from(aiInvestigation).innerJoin(investigation, eq(investigation.id, aiInvestigation.investigationId)).innerJoin(repairRun, eq(repairRun.id, aiInvestigation.repairRunId)).innerJoin(repositoryBaseline, eq(repositoryBaseline.id, aiInvestigation.baselineId)).innerJoin(executionProfile, and(eq(executionProfile.githubRepositoryId, aiInvestigation.githubRepositoryId), eq(executionProfile.workspaceId, aiInvestigation.workspaceId)))
       .where(and(eq(aiInvestigation.id, aiInvestigationId), eq(aiInvestigation.workspaceId, context.workspace.id))).for('update').limit(1);
     if (!source || source.source.state !== 'completed' || source.source.conclusionStatus !== 'diagnosis_found' || source.parent.state !== 'ready' || source.run.state !== 'ready_for_investigation' || source.profile.status !== 'ready') throw new AiCandidateGenerationFlowError('candidate_generation_not_eligible');
+    await assertReviewedHandoffAuthority(transaction, context, source.run.id, options.runtimeReleaseSha);
     try { await assertPublicRepositoryAuthority(transaction, source.source.workspaceId, source.source.githubRepositoryId); }
     catch (error) { if (error instanceof RepositoryPolicyError) throw new AiCandidateGenerationFlowError(error.code); throw error; }
     const [review] = await transaction.select({ id: humanReviewDecision.id }).from(humanReviewDecision).where(eq(humanReviewDecision.repairRunId, source.run.id)).limit(1);

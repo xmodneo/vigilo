@@ -19,6 +19,7 @@ import type { VigiloDatabase } from '../db/types.ts';
 import { assertRunBusinessAllowed, lockExternalExecution } from '../external-execution/business-fence.ts';
 import { ExternalExecutionAuthorityError } from '../external-execution/types.ts';
 import { assertMatchedSourceCheckpoint } from '../external-execution/source-checkpoint.ts';
+import { assertReviewedHandoffAuthority } from '../external-execution/reviewed-handoff-authority.ts';
 import { RepositoryPolicyError, assertPublicRepositoryAuthority } from '../github-repositories/policy.ts';
 import { AI_MODEL_ID, AI_PROVIDER_ID } from '../ai-investigations/types.ts';
 import { REPAIR_LOOP_AI_CANDIDATE_GENERATION_PROTOCOL_VERSION } from '../ai-candidate-generations/types.ts';
@@ -74,7 +75,7 @@ export async function startRepairLoop(
   context: AuthenticatedWorkspace,
   repairRunId: string,
   queues: RepairLoopQueues,
-  options: { idempotencyKey?: string; randomId?: () => string; clock?: () => Date } = {},
+  options: { idempotencyKey?: string; randomId?: () => string; clock?: () => Date; runtimeReleaseSha?: string } = {},
 ): Promise<RepairLoopResult> {
   const idempotencyKey = options.idempotencyKey ?? randomUUID();
   const randomId = options.randomId ?? randomUUID;
@@ -86,6 +87,7 @@ export async function startRepairLoop(
       await lockExternalExecution(transaction);
       const [run] = await transaction.select().from(repairRun).where(and(eq(repairRun.id, repairRunId), eq(repairRun.workspaceId, context.workspace.id))).for('update').limit(1);
       if (!run) throw new RepairLoopFlowError('repair_loop_not_eligible');
+      await assertReviewedHandoffAuthority(transaction, context, run.id, options.runtimeReleaseSha);
       try { await assertPublicRepositoryAuthority(transaction, run.workspaceId, run.githubRepositoryId); }
       catch (error) { if (error instanceof RepositoryPolicyError) throw new RepairLoopFlowError(error.code); throw error; }
       const [existing] = await transaction.select().from(repairLoop).where(eq(repairLoop.repairRunId, run.id)).limit(1);

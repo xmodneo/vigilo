@@ -28,6 +28,7 @@ import { publicRepairLoop } from '../../../lib/repair-loops/handlers';
 import { getHumanReviewForContext } from '../../../lib/human-reviews/server';
 import { getRepairPublicationForContext } from '../../../lib/repair-publications/server';
 import { resolveExecutionAvailability } from '../../../lib/external-execution/availability';
+import { resolveReviewedHandoffAvailability, type ReviewedHandoffAvailability } from '../../../lib/external-execution/reviewed-handoff-availability';
 import type { ExecutionAvailabilityStatus } from '../../../lib/presentation/policy';
 import { getReadinessResult } from '../../../lib/operations/readiness';
 import { GitHubConnectionView } from './github-connection-view';
@@ -56,6 +57,7 @@ export default async function GitHubConnectionPage({ searchParams }: { searchPar
     let humanReview = undefined;
     let repairPublication = undefined;
     let executionAvailability: ExecutionAvailabilityStatus = 'unknown';
+    let reviewedHandoffAvailability: ReviewedHandoffAvailability = 'ineligible';
     if (installation) {
       try {
         const overview = await getRepositoryOverviewForContext(context);
@@ -104,6 +106,13 @@ export default async function GitHubConnectionPage({ searchParams }: { searchPar
             ? await getRepairPublicationForContext(context, repairRun.id)
             : null;
           if (publicSelection) {
+            if (repairRun && context.user.id === context.workspace.ownerUserId) {
+              reviewedHandoffAvailability = await resolveReviewedHandoffAvailability(getAuthDatabase(), {
+                workspaceId: context.workspace.id, ownerUserId: context.user.id,
+                repairRunId: repairRun.id, githubRepositoryId: publicSelection.githubRepositoryId,
+                runtimeReleaseSha: process.env.VIGILO_RELEASE_SHA ?? '',
+              });
+            }
             const authority = await resolveExecutionAvailability(getAuthDatabase(), context.workspace.id, { operationalReady: true });
             executionAvailability = authority.status;
             if (executionAvailability === 'available') {
@@ -114,6 +123,7 @@ export default async function GitHubConnectionPage({ searchParams }: { searchPar
         } catch {
           workflowError = 'unavailable';
           executionAvailability = 'unknown';
+          reviewedHandoffAvailability = 'ineligible';
           executionProfile = undefined;
           baseline = undefined;
           repairRun = undefined;
@@ -138,6 +148,7 @@ export default async function GitHubConnectionPage({ searchParams }: { searchPar
       <GitHubConnectionView
         installation={installation}
         executionAvailability={executionAvailability}
+        reviewedHandoffAvailability={reviewedHandoffAvailability}
         aiInvestigationRequestId={randomUUID()}
         aiCandidateGenerationRequestId={randomUUID()}
         repairLoopRequestId={randomUUID()}

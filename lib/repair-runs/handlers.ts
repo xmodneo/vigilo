@@ -1,9 +1,7 @@
 import { AccessDeniedError, type AuthenticatedWorkspace } from '../auth/protected-context.ts';
 import type { VigiloDatabase } from '../db/types.ts';
 import type { GitHubAppConfiguration } from '../github-app/types.ts';
-import { BaselineAuthorityError } from '../repository-baselines/authority.ts';
-import { cancelCreatedRepairRun, getRepairRun, RepairRunError, startRepairRun } from './flow.ts';
-import { RepairIntentValidationError } from './intent.ts';
+import { cancelCreatedRepairRun, getRepairRun, RepairRunError } from './flow.ts';
 import type { TransactionalRepairQueue } from './queue.ts';
 import type { RepairRunResult } from './types.ts';
 
@@ -12,7 +10,6 @@ interface Dependencies {
   database: VigiloDatabase;
   queue: TransactionalRepairQueue;
   resolveContext: (headers: Headers) => Promise<AuthenticatedWorkspace>;
-  start?: typeof startRepairRun;
 }
 
 const IDEMPOTENCY_KEY = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
@@ -47,43 +44,28 @@ export function publicRepairRun(value: RepairRunResult | null) {
   };
 }
 
-async function parseStartIntent(request: Request): Promise<{ idempotencyKey: string; objective: string }> {
-  const contentType = request.headers.get('content-type') ?? '';
-  const contentLength = Number(request.headers.get('content-length') ?? '0');
-  if (!contentType.startsWith('application/x-www-form-urlencoded') || !Number.isSafeInteger(contentLength) || contentLength > 4_096) {
-    throw new RepairRunError('invalid_idempotency_key');
+/** The controlled beta accepts new operational runs only through reviewed staging. */
+export async function rejectLegacyRepairStart(
+  request: Request,
+  configuration: GitHubAppConfiguration,
+  resolveContext: Dependencies['resolveContext'],
+): Promise<Response> {
+  if (request.headers.get('origin') !== configuration.baseUrl) {
+    return Response.json({ error: 'forbidden' }, { status: 403, headers: noStore });
   }
-  let form: FormData;
   try {
-    form = await request.formData();
-  } catch {
-    throw new RepairRunError('invalid_idempotency_key');
+    await resolveContext(request.headers);
+    return Response.json({ error: 'reviewed_start_required' }, { status: 410, headers: noStore });
+  } catch (error) {
+    if (error instanceof AccessDeniedError) return redirect(configuration.baseUrl, '/sign-in');
+    return Response.json({ error: 'repair_run_unavailable' }, { status: 502, headers: noStore });
   }
-  if ([...form.keys()].some((key) => !['idempotencyKey', 'objective'].includes(key)) || form.getAll('idempotencyKey').length !== 1 || form.getAll('objective').length !== 1) {
-    throw new RepairRunError('invalid_idempotency_key');
-  }
-  const value = form.get('idempotencyKey');
-  const objective = form.get('objective');
-  if (typeof value !== 'string' || !IDEMPOTENCY_KEY.test(value) || typeof objective !== 'string') throw new RepairRunError('invalid_idempotency_key');
-  return { idempotencyKey: value, objective };
 }
 
 export function createRepairRunHandlers(dependencies: Dependencies) {
   return {
-    async start(request: Request) {
-      if (request.headers.get('origin') !== dependencies.configuration.baseUrl) {
-        return Response.json({ error: 'forbidden' }, { status: 403, headers: noStore });
-      }
-      try {
-        const context = await dependencies.resolveContext(request.headers);
-        const intent = await parseStartIntent(request);
-        const run = await (dependencies.start ?? startRepairRun)(dependencies.database, context, intent.idempotencyKey, intent.objective, dependencies.queue);
-        return redirect(dependencies.configuration.baseUrl, `/app/github?repairRun=${encodeURIComponent(run.id)}`);
-      } catch (error) {
-        if (error instanceof AccessDeniedError) return redirect(dependencies.configuration.baseUrl, '/sign-in');
-        const code = error instanceof BaselineAuthorityError || error instanceof RepairRunError || error instanceof RepairIntentValidationError ? error.code : 'repair_run_unavailable';
-        return redirect(dependencies.configuration.baseUrl, `/app/github?error=${encodeURIComponent(code)}`);
-      }
+    start(request: Request) {
+      return rejectLegacyRepairStart(request, dependencies.configuration, dependencies.resolveContext);
     },
     async cancel(request: Request, runId: string) {
       if (request.headers.get('origin') !== dependencies.configuration.baseUrl) {

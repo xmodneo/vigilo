@@ -7,6 +7,7 @@ import type { AuthenticatedWorkspace } from '../auth/protected-context.ts';
 import type { VigiloDatabase } from '../db/types.ts';
 import { assertRunBusinessAllowed, lockExternalExecution } from '../external-execution/business-fence.ts';
 import { assertMatchedSourceCheckpoint } from '../external-execution/source-checkpoint.ts';
+import { assertReviewedHandoffAuthority } from '../external-execution/reviewed-handoff-authority.ts';
 import { RepositoryPolicyError, assertPublicRepositoryAuthority } from '../github-repositories/policy.ts';
 import { trustworthyComparableBaseline } from '../candidate-verifications/classification.ts';
 import { AI_INVESTIGATION_JOB_VERSION, type TransactionalAiInvestigationQueue } from '../repair-runs/queue.ts';
@@ -23,7 +24,7 @@ function result(row: typeof aiInvestigation.$inferSelect): AiInvestigationResult
   return { id: row.id, investigationId: row.investigationId, executionOrdinal: row.executionOrdinal, repairRunId: row.repairRunId, state: row.state as AiInvestigationResult['state'], revision: row.baseCommitSha, providerId: row.providerId, modelId: row.modelId, protocolVersion: row.protocolVersion, completionReason: row.completionReason as AiInvestigationResult['completionReason'], conclusion, usage: { inputTokens: row.inputTokens, outputTokens: row.outputTokens, toolCallCount: row.toolCallCount, modelTurnCount: row.modelTurnCount }, failureCode: row.failureCode, createdAt: row.createdAt, completedAt: row.completedAt };
 }
 
-export async function startAiInvestigation(database: VigiloDatabase, context: AuthenticatedWorkspace, investigationId: string, queue: TransactionalAiInvestigationQueue, options: { randomId?: () => string; clock?: () => Date; idempotencyKey?: string } = {}): Promise<AiInvestigationResult> {
+export async function startAiInvestigation(database: VigiloDatabase, context: AuthenticatedWorkspace, investigationId: string, queue: TransactionalAiInvestigationQueue, options: { randomId?: () => string; clock?: () => Date; idempotencyKey?: string; runtimeReleaseSha?: string } = {}): Promise<AiInvestigationResult> {
   const randomId = options.randomId ?? randomUUID; const now = (options.clock ?? (() => new Date()))();
   const idempotencyKey = options.idempotencyKey ?? randomUUID();
   if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(idempotencyKey)) throw new AiInvestigationFlowError('investigation_not_ready');
@@ -31,6 +32,7 @@ export async function startAiInvestigation(database: VigiloDatabase, context: Au
     await lockExternalExecution(transaction);
     const [parent] = await transaction.select().from(investigation).where(and(eq(investigation.id, investigationId), eq(investigation.workspaceId, context.workspace.id))).for('update').limit(1);
     if (!parent || parent.state !== 'ready') throw new AiInvestigationFlowError('investigation_not_ready');
+    await assertReviewedHandoffAuthority(transaction, context, parent.repairRunId, options.runtimeReleaseSha);
     try { await assertPublicRepositoryAuthority(transaction, parent.workspaceId, parent.githubRepositoryId); }
     catch (error) { if (error instanceof RepositoryPolicyError) throw new AiInvestigationFlowError(error.code); throw error; }
     const [sameIntent] = await transaction.select().from(aiInvestigation).where(and(eq(aiInvestigation.investigationId, investigationId), eq(aiInvestigation.idempotencyKey, idempotencyKey))).limit(1);

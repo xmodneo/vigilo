@@ -7,6 +7,11 @@ environment, and presents the measured evidence for human review.
 Vigilo is a controlled beta. It does not guarantee a repair, automatically merge
 code, deploy software, or establish that a repository is production-ready.
 
+New operational RepairRuns currently require separate owner approval of an exact
+reviewed staging plan. The older self-service Start Repair form and POST are
+unavailable. Existing RepairRun history remains readable; a legacy run without
+complete current reviewed authority cannot enqueue new workflow jobs.
+
 ## Controlled-beta scope and limitations
 
 Vigilo currently supports eligible public, single-package Node.js 24/npm repositories.
@@ -38,7 +43,8 @@ runners, and malformed metadata fail closed.
 ## Repair workflow
 
 1. Connect GitHub and choose an eligible public repository.
-2. Describe a reproducible problem and start a separately authorized Repair Run.
+2. Describe a reproducible problem for a separately owner-reviewed staging plan.
+   The owner must approve that exact plan before its RepairRun is created.
 3. Vigilo measures the frozen baseline and prepares bounded read-only context.
 4. A bounded AI investigation records a structured assessment.
 5. Vigilo freezes the exact proposed changed-file artifact.

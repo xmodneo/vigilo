@@ -5,7 +5,7 @@ import test from 'node:test';
 
 import { and, eq } from 'drizzle-orm';
 
-import { account, aiInvestigation, aiInvestigationAttempt, aiInvestigationEvent, executionProfile, githubInstallation, investigation, investigationContextEntry, investigationContextEvent, repairCandidate, repairIntent, repairRun, repository, repositoryBaseline, user, workspace } from '../db/schema.ts';
+import { account, aiInvestigation, aiInvestigationAttempt, aiInvestigationEvent, executionBudgetGrant, executionBudgetGrantRevocation, executionProfile, githubInstallation, investigation, investigationContextEntry, investigationContextEvent, repairCandidate, repairIntent, repairRun, repairRunAttempt, repository, repositoryBaseline, user, workspace } from '../db/schema.ts';
 import { GeminiInvestigationProvider } from '../lib/ai-investigations/gemini-provider.ts';
 import { modelRequestKey } from '../lib/ai-investigations/model-request-key.ts';
 import { createTestExternalExecutionAuthorizer } from './external-execution-support.ts';
@@ -21,16 +21,38 @@ import type { InvestigationSourceGateway } from '../lib/investigations/types.ts'
 import type { AiInvestigationJobPayload, TransactionalAiInvestigationQueue } from '../lib/repair-runs/queue.ts';
 import { createTestContext } from './support.ts';
 import { ExternalExecutionAuthorityError } from '../lib/external-execution/types.ts';
+import { computeExecutionProfileIdentity } from '../lib/execution-profiles/detector.ts';
+import { buildReviewedStagingPlan, type ReviewedStagingInput } from '../lib/external-execution/reviewed-plan.ts';
+import { stageReviewedRepairRun } from '../lib/external-execution/reviewed-staging.ts';
+import type { TransactionalReviewedBaselineQueue } from '../lib/repair-runs/queue.ts';
+import { transitionRepairRun } from '../lib/repair-runs/flow.ts';
 
 const NOW = new Date();
-const COMMIT = 'a'.repeat(40); const PROFILE = 'b'.repeat(64); const TREE = 'c'.repeat(40);
+const COMMIT = 'a'.repeat(40); const TREE = 'c'.repeat(40);
 const REPOSITORY_ID = 41001; const INSTALLATION_ID = 42001;
+const WORKSPACE_ID = 'f0000000-0000-4000-8000-000000000001';
+const USER_ID = 'f0000000-0000-4000-8000-000000000002';
+const RELEASE = 'e'.repeat(40);
+const OBJECTIVE = 'Fix the controlled free-shipping boundary fixture so a subtotal of exactly 5000 receives free shipping.';
+const SOURCE_IDENTITY = '3'.repeat(64);
+const PROVIDER_ACCOUNTS = { googleProjectId: 'gen-lang-client-0469095642', vercelTeamId: 'team_dQVJwtsj7JcMXmVUYyFgrCzA', vercelProjectId: 'prj_i6HNc531erDzTtCZZJZqIy7vJ3oM' };
+const PROFILE = computeExecutionProfileIdentity({ baseCommitSha: COMMIT, build: { script: 'build', tool: 'npm' }, githubRepositoryId: REPOSITORY_ID,
+  install: { operation: 'ci', tool: 'npm' }, installationId: INSTALLATION_ID, lockfileType: 'package-lock', nodeMajor: 24,
+  packageJsonBlobSha: 'd'.repeat(40), packageJsonContentSha256: 'e'.repeat(64), packageLockBlobSha: 'f'.repeat(40),
+  packageLockContentSha256: '1'.repeat(64), packageManager: 'npm', profileVersion: 2, runtimeFamily: 'node',
+  test: { script: 'test', tool: 'npm' }, testRunner: 'vitest', typecheck: { script: 'typecheck', tool: 'npm' }, workspaceId: WORKSPACE_ID });
+const originalRelease = process.env.VIGILO_RELEASE_SHA;
+test.before(() => { process.env.VIGILO_RELEASE_SHA = RELEASE; });
+test.after(() => { if (originalRelease === undefined) delete process.env.VIGILO_RELEASE_SHA; else process.env.VIGILO_RELEASE_SHA = originalRelease; });
 const CONFIGURATION: GitHubAppConfiguration = { appId: 7, appSlug: 'vigilo-test', baseUrl: 'http://localhost:3000', clientId: 'client' };
 const SOURCE = 'export function shipping(subtotal: number) { return subtotal > 5000 ? 0 : 500; }\n';
 const blobSha = (value: string) => createHash('sha1').update(`blob ${Buffer.byteLength(value)}\0`).update(value).digest('hex');
-const sha256 = (value: string) => createHash('sha256').update(value).digest('hex');
 
-function owner(workspaceId: string): AuthenticatedWorkspace { return { workspace: { id: workspaceId } } as unknown as AuthenticatedWorkspace; }
+function owner(workspaceId: string, userId = USER_ID): AuthenticatedWorkspace { return { user: { id: userId }, workspace: { id: workspaceId, ownerUserId: userId } } as unknown as AuthenticatedWorkspace; }
+
+class ReviewedQueue implements TransactionalReviewedBaselineQueue {
+  async enqueueReviewedBaseline(_transaction: Parameters<TransactionalReviewedBaselineQueue['enqueueReviewedBaseline']>[0], payload: Parameters<TransactionalReviewedBaselineQueue['enqueueReviewedBaseline']>[1]) { return payload.repairRunId; }
+}
 
 class MemoryQueue implements TransactionalAiInvestigationQueue {
   payloads: AiInvestigationJobPayload[] = [];
@@ -82,21 +104,55 @@ async function activateAiInvestigation(context: Awaited<ReturnType<typeof create
 }
 
 async function seedRoot(context: Awaited<ReturnType<typeof createTestContext>>) {
-  const userId = randomUUID(); const workspaceId = randomUUID();
+  const userId = USER_ID; const workspaceId = WORKSPACE_ID;
   await context.database.insert(user).values({ id: userId, name: 'Owner', email: `${userId}@test.invalid`, emailVerified: true });
   await context.database.insert(account).values({ id: randomUUID(), issuer: 'local:oauth:github', accountId: '1234', providerId: 'github', userId });
   await context.database.insert(workspace).values({ id: workspaceId, ownerUserId: userId });
   await context.database.insert(githubInstallation).values({ installationId: INSTALLATION_ID, workspaceId, githubAccountId: 1234, accountLogin: 'xmodneo', accountType: 'User', status: 'active' });
-  await context.database.insert(repository).values({ githubRepositoryId: REPOSITORY_ID, workspaceId, installationId: INSTALLATION_ID, ownerId: 1234, ownerLogin: 'xmodneo', name: 'vigilo', fullName: 'xmodneo/vigilo', defaultBranch: 'main', isPrivate: false });
+  await context.database.insert(repository).values({ githubRepositoryId: REPOSITORY_ID, workspaceId, installationId: INSTALLATION_ID, ownerId: 1234, ownerLogin: 'xmodneo', name: 'vigilo', fullName: 'xmodneo/vigilo', defaultBranch: 'main', isPrivate: false, isSelected: true });
   await context.database.insert(executionProfile).values({ githubRepositoryId: REPOSITORY_ID, workspaceId, installationId: INSTALLATION_ID, profileVersion: 2, profileIdentity: PROFILE, baseCommitSha: COMMIT, runtimeFamily: 'node', nodeMajor: 24, packageManager: 'npm', lockfileType: 'package-lock', installOperation: 'ci', typecheckScript: 'typecheck', buildScript: 'build', testScript: 'test', testRunner: 'vitest', packageJsonBlobSha: 'd'.repeat(40), packageJsonContentSha256: 'e'.repeat(64), packageLockBlobSha: 'f'.repeat(40), packageLockContentSha256: '1'.repeat(64), status: 'ready' });
   return { workspaceId, owner: owner(workspaceId) };
 }
 
 async function seedReady(context: Awaited<ReturnType<typeof createTestContext>>, workspaceId: string, state: 'ready' | 'failed' = 'ready') {
-  const baselineId = randomUUID(); const runId = randomUUID(); const intentId = randomUUID(); const investigationId = randomUUID();
-  await context.database.insert(repositoryBaseline).values({ id: baselineId, workspaceId, githubRepositoryId: REPOSITORY_ID, installationId: INSTALLATION_ID, evidenceVersion: 1, profileIdentity: PROFILE, baseCommitSha: COMMIT, archiveSha256: '2'.repeat(64), sandboxName: 'baseline-sandbox', sandboxSessionId: 'baseline-session', sourceIdentityBefore: '3'.repeat(64), sourceIdentityAfter: '3'.repeat(64), sourceUnchanged: true, credentialsExposure: 'absent', networkPolicy: 'deny-all', installStatus: 'completed', installExitCode: 0, installTimedOut: false, typecheckStatus: 'completed', typecheckExitCode: 0, typecheckTimedOut: false, buildStatus: 'completed', buildExitCode: 0, buildTimedOut: false, testStatus: 'failed', testExitCode: 1, testTimedOut: false, executionOutcome: 'baseline_failed', overallOutcome: 'baseline_failed', cleanupStop: 'confirmed', cleanupDelete: 'confirmed', cleanupLookup: 'absent', errorPhase: 'test', errorCode: 'baseline_failed', startedAt: NOW, completedAt: NOW, durationMs: 1 });
-  await context.database.insert(repairRun).values({ id: runId, workspaceId, githubRepositoryId: REPOSITORY_ID, installationId: INSTALLATION_ID, profileIdentity: PROFILE, baseCommitSha: COMMIT, idempotencyKey: randomUUID(), state: state === 'ready' ? 'ready_for_investigation' : 'infrastructure_failed', baselineId: state === 'ready' ? baselineId : null, baselineOutcome: state === 'ready' ? 'baseline_failed' : null, failureClassification: state === 'ready' ? 'customer_baseline_failure' : 'infrastructure_failure', failureCode: state === 'ready' ? 'baseline_failed' : 'infrastructure_failed', baselineStartedAt: NOW, completedAt: NOW, stateChangedAt: NOW, updatedAt: NOW });
-  await context.database.insert(repairIntent).values({ id: intentId, repairRunId: runId, workspaceId, objective: 'Fix the controlled free-shipping boundary fixture so a subtotal of exactly 5000 receives free shipping.', objectiveHash: sha256('Fix the controlled free-shipping boundary fixture so a subtotal of exactly 5000 receives free shipping.') });
+  const investigationId = randomUUID();
+  let intentId: string;
+  const baselineId = randomUUID(); const runId = randomUUID();
+  {
+    // Direct runner tests leave their synthetic AI attempt active on expected
+    // rejection. Close only those completed scenarios before the next staged
+    // reviewed run in this same in-memory workspace.
+    await context.database.update(aiInvestigationAttempt).set({ state: 'exhausted', leaseExpiresAt: null,
+      finishedAt: NOW, failureCode: 'fixture_scenario_complete' }).where(eq(aiInvestigationAttempt.state, 'active'));
+    await context.database.update(aiInvestigation).set({ state: 'cancelled', failureCode: 'fixture_scenario_complete',
+      completedAt: NOW, updatedAt: NOW }).where(eq(aiInvestigation.state, 'queued'));
+    await context.database.update(aiInvestigation).set({ state: 'failed', failureCode: 'fixture_scenario_complete',
+      completedAt: NOW, updatedAt: NOW }).where(eq(aiInvestigation.state, 'investigating'));
+    for (const grant of await context.database.select().from(executionBudgetGrant)) {
+      await context.database.insert(executionBudgetGrantRevocation).values({ id: randomUUID(), grantId: grant.id,
+        reasonCode: 'operator_revoked', revokedBy: USER_ID }).onConflictDoNothing();
+    }
+    const input: ReviewedStagingInput = { kind: 'm77b_repair_v1', repairRunId: runId, idempotencyKey: randomUUID(),
+      githubRepositoryId: REPOSITORY_ID, installationId: INSTALLATION_ID, profileIdentity: PROFILE, baseCommitSha: COMMIT,
+      authorizedReleaseSha: RELEASE, objective: OBJECTIVE, expectedSourceIdentity: SOURCE_IDENTITY,
+      expiresAt: new Date(Date.now() + 60 * 60_000).toISOString(), providerAccounts: PROVIDER_ACCOUNTS };
+    const plan = buildReviewedStagingPlan({ workspaceId, reviewerUserId: USER_ID }, input);
+    await stageReviewedRepairRun(context.database, owner(workspaceId), input, plan.planIdentity, new ReviewedQueue(),
+      { runtimeReleaseSha: RELEASE, configuredProviderAccounts: PROVIDER_ACCOUNTS });
+    intentId = (await context.database.select().from(repairIntent).where(eq(repairIntent.repairRunId, runId)))[0]!.id;
+    await transitionRepairRun(context.database, workspaceId, runId, 'created', 'baseline_running', NOW, { eventId: randomUUID() });
+    await context.database.insert(repositoryBaseline).values({ id: baselineId, workspaceId, githubRepositoryId: REPOSITORY_ID, installationId: INSTALLATION_ID, evidenceVersion: 1, profileIdentity: PROFILE, baseCommitSha: COMMIT, archiveSha256: '2'.repeat(64), sandboxName: 'baseline-sandbox', sandboxSessionId: 'baseline-session', sourceIdentityBefore: SOURCE_IDENTITY, sourceIdentityAfter: SOURCE_IDENTITY, sourceUnchanged: true, credentialsExposure: 'absent', networkPolicy: 'deny-all', installStatus: 'completed', installExitCode: 0, installTimedOut: false, typecheckStatus: 'completed', typecheckExitCode: 0, typecheckTimedOut: false, buildStatus: 'completed', buildExitCode: 0, buildTimedOut: false, testStatus: 'failed', testExitCode: 1, testTimedOut: false, executionOutcome: 'baseline_failed', overallOutcome: 'baseline_failed', cleanupStop: 'confirmed', cleanupDelete: 'confirmed', cleanupLookup: 'absent', errorPhase: 'test', errorCode: 'baseline_failed', startedAt: NOW, completedAt: NOW, durationMs: 1 });
+    if (state === 'ready') {
+      await context.database.insert(repairRunAttempt).values({ id: randomUUID(), repairRunId: runId, queueJobId: runId,
+        attemptNumber: 1, expectedBaselineId: baselineId, baselineId, ownershipToken: randomUUID(), state: 'customer_failed',
+        claimedAt: NOW, heartbeatAt: NOW, leaseExpiresAt: null, finishedAt: NOW });
+      await transitionRepairRun(context.database, workspaceId, runId, 'baseline_running', 'ready_for_investigation', NOW,
+        { baselineId, eventId: randomUUID(), finalizeSourceCheckpoint: true });
+    } else {
+      await transitionRepairRun(context.database, workspaceId, runId, 'baseline_running', 'infrastructure_failed', NOW,
+        { eventId: randomUUID(), failureCode: 'infrastructure_failed' });
+    }
+  }
   await context.database.insert(investigation).values({ id: investigationId, repairRunId: runId, repairIntentId: intentId, workspaceId, githubRepositoryId: REPOSITORY_ID, installationId: INSTALLATION_ID, baseCommitSha: COMMIT, profileIdentity: PROFILE, baselineId, idempotencyKey: randomUUID(), state: state === 'ready' ? 'ready' : 'failed', contextBudgetVersion: 1, maxTreeEntries: 2000, maxFileBytes: 65536, maxCumulativeBytes: 1048576, maxOperations: 50, treeSha: state === 'ready' ? TREE : null, indexedPathCount: state === 'ready' ? 1 : 0, attemptNumber: 1, failureCode: state === 'ready' ? null : 'context_source_unavailable', completedAt: NOW, updatedAt: NOW });
   if (state === 'ready') await context.database.insert(investigationContextEntry).values({ investigationId, path: 'src/shipping.ts', depth: 2, kind: 'blob', mode: '100644', objectSha: blobSha(SOURCE), sizeBytes: Buffer.byteLength(SOURCE), readable: true });
   return { baselineId, runId, investigationId };
@@ -121,7 +177,7 @@ test('stale private repository authority blocks investigation before queueing', 
   const root = await seedRoot(context); const seeded = await seedReady(context, root.workspaceId); const queue = new MemoryQueue();
   await context.database.update(repository).set({ isPrivate: true }).where(eq(repository.githubRepositoryId, REPOSITORY_ID));
   await assert.rejects(startAiInvestigation(context.database, root.owner, seeded.investigationId, queue),
-    (error: unknown) => error instanceof AiInvestigationFlowError && error.code === 'private_repository_not_supported');
+    (error: unknown) => error instanceof ExternalExecutionAuthorityError && error.code === 'execution_authority_mismatch');
   assert.equal(queue.payloads.length, 0);
 });
 
@@ -163,7 +219,7 @@ test('rerun fails closed on invalid authority and cannot borrow old evidence or 
     const seeded = await seedReady(context, root.workspaceId); const first = await startAiInvestigation(context.database, root.owner, seeded.investigationId, new MemoryQueue());
     for (let number = 1; number <= 3; number++) await processAiInvestigationJob(job(first.id), { database: context.database, gateway: new Gateway(), configuration: CONFIGURATION, createProvider: () => new ScriptedProvider('diagnosis_found', true), clock: () => new Date(NOW.getTime() + number) });
     await context.database.delete(executionProfile).where(and(eq(executionProfile.workspaceId, root.workspaceId), eq(executionProfile.githubRepositoryId, REPOSITORY_ID)));
-    await assert.rejects(startAiInvestigation(context.database, root.owner, seeded.investigationId, new MemoryQueue(), { idempotencyKey: randomUUID() }), (error: unknown) => error instanceof AiInvestigationFlowError && error.code === 'investigation_not_ready');
+    await assert.rejects(startAiInvestigation(context.database, root.owner, seeded.investigationId, new MemoryQueue(), { idempotencyKey: randomUUID() }), (error: unknown) => error instanceof ExternalExecutionAuthorityError && error.code === 'execution_authority_mismatch');
   });
 
   await t.test('old evidence and cumulative budget', async () => {
@@ -461,7 +517,7 @@ test('agent loop rejects protocol abuse, fabricated evidence, unobserved files, 
 
 test('bounded investigation reserves a tool-free finalization request and finalizes exhausted context', async (t) => {
   const context = await createTestContext(); t.after(() => context.client.close()); const root = await seedRoot(context); const seeded = await seedReady(context, root.workspaceId);
-  assert.deepEqual({ maxModelTurns: AI_LIMITS.maxModelTurns, maxToolBearingTurns: AI_LIMITS.maxToolBearingTurns, reservedFinalizationTurns: AI_LIMITS.reservedFinalizationTurns, maxContextResultBytes: AI_LIMITS.maxContextResultBytes }, { maxModelTurns: 8, maxToolBearingTurns: 6, reservedFinalizationTurns: 1, maxContextResultBytes: 128 * 1024 });
+  assert.deepEqual({ maxModelTurns: AI_LIMITS.maxModelTurns, maxToolBearingTurns: AI_LIMITS.maxToolBearingTurns, reservedFinalizationTurns: AI_LIMITS.reservedFinalizationTurns, maxContextResultBytes: AI_LIMITS.maxContextResultBytes }, { maxModelTurns: 7, maxToolBearingTurns: 6, reservedFinalizationTurns: 1, maxContextResultBytes: 128 * 1024 });
 
   await t.test('six tool-bearing requests cannot consume the finalization slot', async () => {
     const ai = await startAiInvestigation(context.database, root.owner, seeded.investigationId, new MemoryQueue());

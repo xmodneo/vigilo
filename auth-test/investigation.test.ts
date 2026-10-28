@@ -7,18 +7,23 @@ import { eq } from 'drizzle-orm';
 
 import {
   executionProfile,
+  executionBudgetGrant,
+  executionBudgetGrantRevocation,
   githubInstallation,
   investigation,
   investigationContextEntry,
   investigationContextEvent,
   repairIntent,
   repairRun,
+  repairRunAttempt,
   repository,
   repositoryBaseline,
 } from '../db/schema.ts';
 import { resolveAuthenticatedWorkspace, type AuthenticatedWorkspace } from '../lib/auth/protected-context.ts';
 import type { VigiloDatabase } from '../lib/db/types.ts';
 import { computeExecutionProfileIdentity, gitBlobSha as profileBlobSha } from '../lib/execution-profiles/detector.ts';
+import { buildReviewedStagingPlan, type ReviewedStagingInput } from '../lib/external-execution/reviewed-plan.ts';
+import { stageReviewedRepairRun } from '../lib/external-execution/reviewed-staging.ts';
 import type { GitHubAppConfiguration } from '../lib/github-app/types.ts';
 import { listPaths, readBaselineSummary, readTextFile, searchText } from '../lib/investigations/context.ts';
 import { createInvestigation, getInvestigation, InvestigationError } from '../lib/investigations/flow.ts';
@@ -34,6 +39,7 @@ import {
   type InvestigationQueueJob,
   type TransactionalInvestigationQueue,
   type TransactionalRepairQueue,
+  type TransactionalReviewedBaselineQueue,
 } from '../lib/repair-runs/queue.ts';
 import { getRepairRun, startRepairRun, transitionRepairRun } from '../lib/repair-runs/flow.ts';
 import type { BaselineEvidence } from '../lib/repository-baselines/types.ts';
@@ -46,6 +52,10 @@ const TREE = 'b'.repeat(40);
 const REPOSITORY_ID = 8101;
 const INSTALLATION_ID = 9001;
 const OBJECTIVE = 'Inspect how Vigilo represents and executes durable Repair Runs.';
+const RELEASE = 'e'.repeat(40);
+const originalRelease = process.env.VIGILO_RELEASE_SHA;
+test.before(() => { process.env.VIGILO_RELEASE_SHA = RELEASE; });
+test.after(() => { if (originalRelease === undefined) delete process.env.VIGILO_RELEASE_SHA; else process.env.VIGILO_RELEASE_SHA = originalRelease; });
 const CONFIGURATION: GitHubAppConfiguration = { appId: 991, appSlug: 'vigilo-test', baseUrl: 'http://localhost:3000', clientId: 'Iv1.test' };
 const PACKAGE = '{"name":"app"}';
 const LOCK = '{"lockfileVersion":3,"packages":{"":{"name":"app"}}}';
@@ -91,14 +101,17 @@ function profileValues(workspaceId: string, baseCommitSha = COMMIT) {
 
 async function seedAuthority(context: Awaited<ReturnType<typeof createTestContext>>, owner: AuthenticatedWorkspace) {
   await context.database.insert(githubInstallation).values({ accountLogin: 'xmodneo', accountType: 'User', githubAccountId: 3001, installationId: INSTALLATION_ID, status: 'active', workspaceId: owner.workspace.id });
-  await context.database.insert(repository).values({ defaultBranch: 'main', fullName: 'xmodneo/vigilo', githubRepositoryId: REPOSITORY_ID, installationId: INSTALLATION_ID, isPrivate: false, name: 'vigilo', ownerId: 3001, ownerLogin: 'xmodneo', workspaceId: owner.workspace.id });
+  await context.database.insert(repository).values({ defaultBranch: 'main', fullName: 'xmodneo/vigilo', githubRepositoryId: REPOSITORY_ID, installationId: INSTALLATION_ID, isPrivate: false, isSelected: true, name: 'vigilo', ownerId: 3001, ownerLogin: 'xmodneo', workspaceId: owner.workspace.id });
   await context.database.insert(executionProfile).values(profileValues(owner.workspace.id));
 }
 
-class Queues implements TransactionalRepairQueue, TransactionalInvestigationQueue {
+class Queues implements TransactionalRepairQueue, TransactionalReviewedBaselineQueue, TransactionalInvestigationQueue {
   repair: unknown[] = [];
   investigation: InvestigationJobPayload[] = [];
   async enqueue(_transaction: Parameters<TransactionalRepairQueue['enqueue']>[0], payload: Parameters<TransactionalRepairQueue['enqueue']>[1]) {
+    this.repair.push(structuredClone(payload)); return payload.repairRunId;
+  }
+  async enqueueReviewedBaseline(_transaction: Parameters<TransactionalReviewedBaselineQueue['enqueueReviewedBaseline']>[0], payload: Parameters<TransactionalReviewedBaselineQueue['enqueueReviewedBaseline']>[1]) {
     this.repair.push(structuredClone(payload)); return payload.repairRunId;
   }
   async enqueueInvestigation(_transaction: Parameters<TransactionalInvestigationQueue['enqueueInvestigation']>[0], payload: InvestigationJobPayload) {
@@ -134,13 +147,32 @@ async function persistBaseline(database: VigiloDatabase, evidence: BaselineEvide
   });
 }
 
-async function eligible(context: Awaited<ReturnType<typeof createTestContext>>, owner: AuthenticatedWorkspace, outcome: BaselineEvidence['overallOutcome'] = 'baseline_passed') {
+async function eligible(context: Awaited<ReturnType<typeof createTestContext>>, owner: AuthenticatedWorkspace, outcome: BaselineEvidence['overallOutcome'] = 'test_failed') {
   const queues = new Queues();
-  const run = await startRepairRun(context.database, owner, randomUUID(), OBJECTIVE, queues, { clock: () => NOW });
+  const [profile] = await context.database.select().from(executionProfile).where(eq(executionProfile.githubRepositoryId, REPOSITORY_ID));
+  assert.ok(profile?.profileIdentity);
+  for (const previousGrant of await context.database.select().from(executionBudgetGrant)) {
+    await context.database.insert(executionBudgetGrantRevocation).values({ id: randomUUID(), grantId: previousGrant.id,
+      reasonCode: 'operator_revoked', revokedBy: owner.user.id }).onConflictDoNothing();
+  }
+  const input: ReviewedStagingInput = { kind: 'm77b_repair_v1', repairRunId: randomUUID(), idempotencyKey: randomUUID(),
+    githubRepositoryId: REPOSITORY_ID, installationId: INSTALLATION_ID,
+    profileIdentity: profile.profileIdentity, baseCommitSha: profile.baseCommitSha, authorizedReleaseSha: RELEASE,
+    objective: OBJECTIVE, expectedSourceIdentity: 'd'.repeat(64), expiresAt: new Date(Date.now() + 60 * 60_000).toISOString(),
+    providerAccounts: { googleProjectId: 'gen-lang-client-0469095642', vercelTeamId: 'team_dQVJwtsj7JcMXmVUYyFgrCzA', vercelProjectId: 'prj_i6HNc531erDzTtCZZJZqIy7vJ3oM' } };
+  const plan = buildReviewedStagingPlan({ workspaceId: owner.workspace.id, reviewerUserId: owner.user.id }, input);
+  await stageReviewedRepairRun(context.database, owner, input, plan.planIdentity, queues,
+    { runtimeReleaseSha: RELEASE, configuredProviderAccounts: input.providerAccounts });
+  const run = (await getRepairRun(context.database, owner, input.repairRunId))!;
   await transitionRepairRun(context.database, owner.workspace.id, run.id, 'created', 'baseline_running', NOW, { eventId: randomUUID() });
   const evidence = baselineEvidence(owner, run.identity.profileIdentity, randomUUID(), outcome, run.identity.baseCommitSha);
   await persistBaseline(context.database, evidence);
-  await transitionRepairRun(context.database, owner.workspace.id, run.id, 'baseline_running', 'ready_for_investigation', NOW, { baselineId: evidence.runId, eventId: randomUUID() });
+  await context.database.insert(repairRunAttempt).values({ id: randomUUID(), repairRunId: run.id, queueJobId: run.id,
+    attemptNumber: 1, expectedBaselineId: evidence.runId, baselineId: evidence.runId, ownershipToken: randomUUID(),
+    state: outcome === 'baseline_passed' ? 'succeeded' : 'customer_failed', claimedAt: NOW, heartbeatAt: NOW,
+    leaseExpiresAt: null, finishedAt: NOW });
+  await transitionRepairRun(context.database, owner.workspace.id, run.id, 'baseline_running', 'ready_for_investigation', NOW,
+    { baselineId: evidence.runId, eventId: randomUUID(), finalizeSourceCheckpoint: true });
   return { queues, run: (await getRepairRun(context.database, owner, run.id))!, evidence };
 }
 
@@ -185,7 +217,7 @@ async function prepared(context: Awaited<ReturnType<typeof createTestContext>>, 
   return { ...ready, investigation: (await getInvestigation(context.database, owner, value.id))!, gateway };
 }
 
-test('repair objective normalization is bounded, durable, immutable, and never supplies authority', async (t) => {
+test('legacy internal objective fixture is bounded, durable, immutable, and never supplies authority', async (t) => {
   assert.deepEqual(normalizeRepairObjective('  repair\r\nthis  '), { objective: 'repair\nthis', objectiveHash: sha256('repair\nthis') });
   for (const invalid of ['', '   ', 'x'.repeat(3_001), '💥'.repeat(769), 'bad\u0000intent']) assert.throws(() => normalizeRepairObjective(invalid), RepairIntentValidationError);
   const context = await createTestContext(); t.after(() => context.client.close()); const owner = await authenticated(context); await seedAuthority(context, owner);
@@ -198,7 +230,7 @@ test('repair objective normalization is bounded, durable, immutable, and never s
   assert.equal((await context.database.select().from(repairIntent).where(eq(repairIntent.id, stored!.id)))[0]?.objective, injected);
 });
 
-test('idempotent repair starts require the same immutable objective and historic runs remain readable', async (t) => {
+test('legacy internal fixture keeps immutable objectives and historic runs readable', async (t) => {
   const context = await createTestContext(); t.after(() => context.client.close()); const owner = await authenticated(context); await seedAuthority(context, owner);
   const queues = new Queues(); const key = randomUUID();
   const first = await startRepairRun(context.database, owner, key, OBJECTIVE, queues);
@@ -220,7 +252,9 @@ test('investigation eligibility accepts trustworthy customer failures and blocks
   const queues = new Queues(); const blocked = await startRepairRun(context.database, owner, randomUUID(), OBJECTIVE, queues);
   await transitionRepairRun(context.database, owner.workspace.id, blocked.id, 'created', 'baseline_running', NOW, { eventId: randomUUID() });
   await transitionRepairRun(context.database, owner.workspace.id, blocked.id, 'baseline_running', 'infrastructure_failed', NOW, { eventId: randomUUID(), failureCode: 'installation_failed' });
-  await assert.rejects(createInvestigation(context.database, owner, blocked.id, randomUUID(), queues), (error: unknown) => error instanceof InvestigationError && error.code === 'repair_run_not_eligible');
+  const before = (await context.database.select().from(investigation)).length;
+  await assert.rejects(createInvestigation(context.database, owner, blocked.id, randomUUID(), queues), (error: unknown) => error instanceof InvestigationError && error.code === 'investigation_handoff_failed');
+  assert.equal((await context.database.select().from(investigation)).length, before);
 });
 
 test('investigation creation freezes run authority, is idempotent, workspace-scoped, and enqueues only its ID', async (t) => {
@@ -274,7 +308,7 @@ test('bounded context operations read exact blobs, reject unsafe content, search
   assert.equal(search.matches.length, 2); assert.ok(search.matches.some((match) => match.path === 'src/run.ts'));
   assert.equal((await searchText(context.database, owner, gateway, CONFIGURATION, id, randomUUID(), '[.*]+')).matches.length, 0);
   await assert.rejects(searchText(context.database, owner, gateway, CONFIGURATION, id, randomUUID(), 'x'.repeat(129)), /query_invalid/);
-  const baseline = await readBaselineSummary(context.database, owner, id, randomUUID()); assert.equal(baseline.overallOutcome, 'baseline_passed');
+  const baseline = await readBaselineSummary(context.database, owner, id, randomUUID()); assert.equal(baseline.overallOutcome, 'test_failed');
   assert.equal('sandboxName' in baseline, false); assert.equal('stdout' in baseline, false);
   const events = await context.database.select().from(investigationContextEvent).where(eq(investigationContextEvent.investigationId, id));
   const serialized = JSON.stringify(events); assert.doesNotMatch(serialized, /Durable Repair Runs|never-persist-this-token|SECRET=|PRIVATE KEY/);

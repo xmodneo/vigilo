@@ -3,7 +3,7 @@ export const AI_PROVIDER_ID = 'google';
 export const AI_MODEL_ID = 'gemini-3.1-flash-lite';
 
 export const AI_LIMITS = Object.freeze({
-  maxModelTurns: 8,
+  maxModelTurns: 7,
   maxToolBearingTurns: 6,
   reservedFinalizationTurns: 1,
   maxToolCalls: 20,

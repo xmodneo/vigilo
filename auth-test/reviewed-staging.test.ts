@@ -2,7 +2,9 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import test from 'node:test';
 
-import { buildReviewedStagingPlan, computeReviewedPlanIdentity, isReviewedStagingPlanIdentity, REVIEWED_STAGING_PLAN_TAG } from '../lib/external-execution/reviewed-plan.ts';
+import { assertReviewedBudgetCompatibility, buildReviewedStagingPlan, computeReviewedPlanIdentity, isReviewedStagingPlanIdentity, REVIEWED_STAGING_PLAN_TAG } from '../lib/external-execution/reviewed-plan.ts';
+
+import { MAX_GEMINI_SERIALIZED_REQUEST_BYTES } from '../lib/ai-investigations/request-budget.ts';
 
 const NOW = new Date('2026-10-14T08:00:00.000Z');
 const INPUT = {
@@ -35,10 +37,11 @@ test('reviewed staging plan is deterministic and includes exactly the fixed six 
   assert.equal(isReviewedStagingPlanIdentity('8'.repeat(64)), false);
   assert.equal(first.accountGrant.version, 2);
   assert.equal(first.accountGrant.scope, 'account');
-  assert.equal(first.accountGrant.maxLogicalRequests, 8);
-  assert.equal(first.accountGrant.maxProviderAttempts, 197);
-  assert.equal(first.accountGrant.maxInputTokens, 32_768);
-  assert.equal(first.accountGrant.maxOutputTokens, 23_000);
+  assert.doesNotThrow(assertReviewedBudgetCompatibility);
+  assert.equal(first.accountGrant.maxLogicalRequests, 16);
+  assert.equal(first.accountGrant.maxProviderAttempts, 205);
+  assert.equal(first.accountGrant.maxInputTokens, 13 * MAX_GEMINI_SERIALIZED_REQUEST_BYTES);
+  assert.equal(first.accountGrant.maxOutputTokens, 53_500);
   assert.equal(first.accountGrant.maxConcurrentExternalOperations, 1);
   assert.equal(first.accountGrant.maxSandboxIdentities, 2);
   assert.equal(first.accountGrant.maxSandboxRuntimeMs, 1_200_000);
@@ -54,11 +57,11 @@ test('reviewed staging plan is deterministic and includes exactly the fixed six 
   assert.deepEqual([
     byCategory.gemini_investigation?.maxLogicalRequests, byCategory.gemini_investigation?.maxProviderAttempts,
     byCategory.gemini_investigation?.maxInputTokens, byCategory.gemini_investigation?.maxOutputTokens,
-  ], [2, 2, 12_288, 5_000]);
+  ], [7, 7, 7 * MAX_GEMINI_SERIALIZED_REQUEST_BYTES, 17_500]);
   assert.deepEqual([
     byCategory.gemini_candidate_generation?.maxLogicalRequests, byCategory.gemini_candidate_generation?.maxProviderAttempts,
     byCategory.gemini_candidate_generation?.maxInputTokens, byCategory.gemini_candidate_generation?.maxOutputTokens,
-  ], [3, 3, 20_480, 18_000]);
+  ], [6, 6, 6 * MAX_GEMINI_SERIALIZED_REQUEST_BYTES, 36_000]);
   for (const category of ['sandbox_baseline', 'sandbox_verification']) {
     const grant = byCategory[category];
     assert.deepEqual([grant?.providerId, grant?.maxLogicalRequests, grant?.maxProviderAttempts,
@@ -70,6 +73,16 @@ test('reviewed staging plan is deterministic and includes exactly the fixed six 
   assert.equal(byCategory.repair_loop_iteration?.providerId, 'vigilo');
   assert.equal(byCategory.repair_loop_iteration?.authorizedProviderAccountIdentity, null);
   assert.equal(first.operationGrants.every((grant) => grant.expiresAt.toISOString() === INPUT.expiresAt), true);
+  for (const [key, accountValue] of [
+    ['maxLogicalRequests', first.accountGrant.maxLogicalRequests],
+    ['maxProviderAttempts', first.accountGrant.maxProviderAttempts],
+    ['maxInputTokens', first.accountGrant.maxInputTokens],
+    ['maxOutputTokens', first.accountGrant.maxOutputTokens],
+    ['maxSandboxIdentities', first.accountGrant.maxSandboxIdentities],
+    ['maxSandboxRuntimeMs', first.accountGrant.maxSandboxRuntimeMs],
+  ] as const) {
+    assert.equal(accountValue, first.operationGrants.reduce((total, grant) => total + grant[key], 0), key);
+  }
 });
 
 test('reviewed plan identity is independent of operation-grant ordering', () => {

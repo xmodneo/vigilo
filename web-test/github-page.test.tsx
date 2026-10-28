@@ -208,8 +208,8 @@ test('selected repository renders a Ready allowlisted execution profile', () => 
   assert.match(html, /npm run build/);
   assert.match(html, /npm test/);
   assert.match(html, /Node built-in test runner/);
-  assert.match(html, /Start repair/);
-  assert.match(html, /action="\/api\/repair-runs"/);
+  assert.match(html, /separately reviewed, owner-approved start/);
+  assert.doesNotMatch(html, /action="\/api\/repair-runs"/);
   assert.match(html, /Execution evidence/);
   assert.match(html, /Outcome.*Passed/);
   assert.match(html, /Network isolation.*Confirmed/);
@@ -496,8 +496,8 @@ test('zero or unknown execution authority withholds provider-backed repair actio
     assert.match(html, /External execution unavailable/);
   }
   const available = renderToStaticMarkup(<GitHubConnectionView {...common} executionAvailability="available" />);
-  assert.match(available, /During an authorized repair, selected public repository source/);
-  assert.match(available, /Starting repair…/);
+  assert.match(available, /separately reviewed, owner-approved start/);
+  assert.doesNotMatch(available, /action="\/api\/repair-runs"|Starting repair…/);
 });
 
 test('eligible Repair Run renders its objective and bounded investigation status', () => {
@@ -509,6 +509,7 @@ test('eligible Repair Run renders its objective and bounded investigation status
   };
   const common = {
     executionAvailability: 'available' as const,
+    reviewedHandoffAvailability: 'eligible' as const,
     executionProfile: {
       baseRevision: 'a'.repeat(40), build: null, install: { operation: 'ci' as const, tool: 'npm' as const }, nodeMajor: 24,
       packageManager: 'npm', profileIdentity: 'b'.repeat(64), profileVersion: 2 as const, runtimeFamily: 'node', status: 'ready' as const,
@@ -521,6 +522,9 @@ test('eligible Repair Run renders its objective and bounded investigation status
   const eligible = renderToStaticMarkup(<GitHubConnectionView {...common} />);
   assert.match(eligible, /Inspect durable Repair Runs/); assert.match(eligible, /Prepare investigation/);
   assert.match(eligible, /action="\/api\/repair-runs\/11111111-1111-4111-8111-111111111111\/investigation"/);
+  const legacy = renderToStaticMarkup(<GitHubConnectionView {...common} reviewedHandoffAvailability="not_reviewed" />);
+  assert.match(legacy, /Inspect durable Repair Runs/);
+  assert.doesNotMatch(legacy, /action="\/api\/repair-runs\/11111111-1111-4111-8111-111111111111\/investigation"/);
   const prepared = renderToStaticMarkup(<GitHubConnectionView {...common} investigation={{
     id: '33333333-3333-4333-8333-333333333333', repairRunId: repairRun.id, repairObjective: repairRun.repairObjective,
     state: 'ready', revision: repairRun.revision, profileIdentity: repairRun.profileIdentity, baselineAvailable: true,
@@ -531,6 +535,33 @@ test('eligible Repair Run renders its objective and bounded investigation status
   assert.match(prepared, /Bounded repository context/); assert.match(prepared, /Paths indexed.*42/); assert.match(prepared, /Baseline evidence.*Available/);
   assert.match(prepared, /Repair Candidate/); assert.match(prepared, /No repair candidate yet/);
   assert.doesNotMatch(prepared, /Prepare investigation/);
+
+  const reviewed = renderToStaticMarkup(<GitHubConnectionView {...common}
+    executionAvailability="operational_unavailable" reviewedHandoffAvailability="eligible"
+    aiInvestigationRequestId="55555555-5555-4555-8555-555555555555"
+    aiCandidateGenerationRequestId="66666666-6666-4666-8666-666666666666"
+    investigation={{
+      id: '33333333-3333-4333-8333-333333333333', repairRunId: repairRun.id, repairObjective: repairRun.repairObjective,
+      state: 'ready', revision: repairRun.revision, profileIdentity: repairRun.profileIdentity, baselineAvailable: true,
+      treeSha: 'c'.repeat(40), indexedPathCount: 42, excludedPathCount: 3, treeTruncated: false,
+      contextBudget: { version: 1, maxTreeEntries: 2000, maxFileBytes: 65536, maxCumulativeBytes: 1048576, maxOperations: 50 },
+      failureCode: null, createdAt: repairRun.createdAt, completedAt: repairRun.completedAt, updatedAt: repairRun.completedAt!,
+    }} />);
+  assert.match(reviewed, /Execution service unavailable/);
+  assert.match(reviewed, /may create an exact job/);
+  assert.match(reviewed, /action="\/api\/ai-investigations"/);
+  assert.doesNotMatch(reviewed, /action="\/api\/repair-runs"/);
+  const invalid = renderToStaticMarkup(<GitHubConnectionView {...common}
+    executionAvailability="available" reviewedHandoffAvailability="ineligible"
+    investigation={{
+      id: '33333333-3333-4333-8333-333333333333', repairRunId: repairRun.id, repairObjective: repairRun.repairObjective,
+      state: 'ready', revision: repairRun.revision, profileIdentity: repairRun.profileIdentity, baselineAvailable: true,
+      treeSha: 'c'.repeat(40), indexedPathCount: 42, excludedPathCount: 3, treeTruncated: false,
+      contextBudget: { version: 1, maxTreeEntries: 2000, maxFileBytes: 65536, maxCumulativeBytes: 1048576, maxOperations: 50 },
+      failureCode: null, createdAt: repairRun.createdAt, completedAt: repairRun.completedAt, updatedAt: repairRun.completedAt!,
+    }} aiInvestigationRequestId="55555555-5555-4555-8555-555555555555"
+    aiCandidateGenerationRequestId="66666666-6666-4666-8666-666666666666" />);
+  assert.doesNotMatch(invalid, /action="\/api\/ai-investigations"/);
 
   const frozen = renderToStaticMarkup(<GitHubConnectionView {...common} investigation={{
     id: '33333333-3333-4333-8333-333333333333', repairRunId: repairRun.id, repairObjective: repairRun.repairObjective,
@@ -569,4 +600,55 @@ test('eligible Repair Run renders its objective and bounded investigation status
   assert.match(verified, /Execution outcome.*Test failed/); assert.match(verified, /Failing phase.*Tests/);
   assert.match(verified, /Network isolation.*Confirmed/); assert.match(verified, /Cleanup.*Confirmed/); assert.match(verified, /Verify candidate again/);
   assert.doesNotMatch(verified, /Approve|Publish|Create PR/);
+});
+
+test('reviewed handoff hint exposes inert downstream forms without general-worker readiness', () => {
+  const runId = '11111111-1111-4111-8111-111111111111';
+  const investigationId = '33333333-3333-4333-8333-333333333333';
+  const aiId = '22222222-2222-4222-8222-222222222222';
+  const now = '2026-10-27T00:00:00.000Z';
+  const common = {
+    executionAvailability: 'operational_unavailable' as const,
+    reviewedHandoffAvailability: 'eligible' as const,
+    executionProfile: { baseRevision: 'a'.repeat(40), build: null, install: { operation: 'ci' as const, tool: 'npm' as const },
+      nodeMajor: 24, packageManager: 'npm', profileIdentity: 'b'.repeat(64), profileVersion: 2 as const,
+      runtimeFamily: 'node', status: 'ready' as const, test: { script: 'test' as const, tool: 'npm' as const },
+      testRunner: 'node-test', typecheck: null },
+    installation: { accountLogin: 'xmodneo', accountType: 'User', installationId: 7001, status: 'active' },
+    selectedRepository: { defaultBranch: 'main', fullName: 'xmodneo/fixture', id: 8101, isPrivate: false },
+    workspaceId: 'workspace-1', repairRequestId: runId,
+    aiInvestigationRequestId: '44444444-4444-4444-8444-444444444444',
+    aiCandidateGenerationRequestId: '55555555-5555-4555-8555-555555555555',
+    repairLoopRequestId: '66666666-6666-4666-8666-666666666666',
+    repairRun: { id: runId, state: 'ready_for_investigation' as const, repositoryId: 8101, revision: 'a'.repeat(40),
+      profileIdentity: 'b'.repeat(64), repairObjective: 'Repair the observed failure.',
+      baseline: { evidenceId: 'baseline-1', outcome: 'baseline_passed' }, failure: null,
+      createdAt: now, baselineStartedAt: now, completedAt: now, stateChangedAt: now },
+    investigation: { id: investigationId, repairRunId: runId, repairObjective: 'Repair the observed failure.',
+      state: 'ready' as const, revision: 'a'.repeat(40), profileIdentity: 'b'.repeat(64), baselineAvailable: true,
+      treeSha: 'c'.repeat(40), indexedPathCount: 7, excludedPathCount: 0, treeTruncated: false,
+      contextBudget: { version: 1 as const, maxTreeEntries: 2000 as const, maxFileBytes: 65536 as const,
+        maxCumulativeBytes: 1048576 as const, maxOperations: 50 as const }, failureCode: null,
+      createdAt: now, completedAt: now, updatedAt: now },
+    aiInvestigation: { id: aiId, investigationId, executionOrdinal: 1, state: 'completed' as const,
+      revision: 'a'.repeat(40), provider: 'google', model: 'gemini-3.1-flash-lite', completionReason: 'model_conclusion' as const,
+      conclusion: { status: 'diagnosis_found' as const, summary: 'Observed defect.', suspectedFiles: [{ path: 'src/a.ts', reason: 'Observed.' }],
+        evidence: [{ kind: 'file' as const, reference: '77777777-7777-4777-8777-777777777777' }],
+        proposedApproach: 'Fix the observed comparison.', confidence: 'high' as const },
+      usage: { inputTokens: 100, outputTokens: 20, toolCallCount: 1, modelTurnCount: 2 }, failureCode: null },
+    repairCandidate: { id: '88888888-8888-4888-8888-888888888888', investigationId, ordinal: 1,
+      state: 'frozen' as const, candidateIdentity: 'd'.repeat(64), changedFileCount: 1, totalResultBytes: 48,
+      rejectionCode: null, createdAt: now, completedAt: now },
+  };
+  const eligible = renderToStaticMarkup(<GitHubConnectionView {...common} />);
+  for (const action of ['/api/ai-candidate-generations', '/api/repair-loops', '/api/candidate-verifications']) {
+    assert.match(eligible, new RegExp(`action="${action}"`));
+  }
+  assert.match(eligible, /External provider execution requires a separately authorized exact worker/);
+  assert.doesNotMatch(eligible, /action="\/api\/repair-runs"/);
+  const ineligible = renderToStaticMarkup(<GitHubConnectionView {...common} reviewedHandoffAvailability="ineligible" />);
+  assert.doesNotMatch(ineligible, /action="\/(?:api\/ai-candidate-generations|api\/repair-loops|api\/candidate-verifications)"/);
+  const legacy = renderToStaticMarkup(<GitHubConnectionView {...common}
+    executionAvailability="available" reviewedHandoffAvailability="not_reviewed" />);
+  assert.doesNotMatch(legacy, /action="\/(?:api\/ai-investigations|api\/ai-candidate-generations|api\/repair-loops|api\/candidate-verifications)"/);
 });

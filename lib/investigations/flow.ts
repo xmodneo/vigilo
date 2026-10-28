@@ -9,6 +9,7 @@ import { RepositoryPolicyError, assertPublicRepositoryAuthority } from '../githu
 import { matchesRepairRunEvidence } from '../repair-runs/flow.ts';
 import { assertMatchedSourceCheckpoint } from '../external-execution/source-checkpoint.ts';
 import { lockExternalExecution } from '../external-execution/business-fence.ts';
+import { assertReviewedHandoffAuthority } from '../external-execution/reviewed-handoff-authority.ts';
 import { INVESTIGATION_JOB_VERSION, type TransactionalInvestigationQueue } from '../repair-runs/queue.ts';
 import { CONTEXT_BUDGET } from './policy.ts';
 import type { InvestigationResult } from './types.ts';
@@ -78,7 +79,7 @@ export async function createInvestigation(
   repairRunId: string,
   idempotencyKey: string,
   queue: TransactionalInvestigationQueue,
-  options: { clock?: () => Date; randomId?: () => string } = {},
+  options: { clock?: () => Date; randomId?: () => string; runtimeReleaseSha?: string } = {},
 ): Promise<InvestigationResult> {
   if (!UUID.test(repairRunId) || !UUID.test(idempotencyKey)) throw new InvestigationError('invalid_investigation_request');
   const now = (options.clock ?? (() => new Date()))();
@@ -88,6 +89,7 @@ export async function createInvestigation(
       await lockExternalExecution(transaction);
       const [run] = await transaction.select().from(repairRun).where(and(eq(repairRun.id, repairRunId), eq(repairRun.workspaceId, context.workspace.id))).limit(1);
       if (!run) throw new InvestigationError('repair_run_not_found');
+      await assertReviewedHandoffAuthority(transaction, context, run.id, options.runtimeReleaseSha);
       try { await assertPublicRepositoryAuthority(transaction, run.workspaceId, run.githubRepositoryId); }
       catch (error) { if (error instanceof RepositoryPolicyError) throw new InvestigationError(error.code); throw error; }
       if (!['ready_for_investigation', 'baseline_failed'].includes(run.state) || !run.baselineId || !TRUSTWORTHY_OUTCOMES.has(run.baselineOutcome ?? '')) throw new InvestigationError('repair_run_not_eligible');

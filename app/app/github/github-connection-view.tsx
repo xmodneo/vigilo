@@ -8,6 +8,7 @@ import { HumanReviewStatus } from './human-review-status.tsx';
 import type { HumanReviewResult } from '../../../lib/human-reviews/types.ts';
 import { RepairPublicationStatus } from './repair-publication-status.tsx';
 import type { RepairPublicationResult } from '../../../lib/repair-publications/types.ts';
+import type { ReviewedHandoffAvailability } from '../../../lib/external-execution/reviewed-handoff-availability.ts';
 import { PendingSubmitButton } from '../pending-submit-button.tsx';
 import {
   presentError,
@@ -80,13 +81,6 @@ function evidenceLabel(value: string | null): string {
   return 'Unavailable';
 }
 
-const restartableRepairRunStates = new Set<RepairRunSummary['state']>([
-  'ready_for_investigation',
-  'baseline_failed',
-  'infrastructure_failed',
-  'cancelled',
-]);
-
 export interface GitHubConnectionViewProps {
   aiInvestigation?: AiInvestigationSummary | null;
   aiInvestigationRequestId?: string;
@@ -95,6 +89,7 @@ export interface GitHubConnectionViewProps {
   baseline?: BaselineSummary | null;
   executionProfile?: ExecutionProfileSummary | null;
   executionAvailability?: ExecutionAvailabilityStatus;
+  reviewedHandoffAvailability?: ReviewedHandoffAvailability;
   installation: InstallationSummary | null;
   investigation?: InvestigationSummary | null;
   investigationRequestId?: string;
@@ -125,13 +120,13 @@ export function GitHubConnectionView({
   baseline = null,
   executionProfile = null,
   executionAvailability = 'unknown',
+  reviewedHandoffAvailability = 'ineligible',
   installation,
   investigation = null,
   investigationRequestId,
   repairCandidate = null,
   candidateVerification = null,
   repositories,
-  repairRequestId,
   repairRun = null,
   repairLoop = null,
   repairLoopRequestId,
@@ -148,7 +143,7 @@ export function GitHubConnectionView({
 }: GitHubConnectionViewProps) {
   const repairLoopActive = repairLoop?.state === 'queued' || repairLoop?.state === 'running';
   const executionPresentation = presentExecutionAvailability(executionAvailability);
-  const executionAllowed = executionPresentation.actionAvailable && !selectedRepository?.isPrivate && !workflowError;
+  const handoffAllowed = reviewedHandoffAvailability === 'eligible' && !selectedRepository?.isPrivate && !workflowError;
   return (
     <main className="workspace-shell">
       <header className="workspace-header">
@@ -253,28 +248,18 @@ export function GitHubConnectionView({
                     <div className="repository-notice" role="status">
                       <strong>{executionPresentation.label}.</strong> {executionPresentation.explanation}
                     </div>
-                    {executionAllowed && (!repairRun || restartableRepairRunStates.has(repairRun.state)) && (
-                      <>
-                      <p className="data-use-disclosure">During an authorized repair, selected public repository source and your repair objective may be sent to configured AI and sandbox providers. Vigilo may retain the repair objective, frozen candidate contents, verification evidence, and audit history. External execution remains separately server-authorized.</p>
-                      <form className="repair-intent-form" action="/api/repair-runs" method="post">
-                        <input type="hidden" name="idempotencyKey" value={repairRequestId} />
-                        <label htmlFor="repair-objective">Repair objective</label>
-                        <textarea id="repair-objective" name="objective" required maxLength={3000} rows={4} placeholder="Example: Checkout should offer free shipping when the order total reaches the documented threshold." />
-                        <PendingSubmitButton className="primary-action" pendingLabel="Starting repair…">Start repair</PendingSubmitButton>
-                      </form>
-                      </>
-                    )}
-                    {!repairRun && !executionAllowed && <p className="empty-state">Your first repair starts with a specific reproducible objective. Existing history remains viewable while external execution is unavailable.</p>}
+                    {repairRun && reviewedHandoffAvailability === 'eligible' && handoffAllowed && <div className="repository-notice" role="status">This reviewed run may create an exact job for owner review. External provider execution requires a separately authorized exact worker and fresh authority checks.</div>}
+                    <div className="repository-notice" role="status">New repairs in this controlled beta require a separately reviewed, owner-approved start. Self-service Start Repair is unavailable. Existing repair history remains viewable.</div>
                     {repairRun && <RepairRunStatus initialRun={repairRun} />}
-                    {repairRun?.repairObjective && investigationRequestId && ['ready_for_investigation', 'baseline_failed'].includes(repairRun.state) && !investigation && (
+                    {handoffAllowed && repairRun?.repairObjective && investigationRequestId && ['ready_for_investigation', 'baseline_failed'].includes(repairRun.state) && !investigation && (
                       <form action={`/api/repair-runs/${encodeURIComponent(repairRun.id)}/investigation`} method="post">
                         <input type="hidden" name="idempotencyKey" value={investigationRequestId} />
                         <PendingSubmitButton className="primary-action" pendingLabel="Preparing investigation…">Prepare investigation</PendingSubmitButton>
                       </form>
                     )}
                     {investigation && <InvestigationStatus initialInvestigation={investigation} />}
-                    {investigation?.state === 'ready' && aiInvestigationRequestId && aiCandidateGenerationRequestId && <AiInvestigationStatus investigationId={investigation.id} initialAiInvestigation={aiInvestigation} startRequestId={aiInvestigationRequestId} initialAiCandidateGeneration={aiCandidateGeneration} candidateGenerationRequestId={aiCandidateGenerationRequestId} suppressCandidateActions={repairLoopActive} actionAvailable={executionAllowed} />}
-                    {executionAllowed && aiInvestigation?.state === 'completed' && aiInvestigation.conclusion?.status === 'diagnosis_found' && repairRun && repairLoopRequestId && !repairLoop && (
+                    {investigation?.state === 'ready' && aiInvestigationRequestId && aiCandidateGenerationRequestId && <AiInvestigationStatus investigationId={investigation.id} initialAiInvestigation={aiInvestigation} startRequestId={aiInvestigationRequestId} initialAiCandidateGeneration={aiCandidateGeneration} candidateGenerationRequestId={aiCandidateGenerationRequestId} suppressCandidateActions={repairLoopActive} actionAvailable={handoffAllowed} />}
+                    {handoffAllowed && aiInvestigation?.state === 'completed' && aiInvestigation.conclusion?.status === 'diagnosis_found' && repairRun && repairLoopRequestId && !repairLoop && (
                       <form action="/api/repair-loops" method="post">
                         <input type="hidden" name="repairRunId" value={repairRun.id} />
                         <input type="hidden" name="idempotencyKey" value={repairLoopRequestId} />
@@ -284,7 +269,7 @@ export function GitHubConnectionView({
                     {repairLoop && <RepairLoopStatus initialLoop={repairLoop} />}
                     {repairLoop && humanReview && humanReviewRequestId && <HumanReviewStatus review={humanReview} idempotencyKey={humanReviewRequestId} />}
                     {repairLoop && humanReview && repairPublicationRequestId && <RepairPublicationStatus review={humanReview} publication={repairPublication?.publication ?? null} events={repairPublication?.events ?? []} idempotencyKey={repairPublicationRequestId} />}
-                    {investigation?.state === 'ready' && <RepairCandidateStatus candidate={repairCandidate} verification={candidateVerification} workflowOwned={repairLoopActive} actionAvailable={executionAllowed} />}
+                    {investigation?.state === 'ready' && <RepairCandidateStatus candidate={repairCandidate} verification={candidateVerification} workflowOwned={repairLoopActive} actionAvailable={handoffAllowed} />}
                     {baseline && (
                       <section className="repository-panel" aria-labelledby="baseline-title">
                         <p className="eyebrow">Execution evidence</p>

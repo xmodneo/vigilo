@@ -2,6 +2,7 @@ import { GoogleGenAI, type Interactions } from '@google/genai';
 
 import { ModelProviderError, type InvestigationModelProvider, type InvestigationModelSession, type ModelTurn } from './types.ts';
 import { FINALIZATION_INPUT } from './protocol.ts';
+import { MAX_GEMINI_SERIALIZED_REQUEST_BYTES } from './request-budget.ts';
 import { ExternalExecutionAuthorityError, ZERO_EXTERNAL_EXECUTION_AUTHORITY, type ExternalExecutionAuthorizer } from '../external-execution/types.ts';
 import { googleProjectIdentity, type ProviderAccountIdentity } from '../external-execution/provider-account.ts';
 
@@ -159,6 +160,10 @@ export class GeminiInvestigationProvider implements InvestigationModelProvider {
           store: false,
         };
         if (!configuration.externalExecutionScope) throw new ModelProviderError('provider_configuration_failed');
+        const serializedRequestBytes = Buffer.byteLength(JSON.stringify(request), 'utf8');
+        if (serializedRequestBytes > MAX_GEMINI_SERIALIZED_REQUEST_BYTES) {
+          throw new ExternalExecutionAuthorityError('execution_budget_exhausted');
+        }
         const permit = await this.executionAuthority.reserve({
           scope: configuration.externalExecutionScope,
           ...(operationKey ? { operationKey } : {}),
@@ -166,7 +171,7 @@ export class GeminiInvestigationProvider implements InvestigationModelProvider {
           amounts: {
             logicalRequests: 1,
             providerAttempts: 1,
-            inputTokens: Buffer.byteLength(JSON.stringify(request), 'utf8'),
+            inputTokens: serializedRequestBytes,
             outputTokens: configuration.maxOutputTokens,
             sandboxIdentities: 0,
             sandboxRuntimeMs: 0,

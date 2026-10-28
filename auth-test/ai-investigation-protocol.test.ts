@@ -6,6 +6,7 @@ import test from 'node:test';
 import { classifyGeminiProviderError, GeminiInvestigationProvider, readModelApiKey } from '../lib/ai-investigations/gemini-provider.ts';
 import { buildInitialInput, CONCLUSION_SCHEMA, encodeToolOutput, MODEL_INSTRUCTIONS, MODEL_TOOLS, parseConclusion, parseToolArguments } from '../lib/ai-investigations/protocol.ts';
 import { AI_LIMITS, AI_MODEL_ID } from '../lib/ai-investigations/types.ts';
+import { MAX_GEMINI_SERIALIZED_REQUEST_BYTES } from '../lib/ai-investigations/request-budget.ts';
 import { parseAiInvestigationJobPayload } from '../lib/repair-runs/queue.ts';
 import { createTestExternalExecutionAuthorizer, TEST_EXTERNAL_EXECUTION_SCOPE } from './external-execution-support.ts';
 import { ExternalExecutionAuthorityError, type ExternalExecutionAuthorizer } from '../lib/external-execution/types.ts';
@@ -45,6 +46,62 @@ test('Gemini durable budget refusal happens before transport and keeps its origi
   const session = new GeminiInvestigationProvider('test-secret-value-with-adequate-length', AI_MODEL_ID, client as never, executionAuthority).createSession(providerConfiguration);
   await assert.rejects(session.next({ signal: new AbortController().signal }), (error: unknown) => error instanceof ExternalExecutionAuthorityError && error.code === 'execution_budget_exhausted');
   assert.equal(dispatches, 0);
+});
+
+test('the old two-request grant exhausts after two tool turns before a finalizing provider request', async () => {
+  let reservations = 0;
+  let dispatches = 0;
+  const underlying = createTestExternalExecutionAuthorizer();
+  const executionAuthority: ExternalExecutionAuthorizer = { reserve: async (request) => {
+    if (reservations === 2) throw new ExternalExecutionAuthorityError('execution_budget_exhausted');
+    reservations += 1;
+    return underlying.reserve(request);
+  } };
+  const client = { create: async () => {
+    dispatches += 1;
+    return { status: 'requires_action', steps: [{ type: 'function_call', id: `call-${dispatches}`, name: 'listPaths', arguments: {} }] };
+  } };
+  const session = new GeminiInvestigationProvider('test-secret-value-with-adequate-length', AI_MODEL_ID, client as never, executionAuthority).createSession(providerConfiguration);
+  await session.next({ signal: new AbortController().signal });
+  await session.next({ toolOutputs: [{ callId: 'call-1', output: '{}' }], signal: new AbortController().signal });
+  await assert.rejects(session.next({ toolOutputs: [{ callId: 'call-2', output: '{}' }], finalization: true, signal: new AbortController().signal }),
+    (error: unknown) => error instanceof ExternalExecutionAuthorityError && error.code === 'execution_budget_exhausted');
+  assert.equal(reservations, 2);
+  assert.equal(dispatches, 2);
+});
+
+test('oversized accumulated serialized request fails before reservation or provider transport', async () => {
+  let reservations = 0;
+  let dispatches = 0;
+  const executionAuthority: ExternalExecutionAuthorizer = { reserve: async () => { reservations += 1; throw new Error('unexpected reservation'); } };
+  const client = { create: async () => { dispatches += 1; throw new Error('unexpected transport'); } };
+  const session = new GeminiInvestigationProvider('test-secret-value-with-adequate-length', AI_MODEL_ID, client as never, executionAuthority)
+    .createSession({ ...providerConfiguration, initialInput: 'x'.repeat(MAX_GEMINI_SERIALIZED_REQUEST_BYTES + 1) });
+  await assert.rejects(session.next({ signal: new AbortController().signal }),
+    (error: unknown) => error instanceof ExternalExecutionAuthorityError && error.code === 'execution_budget_exhausted');
+  assert.equal(reservations, 0);
+  assert.equal(dispatches, 0);
+});
+
+test('a bounded first turn cannot smuggle an oversized tool result into a second provider request', async () => {
+  let reservations = 0;
+  let dispatches = 0;
+  const underlying = createTestExternalExecutionAuthorizer();
+  const executionAuthority: ExternalExecutionAuthorizer = { reserve: async (request) => {
+    reservations += 1;
+    return underlying.reserve(request);
+  } };
+  const client = { create: async () => {
+    dispatches += 1;
+    return { status: 'requires_action', steps: [{ type: 'function_call', id: 'one', name: 'readTextFile', arguments: { path: 'src/shipping.ts' } }] };
+  } };
+  const session = new GeminiInvestigationProvider('test-secret-value-with-adequate-length', AI_MODEL_ID, client as never, executionAuthority)
+    .createSession(providerConfiguration);
+  await session.next({ signal: new AbortController().signal });
+  await assert.rejects(session.next({ toolOutputs: [{ callId: 'one', output: 'x'.repeat(MAX_GEMINI_SERIALIZED_REQUEST_BYTES) }], signal: new AbortController().signal }),
+    (error: unknown) => error instanceof ExternalExecutionAuthorityError && error.code === 'execution_budget_exhausted');
+  assert.equal(reservations, 1);
+  assert.equal(dispatches, 1);
 });
 
 test('Gemini ambiguity remains terminal when outcome persistence fails', async (t) => {
@@ -110,7 +167,7 @@ test('final conclusion validation is exact and bounded', async (t) => {
 });
 
 test('limits are conservative fixed policy and cannot be browser or model controlled', () => {
-  assert.deepEqual(AI_LIMITS, { maxModelTurns: 8, maxToolBearingTurns: 6, reservedFinalizationTurns: 1, maxToolCalls: 20, maxContextResultBytes: 128 * 1024, maxOutputTokens: 2500, timeoutMs: 180000, perTool: { listPaths: 2, readTextFile: 10, searchText: 5, readBaselineSummary: 2 } });
+  assert.deepEqual(AI_LIMITS, { maxModelTurns: 7, maxToolBearingTurns: 6, reservedFinalizationTurns: 1, maxToolCalls: 20, maxContextResultBytes: 128 * 1024, maxOutputTokens: 2500, timeoutMs: 180000, perTool: { listPaths: 2, readTextFile: 10, searchText: 5, readBaselineSummary: 2 } });
   assert.ok(Object.isFrozen(AI_LIMITS)); assert.ok(Object.isFrozen(AI_LIMITS.perTool));
 });
 
