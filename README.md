@@ -89,23 +89,37 @@ create. This bounds Vigilo's dispatches, not the number of resources a provider
 actually created. Successful create responses become trustworthy only after SDK
 parsing and exact name/session confirmation.
 
-The prospective M7.7 envelope is one fixed account grant and five exact run-scoped
-operation grants: two investigation requests, three generation requests, one
-baseline identity, one verifier identity/attempt and one repair-loop iteration;
-external concurrency is one. No supplemental/replacement grant is authorized.
-The existing 96-provider-attempt/600,000-ms/`vcpu_1` ceiling applies separately to
-each Sandbox operation, including its bounded read/cleanup calls. Budget denial
-is terminal; internal model-loop ceilings and finalization behavior are unchanged.
-Success within five Gemini requests is not guaranteed or required.
+### Historical M7.7 limits and current M7.7B reviewed plan
 
-Deterministic controlled-request input totals were 8,207 investigation bytes and
-18,493 generation bytes. Test-only prospective input allowances are 12 KiB and
-20 KiB respectively (32 KiB account aggregate); larger real requests may safely
-exhaust them. The ledger field named `inputTokens` charges serialized UTF-8 Gemini
-request bytes, not tokenizer-measured input tokens. Output allowances are at most
-5,000 investigation and 18,000 generation tokens. The supported M7.7B staging
-service now fixes these limits in a versioned reviewed plan; no real acceptance
-grant has been issued and live acceptance remains pending.
+Earlier M7.7 planning used a prospective five-request Gemini envelope: two
+investigation and three candidate-generation requests. Deterministic controlled
+requests totaled 8,207 investigation bytes and 18,493 generation bytes; the
+test-only prospective input allowances were 12 KiB and 20 KiB, with 5,000 and
+18,000 output tokens respectively. These figures describe historical planning
+and tests, not the current published M7.7B reviewed-plan authority.
+
+The current `m77b_repair_v1` plan fixes one account grant and five exact
+run-scoped operation grants. Gemini investigation permits at most seven requests
+and 17,500 reserved output tokens; candidate generation permits at most six
+requests and 36,000 reserved output tokens. Together these allow at most 13
+Gemini requests and reserve 53,500 output tokens. Each complete serialized
+Gemini request is capped at 256 KiB before reservation and transport. The
+investigation and generation input reservations are 1,835,008 and 1,572,864
+bytes, totaling 3,407,872 account bytes. The ledger field named `inputTokens`
+charges serialized UTF-8 request bytes, not tokenizer-measured input tokens.
+
+The account grant permits at most 16 logical operations, 205 provider attempts,
+two Sandbox identities, 20 minutes of total Sandbox runtime, one concurrent
+external operation, one verification attempt, and one repair-loop iteration.
+The baseline and independent verification grants each permit one `vcpu_1`
+Sandbox for at most 600,000 ms (ten minutes) and 96 metered provider transport
+attempts, including bounded read and cleanup calls. No supplemental or
+replacement grant is authorized. The reviewed-plan builder checks protocol and
+grant constants together and fails closed on drift. Gemini SDK retries are
+disabled; Vercel Sandbox SDK network, 429, and 5xx transport retries, where
+present, remain metered within the attempt ceiling. An ambiguous create never
+authorizes another Sandbox creation. Publication, merge, and deployment are not
+automatic. These ceilings do not guarantee successful execution or zero charges.
 
 The local-only `operations/stage-reviewed-repair-run.ts` entrypoint accepts a
 strict `m77b_repair_v1` plan through protected stdin. `--dry-run` requires
@@ -133,16 +147,17 @@ shows the complete plan but never stages it. The owner-confirmed same-origin
 POST invokes the same transactional staging service with no browser-controlled
 repository, grant, queue, budget, or provider identity. A POST attempt requires
 durable-state inspection before any retry. The historical retirement operator
-does not authorize staging. Releasing this handoff changes the release SHA, so
-no plan should be generated until the new release is published and locally bound.
+does not authorize staging. A code release changes the release SHA; any new plan
+must bind the published, locally active release and be reviewed before staging.
 
 The development and live acceptance model is Google Gemini
 `gemini-3.1-flash-lite`; this is not the final production model. The Gemini Free
-Tier is used only for development and live acceptance against the public Vigilo
-repository. Current Free Tier terms state that submitted content may be used to
-improve Google products. It is not approved for private customer source.
+Tier is used only for development and live acceptance against the approved public
+Vigilo acceptance fixture. Under the Free Tier data-use terms reviewed for this
+acceptance, submitted content may be used to improve Google products. Private
+customer source is not approved.
 
-Sandbox execution in V1 requires an explicit, non-refreshing, team-scoped
+Sandbox execution in V1 requires an explicit, non-refreshing
 Vercel access token (`VERCEL_TOKEN`) with `VERCEL_TEAM_ID` and
 `VERCEL_PROJECT_ID`, held only by the worker/control plane. Never inject these
 values into a sandbox, customer commands, evidence, logs, or UI. Configured
@@ -151,7 +166,8 @@ JWT-shaped tokens, and incomplete configuration fail closed before transport.
 Automatic OIDC/JWT authentication is deferred because the SDK's refresh path is
 not included in durable attempt accounting—not because OIDC is inherently unsafe.
 Future support requires separately reviewed, metered short-lived refresh handling.
-No live acceptance of this remediated boundary has occurred.
+This boundary has been exercised in separately authorized public-fixture baseline
+attempts; complete M7.7B live acceptance remains pending.
 
 ## Local development
 
@@ -194,29 +210,28 @@ endpoint contacts an external provider.
 
 ## Current release and acceptance state
 
-- The checked source migration ledger is `0000` through `0026`.
-  `0026_baseline-one-shot-worker.sql` has been applied to the positively
-  identified persistent local Vigilo development database, whose ledger has 27
-  consistent entries. This local fact says nothing about production, staging,
-  shared databases, or arbitrary deployments. The one-shot worker and retirement
-  operator still require separate authorization.
-- The positively identified local development database currently selects the
-  public `xmodneo/vigilo-acceptance-fixture` repository and has one ready
-  fixture execution profile. One reviewed fixture RepairRun was staged with a
-  pending source checkpoint, grants, and an unclaimed baseline job. Its external
-  baseline execution has not started. No fixture baseline evidence, reservation,
-  or acceptance exists. This local state does not describe other deployments.
-  That historical reviewed job is on the general `repair-baseline-v1` queue;
-  its authority is expired and it must never execute. Keep general workers OFF
-  against the persistent database until the old run is retired. Backup and
-  migration 0026 are complete locally; the remaining separately authorized
-  sequence is: commit/push and promote the new release, keep workers off,
-  retire the old staged run, verify its old job is
-  terminal, then stage a fresh reviewed run on `repair-baseline-reviewed-v1`.
-  Only a later, separately authorized exact one-shot worker may claim the fresh
-  reviewed job. The general worker neither consumes nor supervises that queue:
-  pg-boss schema-wide automatic supervision is disabled, and its normal queue
-  maintenance is explicitly scoped to the seven canonical queues.
+- The checked source migration ledger is `0000` through `0027`. Both
+  `0026_baseline-one-shot-worker.sql` and `0027_exact-phase-one-shot.sql` have
+  been applied to the positively identified persistent local Vigilo development
+  database. Its ledger contained 28 entries at the October 30, 2026 read-only
+  inspection. This local fact says nothing about production, staging, shared
+  databases, or arbitrary deployments.
+- The local database selects the public `xmodneo/vigilo-acceptance-fixture`
+  repository and retains its ready execution profile. The old staged
+  `repair-baseline-v1` job and a later expired reviewed job were both retired
+  before execution; their RepairRuns and jobs are cancelled. A subsequent
+  reviewed baseline ended `infrastructure_failed` with its failed job and
+  evidence preserved. Two later reviewed baseline jobs completed and recorded
+  genuine `test_failed` evidence. An AI investigation on the later run failed
+  with `execution_budget_exhausted`; its evidence remains historical, not a
+  successful diagnosis or complete live acceptance. At the October 30 read-only
+  inspection there was no active external lease, live worker heartbeat, or
+  unexpired unrevoked grant. This snapshot does not describe other deployments.
+  A future attempt needs a fresh, separately owner-approved reviewed plan and
+  separately authorized exact-job workers. The general worker neither consumes
+  nor supervises the `repair-baseline-reviewed-v1` queue: pg-boss schema-wide
+  automatic supervision is disabled and normal queue maintenance is scoped to
+  the seven canonical queues.
 - With 0025 applied locally, changing the selected repository retains old
   repository, profile, run, and baseline rows as history. A switch or loss-of-access
   deselection is blocked by active run/investigation/AI-generation/verification/
@@ -243,8 +258,11 @@ endpoint contacts an external provider.
   separately authorized live draft-publication acceptance. It requires the
   exact prior repair-loop, human-review, and security/cost acceptances plus a
   subject-bound durable grant; no bootstrap grant or reservation exists today.
-- Effective external execution authority is zero. No current UI state creates a
-  grant or acceptance.
+- At the October 30 local inspection, effective external execution authority
+  was zero. Ordinary dashboard handoffs do not create grants; only separate
+  owner-confirmed reviewed staging can create a new operational RepairRun and
+  its fixed grants. An expired, unapproved dry-run plan cannot be staged or
+  reused; a future attempt requires a fresh plan and review.
 - Future external execution requires a server-derived exact `VIGILO_RELEASE_SHA`
   and a matching non-secret provider-account identity on the immutable grant
   and reservation. Gemini uses `GEMINI_PROJECT_ID`; Vercel uses
@@ -252,8 +270,13 @@ endpoint contacts an external provider.
   configuration. The Gemini project binding is operator-attested consistency,
   not cryptographic proof that an opaque API key belongs to that project.
   Credentials are never persisted as execution provenance.
-- The zero-spend policy remains in force. No live acceptance, provider request,
-  Sandbox creation, or GitHub publication occurred while wiring this gate.
+- The zero-additional-spend policy remains in force. The earlier gate-wiring
+  work made no provider request, while later separately authorized M7.7B
+  baseline and Gemini attempts did use real providers. Google Free Tier and
+  Vercel Hobby included allowances do not guarantee successful execution or
+  zero additional charges; current quota and billing conditions must be checked
+  before separately authorized live work. No complete repair-loop acceptance or
+  GitHub publication has occurred.
 - Milestone 7.4 operational readiness is local and deterministic, not deployed
   production acceptance. Managed SaaS production readiness has not been established.
 
