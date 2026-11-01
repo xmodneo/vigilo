@@ -7,7 +7,7 @@ import test from 'node:test';
 
 import type { AuthenticatedWorkspace } from '../lib/auth/protected-context.ts';
 import { readLocalStagingArtifact } from '../lib/external-execution/local-staging-artifact.ts';
-import { createLocalStagingHandler } from '../lib/external-execution/local-staging-handler.ts';
+import { createLocalStagingHandler, validateLocalStagingArtifact } from '../lib/external-execution/local-staging-handler.ts';
 import { buildReviewedStagingPlan } from '../lib/external-execution/reviewed-plan.ts';
 
 const actor = { workspaceId: 'workspace-one', reviewerUserId: 'owner-one' };
@@ -73,6 +73,17 @@ async function csrf(handler: ReturnType<typeof createLocalStagingHandler>) {
   return value;
 }
 
+test('local artifact accepts the current exact seven-plus-six Gemini budget', () => {
+  const reviewed = validateLocalStagingArtifact(
+    { actor, plan: input, approvedPlanIdentity }, configuration,
+    new Date('2026-10-23T10:00:00.000Z'),
+  );
+  assert.equal(reviewed.planIdentity, approvedPlanIdentity);
+  const google = reviewed.operationGrants.filter((grant) => grant.providerId === 'google');
+  assert.deepEqual(google.map((grant) => grant.maxLogicalRequests), [7, 6]);
+  assert.equal(google.reduce((total, grant) => total + grant.maxLogicalRequests, 0), 13);
+});
+
 test('GET shows complete reviewed plan without staging, while authenticated same-origin POST stages exact plan', async () => {
   const { handler, stages } = harness();
   const token = await csrf(handler);
@@ -124,7 +135,10 @@ test('POST rejects mismatched origin, null origin, Fetch Metadata, CSRF, and pla
 test('altered fixture, limits, objective, release, identity, and expired plan cannot be loaded or staged', async () => {
   for (const change of [{ githubRepositoryId: 99 }, { baseCommitSha: 'c'.repeat(40) },
     { expectedSourceIdentity: 'd'.repeat(64) }, { objective: 'different' },
-    { authorizedReleaseSha: 'e'.repeat(40) }, { expiresAt: '2026-10-23T09:00:00.000Z' }]) {
+    { authorizedReleaseSha: 'e'.repeat(40) }, { expiresAt: '2026-10-23T09:00:00.000Z' },
+    { providerAccounts: { ...providerAccounts, googleProjectId: 'other-project' } },
+    { providerAccounts: { ...providerAccounts, vercelTeamId: 'other-team' } },
+    { providerAccounts: { ...providerAccounts, vercelProjectId: 'other-project' } }]) {
     assert.throws(() => harness({ plan: { ...input, ...change } }));
   }
   assert.throws(() => harness({ approvedPlanIdentity: 'f'.repeat(64) }));

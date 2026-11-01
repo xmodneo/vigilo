@@ -71,7 +71,7 @@ export function validateLocalStagingArtifact(
   const vercel = reviewed.operationGrants.filter((grant) => grant.providerId === 'vercel');
   if (reviewed.planIdentity !== artifact.approvedPlanIdentity || reviewed.operationGrants.length !== 5 ||
       google.length !== 2 || google.some((grant) => grant.modelId !== 'gemini-3.1-flash-lite') ||
-      google.reduce((total, grant) => total + grant.maxLogicalRequests, 0) !== 5 ||
+      google.reduce((total, grant) => total + grant.maxLogicalRequests, 0) !== 13 ||
       reviewed.accountGrant.maxSandboxIdentities !== 2 || reviewed.accountGrant.maxSandboxRuntimeMs !== 1_200_000 ||
       reviewed.accountGrant.maxConcurrentExternalOperations !== 1 ||
       vercel.length !== 2 || vercel.some((grant) => grant.maxSandboxIdentities !== 1 ||
