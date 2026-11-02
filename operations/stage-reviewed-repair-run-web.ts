@@ -88,13 +88,15 @@ async function main(): Promise<void> {
   validateLocalStagingArtifact(artifact, configuration);
   const client = postgres(environment.databaseUrl, { max: 2, prepare: false });
   const database = drizzle(client, { schema });
-  const auth = betterAuth(createAuthOptions(database, environment));
+  const authOptions = createAuthOptions(database, environment);
+  const auth = betterAuth({ ...authOptions,
+    session: { ...authOptions.session, deferSessionRefresh: true } });
   const handler = createLocalStagingHandler({
     configuration, artifact, csrfSecret: randomBytes(32),
     resolveContext: async (headers) => {
       try {
         return await resolveAuthenticatedWorkspace(
-          (sessionHeaders) => auth.api.getSession({ headers: sessionHeaders }), database,
+          (sessionHeaders) => auth.api.getSession({ headers: sessionHeaders, method: 'GET' }), database,
           new Headers({ cookie: headers.get('cookie') ?? '' }), { existingWorkspaceOnly: true });
       } catch (error) {
         if (error instanceof AccessDeniedError) return null;
