@@ -1,297 +1,57 @@
 # Vigilo
 
-Vigilo is a repair garage for AI builders. It diagnoses a reproducible problem,
-prepares an exact repair candidate, checks that candidate in a fresh verification
-environment, and presents the measured evidence for human review.
+Vigilo is an engineering prototype for repairing a failing test in an eligible public Node.js repository. It freezes a source revision, measures a baseline in an isolated Sandbox, lets a bounded AI investigator inspect the failure, and is designed to verify any proposed change in a separate Sandbox before a person reviews it.
 
-Vigilo is a controlled beta. It does not guarantee a repair, automatically merge
-code, deploy software, or establish that a repository is production-ready.
+**V0.9 outcome:** the backend completed two real, source-bound failing baselines. On the second attempt, Gemini completed seven bounded investigation requests and six source-context operations, but Vigilo accepted no structured diagnosis. No AI-generated patch or independently verified green repair was produced. We stopped further live attempts rather than treating a provider response or an untested patch as success. The [sanitized evidence](docs/evidence/historical/README.md) records what was measured and what remains unknown.
 
-New operational RepairRuns currently require separate owner approval of an exact
-reviewed staging plan. The older self-service Start Repair form and POST are
-unavailable. Existing RepairRun history remains readable; a legacy run without
-complete current reviewed authority cannot enqueue new workflow jobs.
+## What works
 
-## Controlled-beta scope and limitations
+- GitHub App integration selects an eligible **public**, single-package Node.js 24/npm repository and binds work to one frozen commit and source manifest.
+- Owner-reviewed staging creates one RepairRun, its source checkpoint, six bounded execution grants, and an inert baseline job in one transaction. The self-service Start Repair route is disabled; new operational runs require a separately approved plan.
+- An exact-job worker runs the baseline in one `vcpu_1` Vercel Sandbox. It installs dependencies under a registry-only policy, confirms a `deny-all` network transition and same-session readback before repository scripts, records phase results, and verifies stop/delete/lookup-absent cleanup.
+- A separate exact-job worker prepares bounded, read-only source context. The Gemini investigation uses four scoped tools, durable request reservations, a strict conclusion schema, and no SDK retries.
+- PostgreSQL stores runs, immutable evidence, grants, reservations, provider-attempt events, leases, and PgBoss jobs. Exact-job workers do not start the general multi-queue consumer or automatically execute downstream jobs.
 
-Vigilo currently supports eligible public, single-package Node.js 24/npm repositories.
-Repairs may be inconclusive, fail verification, or end in a
-review-required state. Vigilo does not automatically merge or deploy code. Draft
-pull request publication remains unavailable until independent Task 4.3 live
-acceptance is completed. Production hosting, managed backup/PITR, and monitoring
-have not yet been selected or validated.
+Candidate generation, repair-loop coordination, independent verification, human review, and draft-publication gates exist in the code and have local deterministic coverage. **Their complete AI-generated repair path has not passed live acceptance.** Publication, merge, and deployment are not automatic; draft publication remains gated by missing live acceptance.
 
-Private repositories are unsupported and code-enforced at every source, model,
-sandbox, verification, review, and publication boundary. This beta is not
-approved for private customer repository processing.
+## Architecture
 
-## Supported repository contract
+Vigilo is a TypeScript modular monolith: a Next.js 16 web application with Better Auth and GitHub OAuth/App access; PostgreSQL 17 with Drizzle and PgBoss; explicit one-shot workers; Google Gemini 3.1 Flash Lite for investigation and candidate generation; and Vercel Sandbox for isolated baseline and verification work. The web process and workers share a release SHA and checked migration ledger, but workers require separate startup and exact authority.
 
-An eligible repository has:
+The [system design](docs/DESIGN.md) explains the transaction boundaries, source integrity checks, provider budgets, and five important tradeoffs. Existing deeper notes cover [operations](docs/operations.md), [baseline isolation](docs/baseline.md), [candidate artifacts](docs/candidate.md), and [verification](docs/verification.md). Those component histories do not constitute a live AI-generated repair.
 
-- public visibility;
-- a root `package.json` and committed root `package-lock.json`;
-- npm and Node.js 24 compatibility;
-- one package, with no workspace or monorepo layout;
-- a supported root test script with safe script delegation; and
-- optional root typecheck and build scripts, which Vigilo runs when present.
+## Measured V0.9 evidence
 
-The repository profile is checked against one exact commit. Stale access,
-ambiguous scripts, conflicting lockfiles, unsupported package managers or test
-runners, and malformed metadata fail closed.
+Two separately approved attempts against the frozen public acceptance fixture recorded `test_failed` baselines. In each, dependency installation, typecheck, and build exited 0; tests exited 1; source identity remained matched; the Sandbox reported `deny-all`; and stop, delete, and absence lookup were confirmed. Each baseline ran for about ten seconds. The database records phase status and exit code, but not individual test names or assertion text.
 
-## Repair workflow
+Attempt 1's prepared AI job was never executed before its grant expired and was later retired. Attempt 2 prepared seven indexed source paths. Its seven Gemini requests each received a successful provider response; six context operations completed (a baseline summary, path listing, three file reads, and one search). The reserved seventh, no-tools finalization did not yield an accepted structured conclusion, and the Investigation ended `model_limit_exceeded`. The final provider response was not retained, so we cannot determine whether it was empty, malformed, or rejected during parsing. No candidate generation, verification Sandbox, repair loop, or repair publication followed. See the [historical evidence package](docs/evidence/historical/README.md).
 
-1. Connect GitHub and choose an eligible public repository.
-2. Describe a reproducible problem for a separately owner-reviewed staging plan.
-   The owner must approve that exact plan before its RepairRun is created.
-3. Vigilo measures the frozen baseline and prepares bounded read-only context.
-4. A bounded AI investigation records a structured assessment.
-5. Vigilo freezes the exact proposed changed-file artifact.
-6. A fresh sandbox reconstructs and verifies that exact candidate.
-7. A reviewer sees the AI assessment, stored candidate content, baseline,
-   verification evidence, measurable objective result, and bounded attempt history.
-8. Approval or rejection immutably binds that exact candidate and evidence.
-9. Draft pull-request publication is a separate action and is available only when
-   its independent server-derived acceptance and authority gates pass.
+## Limits and safety boundaries
 
-Approval does not publish, merge, or deploy. Publication can create only a draft
-pull request; it cannot mark a pull request ready, merge, deploy, force-push, or
-delete a branch.
+The current reviewed plan caps an investigation at **7 Gemini requests** and candidate generation at **6**, with each complete serialized request at **256 KiB**. Their input reservations are 1,835,008 and 1,572,864 bytes; output reservations are 17,500 and 36,000 tokens. The account ceiling is 16 logical operations, 205 provider attempts, 3,407,872 serialized input bytes, and 53,500 output tokens. These are Vigilo reservation units and ceilings, **not measured provider usage or a billing guarantee**.
 
-## Data use and provider resources
+One baseline and one independent verification Sandbox are allowed, each `vcpu_1` for at most ten minutes, plus one repair-loop iteration and one concurrent external operation. Vercel transport attempts are separately bounded; an ambiguous create never authorizes a replacement Sandbox. Gemini SDK retries are disabled. Grants expire by PostgreSQL time, revocation and lease ownership are rechecked, and ambiguous provider outcomes fence further execution. Free Tier and Hobby allowances do not guarantee zero charges or successful execution.
 
-Before repository selection: Vigilo currently supports public repositories only.
-Selecting a repository lets Vigilo inspect its metadata and, when explicitly
-authorized, read source from an exact revision.
+Public repositories only: private repository processing is rejected at source, model, Sandbox, verification, and publication boundaries. Source files, objective text, and tool results are treated as untrusted data. No credentials are placed in the model context or Sandbox commands.
 
-During an authorized repair, selected public repository source and the repair
-objective may be sent to configured AI and sandbox providers. Vigilo may retain
-the repair objective, frozen candidate contents, verification evidence, and audit
-history. External execution remains separately server-authorized.
+## Limitations
 
-Execution is bounded by durable Vigilo server-side grants, exact operation scopes,
-attempt limits, leases, and provider-call ceilings. Application budgets limit
-resource use but do not guarantee a provider bill or dollar amount. With no valid
-grant, effective external execution authority is zero and history remains read-only.
+- Vigilo has **not** autonomously repaired the acceptance fixture, produced an AI candidate, shown a live green independent verification, or published a repair pull request.
+- The final Gemini response is unavailable. `model_limit_exceeded` identifies the failed finalization boundary but does not prove why the model's output was not accepted.
+- The live baseline records do not preserve named failing assertions. The fixture's expected regression is not a substitute for observed assertion text in these records.
+- Production hosting, managed backups, monitoring, private repository support, and real-provider crash/restart recovery are not validated. `/api/health` is liveness; readiness requires the matching worker and schema.
+- This is an engineering portfolio release, not a commercial or production-ready repair service. The decision after two attempts was to stop live execution and disclose the gap.
 
-An ambiguous external business outcome permanently fences that RepairRun against
-new business execution, including after restart or cleanup. The fence uses the
-append-only execution audit and unresolved attempt starts after ownership loss;
-a live in-flight attempt is not itself ambiguity. Exact known-resource lookup,
-stop/delete and token revocation do not confer permission to restart work.
-Recovery still needs its own valid remaining bounded authority. Cleanup cannot
-turn ambiguous evidence into release-acceptance evidence.
+## Local setup and reproduction
 
-Each Sandbox identity permits at most one creation HTTP dispatch, including SDK
-retry invocations. A lost/ambiguous create response never authorizes another
-create. This bounds Vigilo's dispatches, not the number of resources a provider
-actually created. Successful create responses become trustworthy only after SDK
-parsing and exact name/session confirmation.
-
-### Historical M7.7 limits and current M7.7B reviewed plan
-
-Earlier M7.7 planning used a prospective five-request Gemini envelope: two
-investigation and three candidate-generation requests. Deterministic controlled
-requests totaled 8,207 investigation bytes and 18,493 generation bytes; the
-test-only prospective input allowances were 12 KiB and 20 KiB, with 5,000 and
-18,000 output tokens respectively. These figures describe historical planning
-and tests, not the current published M7.7B reviewed-plan authority.
-
-The current `m77b_repair_v1` plan fixes one account grant and five exact
-run-scoped operation grants. Gemini investigation permits at most seven requests
-and 17,500 reserved output tokens; candidate generation permits at most six
-requests and 36,000 reserved output tokens. Together these allow at most 13
-Gemini requests and reserve 53,500 output tokens. Each complete serialized
-Gemini request is capped at 256 KiB before reservation and transport. The
-investigation and generation input reservations are 1,835,008 and 1,572,864
-bytes, totaling 3,407,872 account bytes. The ledger field named `inputTokens`
-charges serialized UTF-8 request bytes, not tokenizer-measured input tokens.
-
-The account grant permits at most 16 logical operations, 205 provider attempts,
-two Sandbox identities, 20 minutes of total Sandbox runtime, one concurrent
-external operation, one verification attempt, and one repair-loop iteration.
-The baseline and independent verification grants each permit one `vcpu_1`
-Sandbox for at most 600,000 ms (ten minutes) and 96 metered provider transport
-attempts, including bounded read and cleanup calls. No supplemental or
-replacement grant is authorized. The reviewed-plan builder checks protocol and
-grant constants together and fails closed on drift. Gemini SDK retries are
-disabled; Vercel Sandbox SDK network, 429, and 5xx transport retries, where
-present, remain metered within the attempt ceiling. An ambiguous create never
-authorizes another Sandbox creation. Publication, merge, and deployment are not
-automatic. These ceilings do not guarantee successful execution or zero charges.
-
-The local-only `operations/stage-reviewed-repair-run.ts` entrypoint accepts a
-strict `m77b_repair_v1` plan through protected stdin. `--dry-run` requires
-`{ "actor": { "workspaceId", "reviewerUserId" }, "plan": { ... } }` and returns
-only a plan hash, run ID, and grant count without database writes. A separately
-approved `--apply` request additionally requires the exact reviewed
-`approvedPlanIdentity` and a current session cookie in protected stdin, never a
-command-line argument. It resolves the existing authenticated owner, checks the
-configured release and provider-account identities, and atomically writes one
-RepairRun, its intent/event, pending source checkpoint, one account grant, five
-operation grants, and one inert baseline job. The full `ReviewedStagingInput`
-shape is defined in `lib/external-execution/reviewed-plan.ts`; arbitrary grant
-rows are not accepted. Do not invoke `--apply` for the real acceptance fixture
-without separate authorization. No worker or provider is started by staging.
-
-For the public M7.7B fixture, a separate default-disabled loopback browser
-handoff (`npm run ops:stage-reviewed-repair-run-web`) can use the owner's normal
-Vigilo session without exposing its HttpOnly cookie to a terminal. It binds to
-`http://localhost:3002/` only when explicitly enabled for local development,
-and reads a single non-secret, mode-0600 `.vigilo/m77b-approved-plan.json`
-containing exactly `actor`, `plan`, and `approvedPlanIdentity`. The fixed file
-must be prepared only after a fresh production `--dry-run` and separate review;
-an old-release, altered, or expired plan is rejected. The authenticated GET
-shows the complete plan but never stages it. The owner-confirmed same-origin
-POST invokes the same transactional staging service with no browser-controlled
-repository, grant, queue, budget, or provider identity. A POST attempt requires
-durable-state inspection before any retry. The historical retirement operator
-does not authorize staging. A code release changes the release SHA; any new plan
-must bind the published, locally active release and be reviewed before staging.
-
-The development and live acceptance model is Google Gemini
-`gemini-3.1-flash-lite`; this is not the final production model. The Gemini Free
-Tier is used only for development and live acceptance against the approved public
-Vigilo acceptance fixture. Under the Free Tier data-use terms reviewed for this
-acceptance, submitted content may be used to improve Google products. Private
-customer source is not approved.
-
-Sandbox execution in V1 requires an explicit, non-refreshing
-Vercel access token (`VERCEL_TOKEN`) with `VERCEL_TEAM_ID` and
-`VERCEL_PROJECT_ID`, held only by the worker/control plane. Never inject these
-values into a sandbox, customer commands, evidence, logs, or UI. Configured
-`VERCEL_OIDC_TOKEN` (even alongside access-token configuration), three-segment
-JWT-shaped tokens, and incomplete configuration fail closed before transport.
-Automatic OIDC/JWT authentication is deferred because the SDK's refresh path is
-not included in durable attempt accounting—not because OIDC is inherently unsafe.
-Future support requires separately reviewed, metered short-lived refresh handling.
-This boundary has been exercised in separately authorized public-fixture baseline
-attempts; complete M7.7B live acceptance remains pending.
-
-## Local development
-
-Requirements:
-
-- Node.js 24;
-- npm 11;
-- PostgreSQL reachable through the ignored local `DATABASE_URL`; and
-- local credentials only in ignored `.env.local` / `.secrets/` paths.
-
-Install without lifecycle scripts, start the existing local PostgreSQL service
-using the operator-approved mechanism for that environment, verify `DATABASE_URL`
-targets it, apply the checked migration ledger, and start the web app:
+Use Node.js 24, npm 11, and an **isolated local PostgreSQL database**. Place local credentials in ignored, owner-restricted configuration such as `.env.local`; never copy example values from another operator or commit credentials. Configure the GitHub OAuth/App and provider identities through the project's existing local setup, then independently review provider billing and scopes before any live operation.
 
 ```sh
 npm ci --ignore-scripts
-npm run db:migrate
-npm run dev
+npm run db:migrate       # only against your own disposable/local database
+npm run dev -- --hostname 127.0.0.1 --port 3000
 ```
 
-Start the multi-queue worker separately only when the intended operation has
-explicit external-execution authority:
+`GET /api/health` checks liveness. The application intentionally has no self-service Start Repair action. The code's deterministic suites can be examined with the scripts in `package.json`; live Sandbox and Gemini operations require separate owner-reviewed staging, unexpired grants, exact-job invocation, provider credentials, and spending approval. **Do not run `npm run baseline`, any worker, or staging merely to reproduce this README.** The public evidence package is the reproducible account of the completed live attempts; it does not require a new provider call.
 
-```sh
-npm run worker:dev
-```
-
-Useful deterministic checks:
-
-```sh
-npm run typecheck
-npm test
-npm run build
-```
-
-`GET /api/health` is dependency-free liveness only. `GET
-/api/health/readiness` checks the database ledger, queue registration,
-operational schemas, and a fresh same-release worker heartbeat. Neither health
-endpoint contacts an external provider.
-
-## Current release and acceptance state
-
-- The checked source migration ledger is `0000` through `0027`. Both
-  `0026_baseline-one-shot-worker.sql` and `0027_exact-phase-one-shot.sql` have
-  been applied to the positively identified persistent local Vigilo development
-  database. Its ledger contained 28 entries at the October 30, 2026 read-only
-  inspection. This local fact says nothing about production, staging, shared
-  databases, or arbitrary deployments.
-- The local database selects the public `xmodneo/vigilo-acceptance-fixture`
-  repository and retains its ready execution profile. The old staged
-  `repair-baseline-v1` job and a later expired reviewed job were both retired
-  before execution; their RepairRuns and jobs are cancelled. A subsequent
-  reviewed baseline ended `infrastructure_failed` with its failed job and
-  evidence preserved. Two later reviewed baseline jobs completed and recorded
-  genuine `test_failed` evidence. An AI investigation on the later run failed
-  with `execution_budget_exhausted`; its evidence remains historical, not a
-  successful diagnosis or complete live acceptance. At the October 30 read-only
-  inspection there was no active external lease, live worker heartbeat, or
-  unexpired unrevoked grant. This snapshot does not describe other deployments.
-  A future attempt needs a fresh, separately owner-approved reviewed plan and
-  separately authorized exact-job workers. The general worker neither consumes
-  nor supervises the `repair-baseline-reviewed-v1` queue: pg-boss schema-wide
-  automatic supervision is disabled and normal queue maintenance is scoped to
-  the seven canonical queues.
-- With 0025 applied locally, changing the selected repository retains old
-  repository, profile, run, and baseline rows as history. A switch or loss-of-access
-  deselection is blocked by active run/investigation/AI-generation/verification/
-  repair-loop/publication states, active attempts, unexpired operation or one-shot
-  grants, active or ambiguous external leases, and unfinished provider attempts.
-  Parked `ready_for_investigation` runs do not block selection, but cannot start
-  new work while their repository is deselected. Profile detection for a newly
-  selected repository remains a separate explicit action.
-- `0020_human-review.sql`, `0021_repair-publication.sql`, and
-  `0022_external-execution-authority.sql` were likewise applied only to the
-  positively identified local development database during their reviewed
-  workflows.
-- Arbitrary deployments must independently verify and apply their own migration ledger through the forward-only migration process.
-- Task 4.3 live acceptance remains pending. The real protocol-v4 generation to
-  fresh verification, real sandbox evidence reconciliation, live verified
-  recovery, live second iteration, and real-provider crash/restart recovery are
-  not live-validated.
-- The production publication resolver now requires the exact immutable
-  `repair_loop_live`, `human_review_live`, `draft_publication_live`, and
-  `security_cost_control` acceptance set for `VIGILO_RELEASE_SHA`. No such live
-  set exists, so publication remains hard-closed with `live_acceptance_pending`.
-  In the current zero-authority state, production publication cannot reach a GitHub write.
-- A server-only, expiring one-shot bootstrap path exists solely for a future,
-  separately authorized live draft-publication acceptance. It requires the
-  exact prior repair-loop, human-review, and security/cost acceptances plus a
-  subject-bound durable grant; no bootstrap grant or reservation exists today.
-- At the October 30 local inspection, effective external execution authority
-  was zero. Ordinary dashboard handoffs do not create grants; only separate
-  owner-confirmed reviewed staging can create a new operational RepairRun and
-  its fixed grants. An expired, unapproved dry-run plan cannot be staged or
-  reused; a future attempt requires a fresh plan and review.
-- Future external execution requires a server-derived exact `VIGILO_RELEASE_SHA`
-  and a matching non-secret provider-account identity on the immutable grant
-  and reservation. Gemini uses `GEMINI_PROJECT_ID`; Vercel uses
-  `VERCEL_TEAM_ID` and `VERCEL_PROJECT_ID` from the same validated transport
-  configuration. The Gemini project binding is operator-attested consistency,
-  not cryptographic proof that an opaque API key belongs to that project.
-  Credentials are never persisted as execution provenance.
-- The zero-additional-spend policy remains in force. The earlier gate-wiring
-  work made no provider request, while later separately authorized M7.7B
-  baseline and Gemini attempts did use real providers. Google Free Tier and
-  Vercel Hobby included allowances do not guarantee successful execution or
-  zero additional charges; current quota and billing conditions must be checked
-  before separately authorized live work. No complete repair-loop acceptance or
-  GitHub publication has occurred.
-- Milestone 7.4 operational readiness is local and deterministic, not deployed
-  production acceptance. Managed SaaS production readiness has not been established.
-
-## Architecture and operations
-
-- [Controlled-beta operations](docs/operations.md): deployment topology,
-  readiness, migrations, backup/restore, incidents, and data lifecycle.
-- [Baseline boundary](docs/baseline.md)
-- [Candidate artifact](docs/candidate.md)
-- [Fresh verification](docs/verification.md)
-- [Evidence report](docs/evidence-report.md)
-- [Failure cleanup](docs/failure-cleanup.md)
-
-The system is a modular monolith: a stateless Next.js web service, one
-multi-queue worker, and PostgreSQL for durable application, queue, authority,
-audit, and operational state. Production startup never mutates schema
-automatically. Credentials remain server-side and are never returned by the
-workspace UI.
+For a short interview walkthrough, use the [2–3 minute demo script](docs/DEMO_SCRIPT.md). Resume-bullet candidates and the evidence needed to support them are included there.
