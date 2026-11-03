@@ -3,9 +3,9 @@ import { createHash, randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
 
-import { and, eq } from 'drizzle-orm';
+import { and, eq, sql } from 'drizzle-orm';
 
-import { account, aiInvestigation, aiInvestigationAttempt, aiInvestigationEvent, executionBudgetGrant, executionBudgetGrantRevocation, executionProfile, githubInstallation, investigation, investigationContextEntry, investigationContextEvent, repairCandidate, repairIntent, repairRun, repairRunAttempt, repository, repositoryBaseline, user, workspace } from '../db/schema.ts';
+import { account, aiInvestigation, aiInvestigationAttempt, aiInvestigationEvent, executionBudgetGrant, executionBudgetGrantRevocation, executionProfile, externalExecutionEvent, externalExecutionLease, externalExecutionReservation, githubInstallation, investigation, investigationContextEntry, investigationContextEvent, repairCandidate, repairIntent, repairRun, repairRunAttempt, repairRunSourceCheckpoint, repository, repositoryBaseline, user, workspace } from '../db/schema.ts';
 import { GeminiInvestigationProvider } from '../lib/ai-investigations/gemini-provider.ts';
 import { modelRequestKey } from '../lib/ai-investigations/model-request-key.ts';
 import { createTestExternalExecutionAuthorizer } from './external-execution-support.ts';
@@ -14,7 +14,9 @@ import { getAiInvestigation, startAiInvestigation, AiInvestigationFlowError } fr
 import { processAiInvestigationJob } from '../lib/ai-investigations/worker.ts';
 import { AiAgentError, runAiInvestigation } from '../lib/ai-investigations/runner.ts';
 import { createAiInvestigationHandlers } from '../lib/ai-investigations/handlers.ts';
-import type { AuthenticatedWorkspace } from '../lib/auth/protected-context.ts';
+import { createExpiredAiRetirementHandler } from '../lib/ai-investigations/expired-retirement-handler.ts';
+import { EXPIRED_AI_RETIREMENT_REASON, retireExpiredUnstartedAiInvestigation } from '../lib/ai-investigations/expired-retirement.ts';
+import { AccessDeniedError, type AuthenticatedWorkspace } from '../lib/auth/protected-context.ts';
 import type { GitHubAppConfiguration } from '../lib/github-app/types.ts';
 import { readTextFile, searchText } from '../lib/investigations/context.ts';
 import type { InvestigationSourceGateway } from '../lib/investigations/types.ts';
@@ -26,6 +28,7 @@ import { buildReviewedStagingPlan, type ReviewedStagingInput } from '../lib/exte
 import { stageReviewedRepairRun } from '../lib/external-execution/reviewed-staging.ts';
 import type { TransactionalReviewedBaselineQueue } from '../lib/repair-runs/queue.ts';
 import { transitionRepairRun } from '../lib/repair-runs/flow.ts';
+import { hasRepositorySwitchConflict } from '../lib/github-repositories/switch-guard.ts';
 
 const NOW = new Date();
 const COMMIT = 'a'.repeat(40); const TREE = 'c'.repeat(40);
@@ -634,4 +637,249 @@ test('agent timeout and exhausted context budget stop safely and honestly', asyn
     const output = await processAiInvestigationJob(job(ai.id), { database: context.database, gateway: new Gateway(), configuration: CONFIGURATION, createProvider: () => provider, clock: () => NOW });
     assert.equal(output.status, 'completed'); const stored = await getAiInvestigation(context.database, root.owner, ai.id); assert.equal(stored?.completionReason, 'budget_exhausted'); assert.equal(stored?.conclusion?.status, 'insufficient_evidence'); assert.equal(stored?.conclusion?.confidence, 'low');
   });
+});
+
+// These cases use only disposable PGlite. The small pg-boss table models the
+// exact job row; the fake cancel executes through the same transaction adapter.
+async function expiredAiRetirementCase(expired = true, withTerminalBaseline = false) {
+  const context = await createTestContext();
+  const root = await seedRoot(context);
+  const runId = randomUUID(); const baselineId = randomUUID(); const investigationId = randomUUID();
+  const aiId = randomUUID(); const intentId = randomUUID();
+  const expiresAt = new Date(Date.now() + (expired ? -60_000 : 60 * 60_000));
+  const input: ReviewedStagingInput = { kind: 'm77b_repair_v1', repairRunId: runId,
+    idempotencyKey: randomUUID(), githubRepositoryId: REPOSITORY_ID, installationId: INSTALLATION_ID,
+    profileIdentity: PROFILE, baseCommitSha: COMMIT, authorizedReleaseSha: RELEASE,
+    objective: OBJECTIVE, expectedSourceIdentity: SOURCE_IDENTITY, expiresAt: expiresAt.toISOString(),
+    providerAccounts: PROVIDER_ACCOUNTS };
+  const plan = buildReviewedStagingPlan({ workspaceId: root.workspaceId, reviewerUserId: USER_ID }, input,
+    new Date(expiresAt.getTime() - 60 * 60_000));
+  const historicalTime = new Date(expiresAt.getTime() - 30 * 60_000);
+  await context.database.insert(repairRun).values({ id: runId, workspaceId: root.workspaceId,
+    githubRepositoryId: REPOSITORY_ID, installationId: INSTALLATION_ID, profileIdentity: PROFILE,
+    baseCommitSha: COMMIT, idempotencyKey: input.idempotencyKey, state: 'created',
+    createdAt: historicalTime, stateChangedAt: historicalTime, updatedAt: historicalTime });
+  await context.database.insert(repairIntent).values({ id: intentId, repairRunId: runId,
+    workspaceId: root.workspaceId, objective: OBJECTIVE, objectiveHash: plan.objective.objectiveHash,
+    createdAt: historicalTime });
+  await context.database.insert(repairRunSourceCheckpoint).values({ repairRunId: runId,
+    expectedSourceIdentity: SOURCE_IDENTITY, reviewedBy: USER_ID, planIdentity: plan.planIdentity });
+  await context.database.insert(executionBudgetGrant).values({ ...plan.accountGrant, id: randomUUID(), createdAt: historicalTime });
+  await context.database.insert(executionBudgetGrant).values(plan.operationGrants.map((grant) => ({
+    ...grant, id: randomUUID(), createdAt: historicalTime,
+  })));
+  if (withTerminalBaseline) {
+    const grants = await context.database.select().from(executionBudgetGrant);
+    const baselineGrant = grants.find((grant) => grant.operationCategory === 'sandbox_baseline');
+    const accountGrant = grants.find((grant) => grant.scope === 'account');
+    assert.ok(baselineGrant); assert.ok(accountGrant);
+    const reservationId = randomUUID(); const fence = 1000;
+    await context.database.insert(externalExecutionReservation).values({ id: reservationId, version: 2,
+      grantId: baselineGrant.id, accountGrantId: accountGrant.id, workspaceId: root.workspaceId,
+      repairRunId: runId, githubRepositoryId: REPOSITORY_ID, baseCommitSha: COMMIT,
+      operationCategory: 'sandbox_baseline', providerId: 'vercel', modelId: null,
+      executingReleaseSha: RELEASE, executingProviderAccountIdentity: baselineGrant.authorizedProviderAccountIdentity,
+      operationKey: randomUUID(), fence, reservationIdentity: 'e'.repeat(64),
+      reservedLogicalRequests: 1, reservedProviderAttempts: 1, reservedInputTokens: 0,
+      reservedOutputTokens: 0, reservedSandboxIdentities: 1, reservedSandboxRuntimeMs: 600_000,
+      sandboxResourceClass: 'vcpu_1', reservedVerificationAttempts: 0, reservedRepairLoopIterations: 0,
+      createdAt: historicalTime });
+    await context.database.insert(externalExecutionLease).values({ reservationId,
+      ownershipToken: randomUUID(), fence, state: 'failed', heartbeatAt: historicalTime,
+      leaseExpiresAt: new Date(historicalTime.getTime() + 10 * 60_000),
+      completedAt: new Date(historicalTime.getTime() + 60_000),
+      failureCode: 'execution_authority_mismatch' });
+    await context.database.insert(externalExecutionEvent).values({ id: randomUUID(), reservationId,
+      eventType: 'failed', failureCode: 'execution_authority_mismatch',
+      createdAt: new Date(historicalTime.getTime() + 60_000) });
+  }
+  await context.database.update(repairRun).set({ state: 'baseline_running', baselineStartedAt: historicalTime,
+    stateChangedAt: historicalTime, updatedAt: historicalTime }).where(eq(repairRun.id, runId));
+  await context.database.insert(repositoryBaseline).values({ id: baselineId, workspaceId: root.workspaceId,
+    githubRepositoryId: REPOSITORY_ID, installationId: INSTALLATION_ID, evidenceVersion: 1,
+    profileIdentity: PROFILE, baseCommitSha: COMMIT, archiveSha256: '2'.repeat(64),
+    sandboxName: 'expired-ai-retirement-baseline', sourceIdentityBefore: SOURCE_IDENTITY,
+    sourceIdentityAfter: SOURCE_IDENTITY, sourceUnchanged: true, credentialsExposure: 'absent',
+    networkPolicy: 'deny-all', installStatus: 'completed', installExitCode: 0, installTimedOut: false,
+    typecheckStatus: 'completed', typecheckExitCode: 0, typecheckTimedOut: false,
+    buildStatus: 'completed', buildExitCode: 0, buildTimedOut: false,
+    testStatus: 'failed', testExitCode: 1, testTimedOut: false,
+    executionOutcome: 'test_failed', overallOutcome: 'test_failed', cleanupStop: 'confirmed',
+    cleanupDelete: 'confirmed', cleanupLookup: 'absent', errorPhase: 'test', errorCode: 'npm_command_failed',
+    startedAt: historicalTime, completedAt: historicalTime, durationMs: 1 });
+  const attemptId = randomUUID();
+  await context.database.insert(repairRunAttempt).values({ id: attemptId, repairRunId: runId,
+    queueJobId: runId, attemptNumber: 1, expectedBaselineId: baselineId, baselineId,
+    ownershipToken: randomUUID(), state: 'customer_failed', claimedAt: historicalTime,
+    heartbeatAt: historicalTime, leaseExpiresAt: null, finishedAt: historicalTime,
+    failureClassification: 'customer_baseline_failure', failureCode: 'test_failed' });
+  await context.database.update(repairRun).set({ state: 'ready_for_investigation', baselineId,
+    baselineOutcome: 'test_failed', failureClassification: 'customer_baseline_failure',
+    failureCode: 'test_failed', completedAt: historicalTime, stateChangedAt: historicalTime,
+    updatedAt: historicalTime }).where(eq(repairRun.id, runId));
+  await context.database.update(repairRunSourceCheckpoint).set({ baselineId })
+    .where(eq(repairRunSourceCheckpoint.repairRunId, runId));
+  await context.database.insert(investigation).values({ id: investigationId, repairRunId: runId,
+    repairIntentId: intentId, workspaceId: root.workspaceId, githubRepositoryId: REPOSITORY_ID,
+    installationId: INSTALLATION_ID, baseCommitSha: COMMIT, profileIdentity: PROFILE, baselineId,
+    idempotencyKey: randomUUID(), state: 'ready', contextBudgetVersion: 1, maxTreeEntries: 2000,
+    maxFileBytes: 65536, maxCumulativeBytes: 1048576, maxOperations: 50, treeSha: TREE,
+    indexedPathCount: 1, attemptNumber: 1, completedAt: historicalTime, updatedAt: historicalTime });
+  await context.database.insert(aiInvestigation).values({ id: aiId, investigationId,
+    executionOrdinal: 1, idempotencyKey: randomUUID(), repairRunId: runId, baselineId,
+    workspaceId: root.workspaceId, githubRepositoryId: REPOSITORY_ID, installationId: INSTALLATION_ID,
+    baseCommitSha: COMMIT, profileIdentity: PROFILE, providerId: 'google',
+    modelId: 'gemini-3.1-flash-lite', protocolVersion: 1, state: 'queued',
+    createdAt: historicalTime, queuedAt: historicalTime, updatedAt: historicalTime });
+  await context.database.insert(aiInvestigationEvent).values([
+    { id: randomUUID(), aiInvestigationId: aiId, workspaceId: root.workspaceId,
+      fromState: null, toState: 'created', createdAt: historicalTime },
+    { id: randomUUID(), aiInvestigationId: aiId, workspaceId: root.workspaceId,
+      fromState: 'created', toState: 'queued', createdAt: historicalTime },
+  ]);
+  const seeded = { runId, baselineId, investigationId }; const ai = { id: aiId };
+  await context.client.exec(`create schema if not exists pgboss;
+    create table if not exists pgboss.job (id uuid primary key, name text not null, state text not null,
+      data jsonb not null, retry_count integer not null default 0, started_on timestamptz,
+      completed_on timestamptz, heartbeat_on timestamptz, blocked boolean not null default false,
+      blocking boolean not null default false, pending_dependencies integer not null default 0,
+      source_id uuid);`);
+  await context.database.execute(sql`insert into pgboss.job (id, name, state, data) values
+    (${ai.id}::uuid, 'ai-investigation-v1', 'created', ${JSON.stringify({ version: 1, aiInvestigationId: ai.id })}::jsonb)`);
+  const planIdentity = plan.planIdentity;
+  const target = { repairRunId: runId, contextInvestigationId: seeded.investigationId,
+    aiInvestigationId: ai.id, planIdentity, authorizedReleaseSha: RELEASE,
+    repositoryId: REPOSITORY_ID, revision: COMMIT };
+  const boss = { cancel: async (_name: string, id: string, options: { db: { executeSql(query: string, values: unknown[]): Promise<{ rows: unknown[] }> } }) => {
+    const result = await options.db.executeSql(`update pgboss.job set state = 'cancelled', completed_on = clock_timestamp()
+      where id = $1::uuid and name = 'ai-investigation-v1' and state = 'created' returning id`, [id]);
+    return { affected: result.rows.length };
+  } } as never;
+  const jobState = async () => {
+    const result = await context.database.execute(sql`select state, started_on, completed_on from pgboss.job where id = ${ai.id}::uuid`);
+    const rows = result as unknown as { rows?: Array<{ state: string; started_on: Date | null; completed_on: Date | null }> } |
+      Array<{ state: string; started_on: Date | null; completed_on: Date | null }>;
+    return (Array.isArray(rows) ? rows : rows.rows ?? [])[0];
+  };
+  return { context, root, seeded, ai, target, boss, jobState };
+}
+
+test('owner retirement atomically terminalizes one expired never-started AI job and preserves history', async (t) => {
+  const fixture = await expiredAiRetirementCase(true, true); t.after(() => fixture.context.client.close());
+  const { context, root, seeded, ai, target, boss, jobState } = fixture;
+  const beforeRun = (await context.database.select().from(repairRun).where(eq(repairRun.id, seeded.runId)))[0];
+  const beforeContext = (await context.database.select().from(investigation).where(eq(investigation.id, seeded.investigationId)))[0];
+  const beforeBaseline = (await context.database.select().from(repositoryBaseline).where(eq(repositoryBaseline.id, seeded.baselineId)))[0];
+  assert.ok(beforeRun); assert.ok(beforeContext); assert.ok(beforeBaseline);
+  const otherBaselineId = randomUUID(); const otherRunId = randomUUID();
+  await context.database.insert(repositoryBaseline).values({ ...beforeBaseline, id: otherBaselineId,
+    sandboxName: 'other-parked-baseline' });
+  await context.database.insert(repairRun).values({ ...beforeRun, id: otherRunId,
+    idempotencyKey: randomUUID(), baselineId: otherBaselineId });
+  const otherBefore = (await context.database.select().from(repairRun).where(eq(repairRun.id, otherRunId)))[0];
+  assert.ok(otherBefore);
+  const beforeGrants = await context.database.select().from(executionBudgetGrant);
+  const beforeReservations = await context.database.select().from(externalExecutionReservation);
+  const beforeProviderEvents = await context.database.select().from(externalExecutionEvent);
+  const beforeEvents = await context.database.select().from(aiInvestigationEvent)
+    .where(eq(aiInvestigationEvent.aiInvestigationId, ai.id));
+  assert.equal(await hasRepositorySwitchConflict(context.database, root.workspaceId, new Date()), true);
+  const results = await Promise.all([
+    retireExpiredUnstartedAiInvestigation(context.database, root.owner, target, boss),
+    retireExpiredUnstartedAiInvestigation(context.database, root.owner, target, boss),
+  ]);
+  assert.deepEqual(results.sort(), ['already_retired', 'retired']);
+  const terminalJob = await jobState();
+  assert.ok(terminalJob);
+  assert.equal(terminalJob.state, 'cancelled');
+  assert.equal(terminalJob.started_on, null);
+  const [terminal] = await context.database.select().from(aiInvestigation).where(eq(aiInvestigation.id, ai.id));
+  assert.ok(terminal);
+  assert.equal(terminal.state, 'cancelled');
+  assert.equal(terminal.failureCode, EXPIRED_AI_RETIREMENT_REASON);
+  const events = await context.database.select().from(aiInvestigationEvent)
+    .where(eq(aiInvestigationEvent.aiInvestigationId, ai.id));
+  assert.equal(events.filter((event) => event.failureCode === EXPIRED_AI_RETIREMENT_REASON).length, 1);
+  assert.deepEqual(events.filter((event) => event.failureCode === null).map((event) => event.id).sort(),
+    beforeEvents.map((event) => event.id).sort());
+  assert.equal(await hasRepositorySwitchConflict(context.database, root.workspaceId, new Date()), false);
+  assert.deepEqual((await context.database.select().from(repairRun).where(eq(repairRun.id, seeded.runId)))[0], beforeRun);
+  assert.deepEqual((await context.database.select().from(investigation).where(eq(investigation.id, seeded.investigationId)))[0], beforeContext);
+  assert.deepEqual((await context.database.select().from(repositoryBaseline).where(eq(repositoryBaseline.id, seeded.baselineId)))[0], beforeBaseline);
+  assert.deepEqual((await context.database.select().from(repairRun).where(eq(repairRun.id, otherRunId)))[0], otherBefore);
+  assert.deepEqual(await context.database.select().from(executionBudgetGrant), beforeGrants);
+  assert.deepEqual(await context.database.select().from(externalExecutionReservation), beforeReservations);
+  assert.deepEqual(await context.database.select().from(externalExecutionEvent), beforeProviderEvents);
+  assert.equal((await context.database.select().from(aiInvestigationAttempt).where(eq(aiInvestigationAttempt.aiInvestigationId, ai.id))).length, 0);
+});
+
+test('expired AI retirement refuses unexpired, claimed, attempted and mismatched work without partial writes', async (t) => {
+  for (const scenario of ['unexpired', 'claimed', 'attempt', 'reservation', 'wrong_owner', 'wrong_workspace', 'wrong_run', 'wrong_ai', 'wrong_plan', 'lost_claim'] as const) {
+    await t.test(scenario, async (t) => {
+      const fixture = await expiredAiRetirementCase(scenario !== 'unexpired'); t.after(() => fixture.context.client.close());
+      const { context, root, ai, target, boss, jobState } = fixture;
+      let actor = root.owner; let selectedTarget = target; let selectedBoss = boss;
+      if (scenario === 'claimed') await context.database.execute(sql`update pgboss.job set state = 'active', started_on = clock_timestamp() where id = ${ai.id}::uuid`);
+      if (scenario === 'attempt') await context.database.insert(aiInvestigationAttempt).values({ id: randomUUID(), aiInvestigationId: ai.id,
+        queueJobId: ai.id, attemptNumber: 1, ownershipToken: randomUUID(), state: 'exhausted',
+        claimedAt: NOW, heartbeatAt: NOW, leaseExpiresAt: null, finishedAt: NOW, failureCode: 'attempt_recorded' });
+      if (scenario === 'reservation') {
+        const grants = await context.database.select().from(executionBudgetGrant);
+        const operation = grants.find((grant) => grant.operationCategory === 'gemini_investigation');
+        const accountGrant = grants.find((grant) => grant.scope === 'account');
+        assert.ok(operation); assert.ok(accountGrant);
+        await context.database.insert(externalExecutionReservation).values({ id: randomUUID(), version: 2,
+          grantId: operation.id, accountGrantId: accountGrant.id, workspaceId: root.workspaceId,
+          repairRunId: target.repairRunId, githubRepositoryId: REPOSITORY_ID, baseCommitSha: COMMIT,
+          operationCategory: 'gemini_investigation', providerId: 'google', modelId: 'gemini-3.1-flash-lite',
+          executingReleaseSha: RELEASE, executingProviderAccountIdentity: operation.authorizedProviderAccountIdentity,
+          operationKey: randomUUID(), fence: 999,
+          reservationIdentity: 'f'.repeat(64), reservedLogicalRequests: 1, reservedProviderAttempts: 1,
+          reservedInputTokens: 0, reservedOutputTokens: 0, reservedSandboxIdentities: 0,
+          reservedSandboxRuntimeMs: 0, reservedVerificationAttempts: 0, reservedRepairLoopIterations: 0,
+          createdAt: new Date(operation.expiresAt.getTime() - 30 * 60_000) });
+      }
+      if (scenario === 'wrong_owner') actor = owner(root.workspaceId, randomUUID());
+      if (scenario === 'wrong_workspace') actor = owner(randomUUID());
+      if (scenario === 'wrong_run') selectedTarget = { ...target, repairRunId: randomUUID() };
+      if (scenario === 'wrong_ai') selectedTarget = { ...target, aiInvestigationId: randomUUID() };
+      if (scenario === 'wrong_plan') selectedTarget = { ...target, planIdentity: `77b00001${'f'.repeat(56)}` };
+      if (scenario === 'lost_claim') selectedBoss = { cancel: async () => ({ affected: 0 }) } as never;
+      await assert.rejects(retireExpiredUnstartedAiInvestigation(context.database, actor, selectedTarget, selectedBoss));
+      assert.equal((await jobState())?.state, scenario === 'claimed' ? 'active' : 'created');
+      const [stored] = await context.database.select().from(aiInvestigation).where(eq(aiInvestigation.id, ai.id));
+      assert.equal(stored?.state, 'queued');
+      const events = await context.database.select().from(aiInvestigationEvent)
+        .where(and(eq(aiInvestigationEvent.aiInvestigationId, ai.id),
+          eq(aiInvestigationEvent.failureCode, EXPIRED_AI_RETIREMENT_REASON)));
+      assert.equal(events.length, 0);
+    });
+  }
+});
+
+test('expired AI retirement handoff requires the existing owner session, same origin and exact confirmation', async () => {
+  const fixture = await expiredAiRetirementCase();
+  try {
+    let called = 0;
+    const handler = createExpiredAiRetirementHandler({ baseUrl: 'http://localhost:3000', target: fixture.target,
+      resolveContext: async () => fixture.root.owner,
+      retire: async () => { called++; return 'retired'; } });
+    const request = (fields: Record<string, string>, origin = 'http://localhost:3000') => new Request('http://localhost:3000/api/ai-investigations/retire-expired', {
+      method: 'POST', headers: { origin, 'content-type': 'application/x-www-form-urlencoded', 'sec-fetch-site': 'same-origin' },
+      body: new URLSearchParams(fields),
+    });
+    const valid = { repairRunId: fixture.target.repairRunId, aiInvestigationId: fixture.target.aiInvestigationId,
+      confirmation: 'retire-expired-unstarted-ai' };
+    assert.equal((await handler(request(valid, 'https://attacker.invalid'))).status, 403);
+    assert.equal((await handler(request({ ...valid, confirmation: 'wrong' }))).status, 403);
+    assert.equal((await handler(request({ ...valid, aiInvestigationId: randomUUID() }))).status, 403);
+    assert.equal(called, 0);
+    const unauthenticated = createExpiredAiRetirementHandler({ baseUrl: 'http://localhost:3000',
+      target: fixture.target, resolveContext: async () => { throw new AccessDeniedError('unauthorized'); },
+      retire: async () => { called++; return 'retired'; } });
+    assert.equal((await unauthenticated(request(valid))).status, 401);
+    assert.equal(called, 0);
+    assert.equal((await handler(request(valid))).status, 200);
+    assert.equal(called, 1);
+  } finally { await fixture.context.client.close(); }
 });
